@@ -4,6 +4,8 @@
 // reaches sevdesk.
 //
 //   node scripts/smoke-bin.mjs [path]   default: out/bin/sevdesk-mcp-<host>
+//   SMOKE_ARCH=x86_64 node scripts/smoke-bin.mjs out/bin/sevdesk-mcp-darwin-x64
+//                                       macOS only: runs the binary under Rosetta
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
@@ -26,7 +28,10 @@ if (!existsSync(bin)) fail(`${bin} is missing; run "npm run build:bin" first`);
 
 // Only what the binary needs: a real token in the caller's environment must
 // not reach it, and the keychain is never asked because the variable is set.
-const child = spawn(bin, [], {
+const arch = process.env.SMOKE_ARCH;
+if (arch !== undefined && !/^[a-z0-9_]+$/.test(arch)) fail(`invalid SMOKE_ARCH ${arch}`);
+const [command, args] = arch ? ["/usr/bin/arch", [`-${arch}`, bin]] : [bin, []];
+const child = spawn(command, args, {
   env: {
     PATH: process.env.PATH ?? "",
     SEVDESK_API_TOKEN: DUMMY_TOKEN,
@@ -101,4 +106,6 @@ if (code === "timeout") {
 if (code !== 0) fail(`binary exited with code ${code} (signal ${signal})`, stderr);
 if (stderr.includes(DUMMY_TOKEN)) fail("the token appeared on stderr");
 
-console.error(`smoke-bin: ${bin} ${version} ok, ${names.length} tools: ${names.join(", ")}`);
+console.error(
+  `smoke-bin: ${bin}${arch ? ` (${arch})` : ""} ${version} ok, ${names.length} tools: ${names.join(", ")}`,
+);

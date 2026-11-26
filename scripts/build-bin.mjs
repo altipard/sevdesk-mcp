@@ -20,6 +20,10 @@ if (typeof Bun === "undefined") {
 
 const root = new URL("../", import.meta.url);
 const TARGETS = ["darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64"];
+// x64 builds use bun's baseline variant: the default one needs AVX2 and crashes on older CPUs
+// and on some virtual machines. The asset name stays sevdesk-mcp-<os>-x64.
+const bunTarget = (target) =>
+  target.endsWith("-x64") ? `bun-${target}-baseline` : `bun-${target}`;
 const PACKAGE_READ = 'readFileSync(new URL("../package.json", import.meta.url), "utf8")';
 
 function hostTarget() {
@@ -53,7 +57,9 @@ const embedPackageJson = {
       if (!source.includes(PACKAGE_READ)) {
         throw new Error(`build-bin: ${loaded.path} no longer contains ${PACKAGE_READ}`);
       }
-      return { contents: source.replace(PACKAGE_READ, JSON.stringify(packageJson)), loader: "ts" };
+      // A replacer function: a string replacement would expand "$&" and friends.
+      const contents = source.replace(PACKAGE_READ, () => JSON.stringify(packageJson));
+      return { contents, loader: "ts" };
     });
   },
 };
@@ -65,7 +71,7 @@ for (const target of targets) {
   const outfile = fileURLToPath(new URL(`sevdesk-mcp-${target}`, outDir));
   const result = await Bun.build({
     entrypoints: [fileURLToPath(new URL("src/bin/stdio.ts", root))],
-    compile: { target: `bun-${target}`, outfile },
+    compile: { target: bunTarget(target), outfile },
     minify: true,
     sourcemap: "none",
     plugins: [embedPackageJson],
