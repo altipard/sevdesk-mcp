@@ -2,6 +2,7 @@ import type { McpServer, ServerContext } from "@modelcontextprotocol/server";
 import { describe, expect, it } from "vitest";
 import { createAuditLog } from "../../src/policy/audit.js";
 import { runGuarded } from "../../src/policy/guard.js";
+import { InMemoryNonceStore } from "../../src/policy/nonce-store.js";
 import { createPolicyRuntime, requestPolicy } from "../../src/policy/runtime.js";
 import { captureLogger, testConfig } from "../helpers.js";
 
@@ -56,5 +57,63 @@ describe("guard for X without an approval channel", () => {
     const released = await runGuarded(env, ctx, action(true, token));
     expect(released).toMatchObject({ structuredContent: { ok: true } });
     expect(executed).toBe(1);
+  });
+});
+
+describe("guard on HTTP derives rights and subject per call", () => {
+  const config = testConfig({ mode: "full" });
+  const alice = {
+    token: "a",
+    clientId: "app",
+    scopes: ["sevdesk:read", "sevdesk:write"],
+    extra: { sub: "alice" },
+  };
+
+  async function call(authInfo: unknown) {
+    const lines: string[] = [];
+    const runtime = createPolicyRuntime(config, {
+      transport: "http",
+      secret: Buffer.from("g".repeat(32)),
+      nonces: new InMemoryNonceStore(),
+      audit: createAuditLog({ write: (l) => lines.push(l) }),
+    });
+    const policy = requestPolicy(config, runtime, alice);
+    let executed = 0;
+    const result = await runGuarded(
+      { policy, server: noElicitation, logger: captureLogger().logger },
+      { mcpReq: {}, http: { authInfo } } as unknown as ServerContext,
+      {
+        key: "w_tool",
+        tool: "w_tool",
+        class: "W",
+        args: {},
+        explicitlyAllowed: false,
+        summary: "w.",
+        execute: async () => {
+          executed++;
+          return { ok: true };
+        },
+      },
+    );
+    return { result, executed, audit: lines.map((l) => JSON.parse(l)) };
+  }
+
+  it("runs for the subject the server was built for", async () => {
+    const { result, executed, audit } = await call(alice);
+    expect(result).toMatchObject({ structuredContent: { ok: true } });
+    expect(executed).toBe(1);
+    expect(audit[0]).toMatchObject({ subject: "sub:alice", outcome: "ok" });
+  });
+
+  it("denies a call whose token names another subject", async () => {
+    const { executed, audit } = await call({ ...alice, extra: { sub: "mallory" } });
+    expect(executed).toBe(0);
+    expect(audit[0]).toMatchObject({ subject: "sub:mallory", outcome: "denied" });
+  });
+
+  it("denies a call whose token identifies nobody", async () => {
+    const { executed, audit } = await call({ ...alice, clientId: "", extra: {} });
+    expect(executed).toBe(0);
+    expect(audit[0]).toMatchObject({ subject: "unidentified", outcome: "denied" });
   });
 });

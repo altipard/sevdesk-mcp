@@ -85,6 +85,13 @@ describe("rightsForRequest", () => {
     expect(rightsForRequest("full", "http", undefined)).toBe("none");
   });
 
+  it("grants nothing to an HTTP token that names neither sub nor client", () => {
+    const anonymous = { token: "t", clientId: "", scopes: [R, W, X] };
+    expect(rightsForRequest("full", "http", anonymous)).toBe("none");
+    expect(rightsForRequest("full", "http", { ...anonymous, extra: { sub: "" } })).toBe("none");
+    expect(rightsForRequest("full", "http", { ...anonymous, extra: { sub: "u1" } })).toBe("full");
+  });
+
   it("takes the minimum on HTTP", () => {
     expect(rightsForRequest("full", "http", auth([R, W]))).toBe("write");
     expect(rightsForRequest("read", "http", auth([R, W, X]))).toBe("read");
@@ -98,6 +105,7 @@ describe("subjectFor", () => {
       subjectFor("http", { token: "t", clientId: "app", scopes: [], extra: { sub: "u1" } }),
     ).toBe("sub:u1");
     expect(subjectFor("http", { token: "t", clientId: "app", scopes: [] })).toBe("client:app");
-    expect(subjectFor("http", undefined)).toBe("anonymous");
+    expect(subjectFor("http", undefined)).toBeUndefined();
+    expect(subjectFor("http", { token: "t", clientId: "", scopes: [] })).toBeUndefined();
   });
 });

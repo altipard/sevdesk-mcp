@@ -566,7 +566,7 @@ describe("HTTP policy", () => {
       expect(JSON.parse(auditLines[0] ?? "{}")).toMatchObject({
         outcome: "denied",
         reason: "insufficient_rights",
-        subject: "sub:alice",
+        subject: "unidentified",
       });
     } finally {
       await client.close();

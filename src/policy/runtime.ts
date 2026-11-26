@@ -3,7 +3,13 @@ import { type Config, ConfigError, confirmSecretFor } from "../config.js";
 import { type AuditLog, createAuditLog } from "./audit.js";
 import { type ConfirmationSigner, createConfirmationSigner } from "./confirm.js";
 import { InMemoryNonceStore, type NonceStore } from "./nonce-store.js";
-import { type Rights, rightsForRequest, subjectFor, type Transport } from "./rights.js";
+import {
+  type Rights,
+  rightsForRequest,
+  subjectFor,
+  type Transport,
+  UNIDENTIFIED_SUBJECT,
+} from "./rights.js";
 
 /**
  * Policy state that must live exactly once per process: the HMAC key, the
@@ -73,6 +79,6 @@ export function requestPolicy(
     config,
     runtime,
     rights: rightsForRequest(config.mode, runtime.transport, authInfo),
-    subject: subjectFor(runtime.transport, authInfo),
+    subject: subjectFor(runtime.transport, authInfo) ?? UNIDENTIFIED_SUBJECT,
   };
 }

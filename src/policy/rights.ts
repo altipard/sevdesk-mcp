@@ -71,10 +71,33 @@ export function effectiveRights(mode: Mode, scopes: readonly string[] | undefine
   return minRights(mode, rightsFromScopes(scopes));
 }
 
+/** Audit subject for HTTP calls without an identifiable caller. They get no rights. */
+export const UNIDENTIFIED_SUBJECT = "unidentified";
+
+/**
+ * Subject bound into confirmation tokens and recorded in audit events:
+ * `sub` of the token, else its client ID. Undefined on HTTP when the token
+ * names neither: such callers must not share one subject, because they
+ * could then use each other's confirmation tokens.
+ */
+export function subjectFor(
+  transport: Transport,
+  authInfo: AuthInfo | undefined,
+): string | undefined {
+  if (transport === "stdio") return "stdio";
+  const sub = authInfo?.extra?.sub;
+  if (typeof sub === "string" && sub !== "") return `sub:${sub}`;
+  if (typeof authInfo?.clientId === "string" && authInfo.clientId !== "") {
+    return `client:${authInfo.clientId}`;
+  }
+  return undefined;
+}
+
 /**
  * Effective rights for a request on the given transport. On HTTP a missing
  * authInfo never falls back to the mode: without a verified token there are
- * no rights, even if the auth gate in front was misconfigured.
+ * no rights, even if the auth gate in front was misconfigured. A token that
+ * identifies no caller (neither sub nor client ID) gets no rights either.
  */
 export function rightsForRequest(
   mode: Mode,
@@ -82,15 +105,6 @@ export function rightsForRequest(
   authInfo: AuthInfo | undefined,
 ): Rights {
   if (transport === "stdio") return effectiveRights(mode, undefined);
-  if (authInfo === undefined) return "none";
+  if (authInfo === undefined || subjectFor(transport, authInfo) === undefined) return "none";
   return effectiveRights(mode, authInfo.scopes);
-}
-
-/** Subject recorded in confirmation tokens and audit events. */
-export function subjectFor(transport: Transport, authInfo: AuthInfo | undefined): string {
-  if (transport === "stdio") return "stdio";
-  const sub = authInfo?.extra?.sub;
-  if (typeof sub === "string" && sub !== "") return `sub:${sub}`;
-  if (authInfo?.clientId) return `client:${authInfo.clientId}`;
-  return "anonymous";
 }

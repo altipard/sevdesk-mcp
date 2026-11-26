@@ -14,7 +14,15 @@ import { errorResult, okResult } from "../tools/result.js";
 import type { AuditOutcome } from "./audit.js";
 import type { OperationClass } from "./classification.js";
 import { argumentHash, type RejectReason } from "./confirm.js";
-import { allows, minRights, type Rights, requiredRights, rightsForRequest } from "./rights.js";
+import {
+  allows,
+  minRights,
+  type Rights,
+  requiredRights,
+  rightsForRequest,
+  subjectFor,
+  UNIDENTIFIED_SUBJECT,
+} from "./rights.js";
 import type { RequestPolicy } from "./runtime.js";
 
 /** Idempotency window for X actions per target, e.g. one e-mail per invoice. */
@@ -71,11 +79,31 @@ function failure(text: string): CallToolResult {
   return { isError: true, content: [{ type: "text", text }] };
 }
 
-/** Rights for this call. On HTTP they are re-derived from the request's own token. */
-function callRights(env: GuardEnv, ctx: ServerContext): Rights {
+interface CallIdentity {
+  readonly rights: Rights;
+  readonly subject: string;
+}
+
+/**
+ * Rights and subject of this call. On HTTP both are derived again from the
+ * request's own token, like at registration: rights are the minimum of
+ * both, and a subject that differs from the one the server was built for
+ * (or none at all) means no rights.
+ */
+function callIdentity(env: GuardEnv, ctx: ServerContext): CallIdentity {
   const { policy } = env;
-  if (policy.runtime.transport === "stdio") return policy.rights;
-  return minRights(policy.rights, rightsForRequest(policy.config.mode, "http", ctx.http?.authInfo));
+  if (policy.runtime.transport === "stdio") {
+    return { rights: policy.rights, subject: policy.subject };
+  }
+  const authInfo = ctx.http?.authInfo;
+  const subject = subjectFor("http", authInfo);
+  if (subject === undefined || subject !== policy.subject) {
+    return { rights: "none", subject: subject ?? UNIDENTIFIED_SUBJECT };
+  }
+  return {
+    rights: minRights(policy.rights, rightsForRequest(policy.config.mode, "http", authInfo)),
+    subject,
+  };
 }
 
 /**
@@ -127,11 +155,12 @@ export async function runGuarded(
 ): Promise<CallToolResult | InputRequiredResult> {
   const { policy, logger } = env;
   const { runtime } = policy;
+  const identity = callIdentity(env, ctx);
   const audited = action.class !== "R" && action.class !== "R+";
   const audit = (outcome: AuditOutcome, extra: { reason?: string; status?: number } = {}) => {
     if (!audited) return;
     runtime.audit.record({
-      subject: policy.subject,
+      subject: identity.subject,
       tool: action.tool,
       operationId: action.operationId,
       targetId: action.targetId,
@@ -141,7 +170,7 @@ export async function runGuarded(
     });
   };
 
-  if (!allows(callRights(env, ctx), action.class)) {
+  if (!allows(identity.rights, action.class)) {
     audit("denied", { reason: "insufficient_rights" });
     return failure(
       `${action.tool} needs ${requiredRights(action.class)} rights (SEVDESK_MODE and token scopes); ` +
@@ -168,7 +197,7 @@ export async function runGuarded(
   if (action.class === "R" || action.class === "R+" || action.class === "W") return execute();
 
   // W+ and X: two-step call with a confirmation token.
-  const binding = { tool: action.key, args: action.args, subject: policy.subject };
+  const binding = { tool: action.key, args: action.args, subject: identity.subject };
   if (action.confirmationToken === undefined) {
     let preview: ToolOutput;
     try {
