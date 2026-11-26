@@ -46,12 +46,12 @@ export function minRights(a: Rights, b: Rights): Rights {
  * and every scope below it. `sevdesk:write` does not imply `sevdesk:read`,
  * and `sevdesk:irreversible` without `sevdesk:write` adds nothing.
  *
- * Write-only tokens (auth-spike.md, "Auflagen"): they get no rights at all.
- * The HTTP gate keeps requiring `sevdesk:read` and answers such a token with
- * 403 `scope="sevdesk:read"`; the IdP has to issue `sevdesk:write` only
- * together with `sevdesk:read`. Treating write as implying read here would
- * be exactly the silent hierarchy the spike rules out, and it would let a
- * token reach tools its issuer never granted.
+ * Write-only tokens get no rights at all. The HTTP gate keeps requiring
+ * `sevdesk:read` and answers such a token with 403 `scope="sevdesk:read"`;
+ * the IdP has to issue `sevdesk:write` only together with `sevdesk:read`.
+ * Write does not imply read: an implied step would be a hierarchy the scope
+ * list does not state, and the token could reach tools its issuer never
+ * granted.
  */
 export function rightsFromScopes(scopes: readonly string[]): Rights {
   const has = (scope: string) => scopes.includes(scope);
