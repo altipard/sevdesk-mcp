@@ -227,7 +227,7 @@ describe("built stdio binary", () => {
     expect(anonymous.error).toMatchObject({ code: -32000 });
 
     const list = await session.request(5, "tools/list");
-    expect((list.result?.tools as unknown[]).length).toBeGreaterThan(0);
+    expect(list.result?.tools).toEqual(expect.arrayContaining([expect.anything()]));
     expect(await session.close()).toBe(0);
     expect(session.stderr.join("")).toContain("stdio message over the size limit dropped");
   }, 60_000);
