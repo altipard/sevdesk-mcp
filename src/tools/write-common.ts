@@ -380,21 +380,31 @@ export function positionBody(position: ResolvedPosition, objectName: string, ind
   };
 }
 
-/** Net sum of the positions: each position rounded to whole cents, then added in cents. */
-export function netSum(positions: readonly ResolvedPosition[]): number {
-  const totalCents = positions.reduce(
-    (sum, p) => sum + Math.round(p.quantity * p.priceNet * 100),
-    0,
-  );
-  return totalCents / 100;
+/**
+ * Whole cents of an amount. toFixed(6) first, so float noise like
+ * 100.50000000000001 or 49.49999999999999 does not decide the rounding.
+ */
+export function toCents(value: number): number {
+  return Math.round(Number((value * 100).toFixed(6)));
 }
 
-/** Differences up to one cent are rounding, not a mismatch. */
-export const SUM_TOLERANCE = 0.01;
+/** Net sum of the positions: each position rounded to whole cents, then added in cents. */
+export function netSum(positions: readonly ResolvedPosition[]): number {
+  return positions.reduce((sum, p) => sum + toCents(p.quantity * p.priceNet), 0) / 100;
+}
 
-/** Warning if sevdesk's net sum differs from ours by more than a cent. */
-export function sumWarning(expected: number, actual: number | null): string | undefined {
-  if (actual === null || cents(Math.abs(actual - expected)) <= SUM_TOLERANCE) return undefined;
+/** Rounding may differ by up to one cent per position. */
+export const SUM_TOLERANCE_PER_POSITION = 0.01;
+
+/** Warning if sevdesk's net sum differs from ours by more than rounding can explain. */
+export function sumWarning(
+  expected: number,
+  actual: number | null,
+  positionCount: number,
+): string | undefined {
+  if (actual === null) return undefined;
+  const toleranceCents = toCents(SUM_TOLERANCE_PER_POSITION) * Math.max(1, positionCount);
+  if (Math.abs(toCents(actual) - toCents(expected)) <= toleranceCents) return undefined;
   return (
     `Sum mismatch: sevdesk reports a net sum of ${actual}, the positions add up to ${expected}. ` +
     "A possible cause is that the account reads prices as gross instead of net; check the " +

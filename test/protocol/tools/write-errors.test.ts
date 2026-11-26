@@ -102,7 +102,13 @@ const CASES: Array<{
     tool: "book_invoice_payment",
     confirmed: true,
     failing: http.put(sevdeskUrl("/Invoice/1001/bookAmount"), () => sevdeskError(500)),
-    args: { invoiceId: 1001, amount: 50, paymentType: "N", checkAccountId: 9001 },
+    args: {
+      invoiceId: 1001,
+      amount: 50,
+      date: "2026-03-05",
+      paymentType: "N",
+      checkAccountId: 9001,
+    },
   },
   {
     tool: "send_invoice_email",

@@ -37,7 +37,11 @@ export const APPROVAL_KEY = "approve";
  * only the arguments.
  */
 export const APPROVAL_FACTS_KEY = "approval";
-/** Upper bound of the facts shown in the approval question. */
+/**
+ * Upper bound of the facts shown in the approval question. Facts are never
+ * cut: a tool shortens its free text (subject, text) to fit, and facts that
+ * still do not fit (recipients, warnings) make the guard refuse the approval.
+ */
 export const MAX_APPROVAL_FACTS_LENGTH = 1000;
 
 export const CONFIRMATION_TOKEN_DESCRIPTION =
@@ -168,13 +172,15 @@ const unknownOutcomeKey = (idempotencyKey: string) => `${idempotencyKey}:outcome
 
 /**
  * The approval facts of a preview, cleaned like tool output (hidden
- * characters removed, length capped), or undefined if it has none.
+ * characters removed): undefined if it has none, "too_long" if they exceed
+ * MAX_APPROVAL_FACTS_LENGTH. They are never cut, because a cut could hide
+ * a recipient or a warning from the person approving.
  */
-export function approvalFacts(preview: ToolOutput): string | undefined {
+export function approvalFacts(preview: ToolOutput): string | "too_long" | undefined {
   const facts = preview[APPROVAL_FACTS_KEY];
   if (typeof facts !== "string") return undefined;
-  const cleaned = text(facts.slice(0, MAX_APPROVAL_FACTS_LENGTH));
-  return cleaned ?? undefined;
+  if (facts.length > MAX_APPROVAL_FACTS_LENGTH) return "too_long";
+  return text(facts) ?? undefined;
 }
 
 /**
@@ -280,7 +286,17 @@ export async function runGuarded(
         // arguments the token is bound to.
         let facts: string | undefined;
         try {
-          facts = approvalFacts((await action.preview?.()) ?? {});
+          const found = approvalFacts((await action.preview?.()) ?? {});
+          if (found === "too_long") {
+            audit("denied", { reason: "approval_facts_too_long" });
+            return failure(
+              `The approval question for ${action.tool} would exceed ` +
+                `${MAX_APPROVAL_FACTS_LENGTH} characters, and recipients and warnings are never ` +
+                "shortened. Nothing was executed. Use fewer or shorter cc/bcc addresses and " +
+                "call the tool again without confirmation_token for a new preview.",
+            );
+          }
+          facts = found;
         } catch (error) {
           audit("error", { reason: "preview_failed" });
           return errorResult(action.tool, error, logger);

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { Logger } from "../logger.js";
+import { MAX_APPROVAL_FACTS_LENGTH } from "../policy/guard.js";
 import { defineTool, type StrictToolAnnotations } from "../policy/registry.js";
 import { SevdeskError } from "../sevdesk/errors.js";
 import {
@@ -11,7 +12,6 @@ import {
   isoDate,
   objectsOf,
   text,
-  todayIso,
   unixSeconds,
 } from "./format.js";
 import { present } from "./result.js";
@@ -82,7 +82,8 @@ function invoiceFacts(invoice: InvoiceState, contactName: string | null) {
 /** One line of free text for the approval question; line breaks could fake extra lines. */
 const oneLine = (value: string | null, max = 200): string => {
   const flat = (value ?? "").replace(/\s+/g, " ").trim();
-  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+  if (flat.length <= max) return flat;
+  return max <= 0 ? "" : `${flat.slice(0, max - 1)}…`;
 };
 
 /** "RE-1001 (ID 1001) for Muster GmbH, gross 119 EUR" from the preview's read. */
@@ -254,9 +255,9 @@ export const bookInvoicePayment = defineTool({
       .max(1_000_000_000)
       .refine(wholeCents, { error: "must have at most two decimal places" })
       .describe("Amount paid, in invoice currency, at most two decimals."),
-    date: isoDate
-      .optional()
-      .describe("Payment date YYYY-MM-DD; default today (German time), shown in the preview."),
+    // Required: a default would be resolved again at execution, possibly on
+    // another day than the preview showed, and is not bound to the token.
+    date: isoDate.describe("Payment date YYYY-MM-DD (German calendar)."),
     paymentType: z
       .enum(PAYMENT_TYPES)
       .describe("FULL_PAYMENT, N partial, CB Skonto, MTC bank charges, O other, OF reminder fees."),
@@ -304,7 +305,7 @@ export const bookInvoicePayment = defineTool({
     return {
       ...invoiceFacts(invoice, await contactNameOf(call, invoice.contactId)),
       amount: args.amount,
-      date: args.date ?? todayIso(),
+      date: args.date,
       paymentType: args.paymentType,
       checkAccount,
       ...(args.checkAccountTransactionId !== undefined && {
@@ -328,7 +329,7 @@ export const bookInvoicePayment = defineTool({
       );
     }
     const open = openOf(invoice);
-    const date = args.date ?? todayIso();
+    const date = args.date;
     const { sevdesk } = call;
     const body = await sevdesk.call(
       sevdesk.api.PUT("/Invoice/{invoiceId}/bookAmount", {
@@ -373,6 +374,42 @@ export const bookInvoicePayment = defineTool({
 
 // ---------------------------------------------------------------------------
 // send_invoice_email
+
+/**
+ * Approval facts for an e-mail. Invoice, all recipients, attachment and
+ * warnings are never shortened; subject and text share what is left of
+ * MAX_APPROVAL_FACTS_LENGTH. If even the fixed part does not fit, it is
+ * returned whole and the guard refuses the approval.
+ */
+export function emailApproval(
+  args: {
+    toEmail: string;
+    ccEmail?: string[] | undefined;
+    bccEmail?: string[] | undefined;
+    subject: string;
+    text: string;
+    sendXml?: boolean | undefined;
+  },
+  invoice: string,
+  warnings: readonly string[],
+): string {
+  const copies = [
+    args.ccEmail?.length ? `cc ${args.ccEmail.join(", ")}` : "",
+    args.bccEmail?.length ? `bcc ${args.bccEmail.join(", ")}` : "",
+  ].filter(Boolean);
+  const head =
+    `Send invoice ${invoice}, by e-mail to ${args.toEmail}` +
+    `${copies.length > 0 ? ` (${copies.join("; ")})` : ""}.`;
+  const tail =
+    ` Attachment: ${args.sendXml ? "e-invoice XML" : "PDF"}.` +
+    `${warnings.length > 0 ? ` Warnings: ${warnings.map((w) => oneLine(w, Number.MAX_SAFE_INTEGER)).join(" ")}` : ""}`;
+  const frame = (subject: string, body: string) => ` Subject: "${subject}". Text: "${body}".`;
+  const room = MAX_APPROVAL_FACTS_LENGTH - head.length - tail.length - frame("", "").length;
+  if (room < 0) return head + tail;
+  const subject = oneLine(args.subject, Math.min(200, room));
+  const body = oneLine(args.text, Math.min(160, room - subject.length));
+  return head + frame(subject, body) + tail;
+}
 
 const MAX_COPIES = 10;
 
@@ -450,23 +487,21 @@ export const sendInvoiceEmail = defineTool({
     const recipientKnown = known.some(
       (value) => value.toLowerCase() === args.toEmail.toLowerCase(),
     );
+    // The approval question gets the same warnings without the list of
+    // known addresses (sevdesk data of any length).
+    const approvalWarnings = [...warnings];
     if (!recipientKnown) {
       warnings.push(
         `${args.toEmail} is not an e-mail address of the invoice's contact in sevdesk` +
           `${known.length > 0 ? ` (known: ${known.join(", ")})` : ""}.`,
       );
+      approvalWarnings.push(
+        `${args.toEmail} is not an e-mail address of the invoice's contact in sevdesk.`,
+      );
     }
     const contactName = await contactNameOf(call, invoice.contactId);
-    const copies = [
-      args.ccEmail?.length ? `cc ${args.ccEmail.join(", ")}` : "",
-      args.bccEmail?.length ? `bcc ${args.bccEmail.join(", ")}` : "",
-    ].filter(Boolean);
     return {
-      approval:
-        `Send invoice ${invoiceLine(invoice, contactName)}, by e-mail to ${args.toEmail}` +
-        `${copies.length > 0 ? ` (${copies.join("; ")})` : ""}. Subject: "${oneLine(args.subject)}". ` +
-        `Text: "${oneLine(args.text, 160)}". Attachment: ${args.sendXml ? "e-invoice XML" : "PDF"}.` +
-        `${warnings.length > 0 ? ` Warnings: ${warnings.map((w) => oneLine(w, 300)).join(" ")}` : ""}`,
+      approval: emailApproval(args, invoiceLine(invoice, contactName), approvalWarnings),
       ...invoiceFacts(invoice, contactName),
       toEmail: args.toEmail,
       ccEmail: args.ccEmail ?? [],

@@ -30,6 +30,7 @@ const EMAIL = {
 const BOOKING = {
   invoiceId: 1001,
   amount: 119,
+  date: "2026-03-05",
   paymentType: "FULL_PAYMENT",
   checkAccountId: 9001,
 };

@@ -241,7 +241,7 @@ export const createInvoiceDraft = defineTool({
     const invoice = mapInvoiceState(saved);
     const warnings = [...prepared.warnings];
     const expected = netSum(prepared.positions);
-    const mismatch = sumWarning(expected, invoice.sumNet);
+    const mismatch = sumWarning(expected, invoice.sumNet, prepared.positions.length);
     if (mismatch) warnings.push(mismatch);
     if (invoice.status !== 100) {
       warnings.push(
@@ -345,7 +345,7 @@ export const createOrderDraft = defineTool({
     const order = mapOrderState(saved);
     const warnings = [...prepared.warnings];
     const expected = netSum(prepared.positions);
-    const mismatch = sumWarning(expected, order.sumNet);
+    const mismatch = sumWarning(expected, order.sumNet, prepared.positions.length);
     if (mismatch) warnings.push(mismatch);
     if (order.status !== 100) {
       warnings.push(

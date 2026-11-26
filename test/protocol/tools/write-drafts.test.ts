@@ -343,11 +343,12 @@ describe("contact person and sums", () => {
   });
 
   it.each([
+    // Three positions: up to 3 cents of rounding difference are tolerated.
     ["1.39", false],
-    ["1.40", false],
-    ["1.38", false],
-    ["1.41", true],
-    ["1.37", true],
+    ["1.42", false],
+    ["1.36", false],
+    ["1.43", true],
+    ["1.35", true],
   ])(
     "rounds each position to cents (1.39) and warns about sevdesk's sum %s: %s",
     async (sumNet, warns) => {

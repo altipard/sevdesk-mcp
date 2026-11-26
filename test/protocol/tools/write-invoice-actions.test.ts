@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { todayIso, unixSeconds } from "../../../src/tools/format.js";
+import { MAX_APPROVAL_FACTS_LENGTH } from "../../../src/policy/guard.js";
+import { unixSeconds } from "../../../src/tools/format.js";
 import { checkAccount, communicationWay, contact, invoice, list } from "../../fixtures/sevdesk.js";
 import {
   HttpResponse,
@@ -216,23 +217,26 @@ describe("book_invoice_payment (W+)", () => {
     expect(writes()).toEqual([]);
   });
 
-  it("requires paymentType, at most two decimals, and shows the default date in the preview", async () => {
+  it("requires paymentType and date and accepts amounts in whole cents only", async () => {
     api.server.use(readInvoice(openInvoice), readContact, account);
     const c = await connectWrites({ config: { mode: "write" } });
-    const { paymentType: _omitted, ...withoutType } = args;
-    for (const bad of [withoutType, { ...args, amount: 10.005 }, { ...args, amount: 0.001 }]) {
+    const { paymentType: _type, ...withoutType } = args;
+    const { date: _date, ...withoutDate } = args;
+    for (const bad of [
+      withoutType,
+      withoutDate,
+      { ...args, amount: 10.005 },
+      { ...args, amount: 0.001 },
+    ]) {
       const result = await c.call("book_invoice_payment", bad);
       expect(result.isError, JSON.stringify(bad)).toBe(true);
     }
     expect(api.requests).toHaveLength(0);
-    const { date: _date, ...withoutDate } = args;
-    const { preview } = await previewOf(c, "book_invoice_payment", {
-      ...withoutDate,
-      amount: 1.15,
-    });
-    expect(preview.date).toBe(todayIso());
+    const { preview } = await previewOf(c, "book_invoice_payment", { ...args, amount: 1.15 });
+    expect(preview.date).toBe("2026-03-05");
     const tool = (await c.client.listTools()).tools.find((t) => t.name === "book_invoice_payment");
-    expect(JSON.stringify(tool?.inputSchema)).not.toContain(todayIso());
+    const schema = tool?.inputSchema as { required?: string[] };
+    expect(schema.required).toEqual(expect.arrayContaining(["date", "paymentType"]));
   });
 
   it("refuses at execution when the invoice is no longer open, without booking", async () => {
@@ -350,6 +354,64 @@ describe("send_invoice_email (X)", () => {
       targetId: "1001",
       class: "X",
     });
+  });
+
+  it("refuses the approval when the recipients alone do not fit, instead of cutting them", async () => {
+    api.server.use(readInvoice(draft), readContact, ways, sent);
+    const c = await connectWrites({
+      config: { enableTools: ["send_invoice_email"] },
+      answer: "accept",
+    });
+    const long = (n: number) => `${"a".repeat(60)}${n}@${"b".repeat(60)}.example`;
+    const many = {
+      ...args,
+      ccEmail: Array.from({ length: 10 }, (_, i) => long(i)),
+      bccEmail: [long(99)],
+    };
+    const { token } = await previewOf(c, "send_invoice_email", many);
+    const result = await c.call("send_invoice_email", { ...many, confirmation_token: token });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain(
+      `would exceed ${MAX_APPROVAL_FACTS_LENGTH} characters, and recipients and warnings are never shortened`,
+    );
+    expect(textOf(result)).toContain("Use fewer or shorter cc/bcc addresses");
+    expect(c.elicitations).toEqual([]);
+    expect(writes()).toEqual([]);
+    expect(c.audit().at(-1)).toMatchObject({
+      outcome: "denied",
+      reason: "approval_facts_too_long",
+    });
+  });
+
+  it("shortens only subject and text to fit, keeping every recipient and warning whole", async () => {
+    api.server.use(readInvoice(openInvoice), readContact, ways, sent);
+    const c = await connectWrites({
+      config: { enableTools: ["send_invoice_email"] },
+      answer: "decline",
+    });
+    const cc = Array.from({ length: 5 }, (_, i) => `${"c".repeat(50)}${i}@kopie.example`);
+    const bcc = [`${"d".repeat(50)}@blind.example`];
+    const long = {
+      ...args,
+      toEmail: "fremd@example.org",
+      ccEmail: cc,
+      bccEmail: bcc,
+      subject: "S".repeat(200),
+      text: "T".repeat(5000),
+    };
+    const { token } = await previewOf(c, "send_invoice_email", long);
+    await c.call("send_invoice_email", { ...long, confirmation_token: token });
+    const [question] = c.elicitations;
+    expect(question).toBeDefined();
+    for (const address of [...cc, ...bcc, "fremd@example.org"]) expect(question).toContain(address);
+    expect(question).toContain("The invoice is already open (200); it may have been sent before.");
+    expect(question).toContain(
+      "fremd@example.org is not an e-mail address of the invoice's contact in sevdesk.",
+    );
+    const facts = (question as string).replace(" This cannot be undone. Execute it?", "");
+    expect(facts.length).toBeLessThanOrEqual(MAX_APPROVAL_FACTS_LENGTH);
+    expect(facts).toContain("…");
+    expect(writes()).toEqual([]);
   });
 
   it("sends nothing when the user declines", async () => {

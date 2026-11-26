@@ -193,6 +193,34 @@ try {
   filter = `unknown (${error?.status ?? (error instanceof Error ? error.name : "error")})`;
 }
 console.log(`undocumented contact name filter works: ${filter}`);
+
+// Assumption of the write tools (default contactPerson): GET /Invoice lists
+// by creation, oldest first, so offset=total-1 is the newest invoice. Read
+// only; compares id and create date of the first and the last entry and
+// prints yes/no, never content.
+async function lastInvoiceIsNewest() {
+  const get = (query) =>
+    sevdesk.call(sevdesk.api.request("get", `/Invoice?${new URLSearchParams(query)}`, {}));
+  const first = await get({ limit: "1", offset: "0", countAll: "true" });
+  const total = Number(first?.total);
+  if (!(total > 1)) return "unknown (too few invoices)";
+  const last = await get({ limit: "1", offset: String(total - 1) });
+  const a = first?.objects?.[0];
+  const b = last?.objects?.[0];
+  if (!a || !b) return "unknown (empty page)";
+  const newerId = Number(b.id) > Number(a.id);
+  const createdA = Date.parse(a.create);
+  const createdB = Date.parse(b.create);
+  const newerDate = Number.isNaN(createdA) || Number.isNaN(createdB) || createdB >= createdA;
+  return newerId && newerDate ? "yes" : "no";
+}
+let newest;
+try {
+  newest = await lastInvoiceIsNewest();
+} catch (error) {
+  newest = `unknown (${error?.status ?? (error instanceof Error ? error.name : "error")})`;
+}
+console.log(`invoice at offset total-1 is the newest: ${newest}`);
 console.log(
   `contact embed=addresses delivers addresses: ${
     embedWorks === undefined ? "unknown" : embedWorks ? "yes" : "no"
