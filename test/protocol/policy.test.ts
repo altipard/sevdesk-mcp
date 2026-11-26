@@ -627,6 +627,43 @@ describe("class X single use and idempotency", () => {
   });
 });
 
+describe("operationId picked from the arguments", () => {
+  it("audits and locks under the picked operation", async () => {
+    const tool = testTool("send_email", "X", {
+      operationId: (args: { note?: string }) =>
+        args.note === "voucher" ? "voucherEnshrine" : "invoiceEnshrine",
+      operations: ["invoiceEnshrine", "voucherEnshrine"],
+    } as Partial<ToolDefinition>);
+    const h = await harness({ tools: [tool] });
+    for (const note of ["invoice", "voucher", "invoice"]) {
+      const token = await preview(h, "send_email", { invoiceId: 5, note });
+      await h.client.callTool({
+        name: "send_email",
+        arguments: { invoiceId: 5, note, confirmation_token: token },
+      });
+    }
+    expect(executed.map((e) => (e.args as { note: string }).note)).toEqual(["invoice", "voucher"]);
+    expect(h.audit.at(-1)).toMatchObject({
+      operationId: "invoiceEnshrine",
+      outcome: "denied",
+      reason: "duplicate",
+    });
+  });
+
+  it("refuses the call when the pick is not declared, before anything runs", async () => {
+    const tool = testTool("send_email", "X", {
+      operationId: () => "voucherEnshrine",
+      operations: ["invoiceEnshrine"],
+    } as Partial<ToolDefinition>);
+    const h = await harness({ tools: [tool] });
+    const result = await h.client.callTool({ name: "send_email", arguments: { invoiceId: 5 } });
+    expect(result.isError).toBe(true);
+    expect(text(result)).toContain("nothing was sent to sevdesk");
+    expect(executed).toEqual([]);
+    expect(h.audit).toEqual([]);
+  });
+});
+
 describe("HTTP policy", () => {
   const config = testConfig({ mode: "full" });
   const authInfo = {

@@ -123,6 +123,7 @@ describe("reset_document_status (W+)", () => {
     expect(operations(api).filter((op) => op.startsWith("PUT"))).toEqual([`PUT ${operation}`]);
     expect(c.audit().at(-1)).toMatchObject({
       tool: "reset_document_status",
+      operationId: operation,
       class: "W+",
       targetId: `${args.documentType}:${args.documentId}`,
       outcome: "ok",
@@ -478,8 +479,9 @@ describe("enshrine_document (X)", () => {
     ]);
     expect(c.audit().at(-1)).toMatchObject({
       tool: "enshrine_document",
+      operationId: "invoiceEnshrine",
       class: "X",
-      targetId: "invoice:1001",
+      targetId: "1001",
     });
     const again = await confirm(c, "enshrine_document", args);
     expect(textOf(again.result)).toContain("already ran for this target within the last 24 hours");
@@ -510,6 +512,86 @@ describe("enshrine_document (X)", () => {
       "PUT invoiceEnshrine",
       "PUT voucherEnshrine",
     ]);
+  });
+
+  describe("shares the lock with sevdesk_api_request", () => {
+    const BOTH = { ...ENABLE, apiAllow: ["invoiceEnshrine"] };
+    const fallbackArgs = { operationId: "invoiceEnshrine", params: { invoiceId: 1001 } };
+    const toolArgs = { documentType: "invoice", documentId: 1001 };
+
+    it.each([
+      ["tool first", "enshrine_document", toolArgs, "sevdesk_api_request", fallbackArgs],
+      ["fallback first", "sevdesk_api_request", fallbackArgs, "enshrine_document", toolArgs],
+    ] as const)(
+      "%s: the second path is refused as a duplicate",
+      async (_label, a, aArgs, b, bArgs) => {
+        api.server.use(...reads({}), enshrineInvoice);
+        const c = await connectWrites({ config: BOTH });
+        const first = await confirm(c, a, aArgs);
+        expect(first.result.isError, textOf(first.result)).toBeFalsy();
+        const second = await confirm(c, b, bArgs);
+        expect(textOf(second.result)).toContain(
+          "already ran for this target within the last 24 hours",
+        );
+        expect(operations(api).filter((op) => op.startsWith("PUT"))).toEqual([
+          "PUT invoiceEnshrine",
+        ]);
+        expect(c.audit().at(-1)).toMatchObject({
+          tool: b,
+          operationId: "invoiceEnshrine",
+          targetId: "1001",
+          outcome: "denied",
+          reason: "duplicate",
+        });
+      },
+    );
+
+    it.each([
+      ["tool", "enshrine_document", toolArgs, "sevdesk_api_request", fallbackArgs],
+      ["fallback", "sevdesk_api_request", fallbackArgs, "enshrine_document", toolArgs],
+    ] as const)(
+      "an unknown outcome on the %s path blocks the other one with the same reason",
+      async (_label, a, aArgs, b, bArgs) => {
+        api.server.use(
+          ...reads({}),
+          http.put(sevdeskUrl("/Invoice/1001/enshrine"), () => sevdeskError(502), { once: true }),
+        );
+        const c = await connectWrites({ config: BOTH });
+        const failed = await confirm(c, a, aArgs);
+        expect(failed.result.isError).toBe(true);
+        const blocked = await confirm(c, b, bArgs);
+        expect(textOf(blocked.result)).toContain("may already have run for this target");
+        expect(writes()).toHaveLength(1);
+        expect(c.audit().at(-1)).toMatchObject({
+          tool: b,
+          outcome: "denied",
+          reason: "duplicate_outcome_unknown",
+        });
+      },
+    );
+
+    it("keeps a voucher with the same number apart from the invoice", async () => {
+      api.server.use(
+        ...reads({}),
+        http.get(sevdeskUrl("/Voucher/1001"), () =>
+          HttpResponse.json(list([voucher({ id: "1001" })])),
+        ),
+        enshrineInvoice,
+        http.put(sevdeskUrl("/Voucher/1001/enshrine"), () => HttpResponse.json({ objects: null })),
+      );
+      const c = await connectWrites({ config: BOTH });
+      const viaFallback = await confirm(c, "sevdesk_api_request", fallbackArgs);
+      expect(viaFallback.result.isError, textOf(viaFallback.result)).toBeFalsy();
+      const voucherRun = await confirm(c, "enshrine_document", {
+        documentType: "voucher",
+        documentId: 1001,
+      });
+      expect(voucherRun.result.isError, textOf(voucherRun.result)).toBeFalsy();
+      expect(operations(api).filter((op) => op.startsWith("PUT"))).toEqual([
+        "PUT invoiceEnshrine",
+        "PUT voucherEnshrine",
+      ]);
+    });
   });
 
   it("names the supplier and the voucher description for vouchers, on one line", async () => {

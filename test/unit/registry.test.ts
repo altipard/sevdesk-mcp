@@ -4,6 +4,7 @@ import { ConfigError } from "../../src/config.js";
 import {
   defineTool,
   isToolEnabled,
+  resolveOperationId,
   type ToolDefinition,
   ToolDefinitionError,
   validateToolNames,
@@ -100,6 +101,49 @@ describe("defineTool", () => {
     expect(() => defineTool({ ...base, ...override } as ToolDefinition)).toThrow(
       ToolDefinitionError,
     );
+  });
+});
+
+describe("operationId picked from the arguments", () => {
+  const picking = (operations: ToolDefinition["operations"]) =>
+    defineTool({
+      ...base,
+      name: "enshrine_it",
+      class: "X",
+      annotations: destructive,
+      preview: async () => ({}),
+      targetId: (a) => a.id,
+      inputSchema: z.object({ id: z.number(), kind: z.enum(["invoice", "voucher"]) }),
+      operationId: (a) => (a.kind === "invoice" ? "invoiceEnshrine" : "voucherEnshrine"),
+      ...(operations && { operations }),
+    });
+
+  it("resolves per call to one of the declared operations", () => {
+    const tool = picking(["invoiceEnshrine", "voucherEnshrine"]);
+    expect(resolveOperationId(tool, { id: 1, kind: "invoice" })).toBe("invoiceEnshrine");
+    expect(resolveOperationId(tool, { id: 1, kind: "voucher" })).toBe("voucherEnshrine");
+  });
+
+  it("refuses a pick that operations does not list", () => {
+    const tool = picking(["invoiceEnshrine"]);
+    expect(() => resolveOperationId(tool, { id: 1, kind: "voucher" })).toThrow(
+      /voucherEnshrine is not listed in operations/,
+    );
+  });
+
+  it("needs the candidates in operations at definition time", () => {
+    expect(() => picking(undefined)).toThrow(ToolDefinitionError);
+  });
+
+  it("returns a fixed operationId unchanged", () => {
+    const tool = defineTool({
+      ...base,
+      name: "read_it",
+      class: "R",
+      annotations: ro,
+      operationId: "getInvoices",
+    });
+    expect(resolveOperationId(tool, { id: 1 })).toBe("getInvoices");
   });
 });
 

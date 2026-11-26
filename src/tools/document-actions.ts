@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { OperationId } from "../policy/operations.js";
 import { defineTool, type ToolCall } from "../policy/registry.js";
 import { SevdeskError } from "../sevdesk/errors.js";
 import {
@@ -39,6 +40,13 @@ import {
 const RESETTABLE = ["invoice", "credit_note", "voucher"] as const;
 type Resettable = (typeof RESETTABLE)[number];
 type Target = "draft" | "open";
+
+/** The sevdesk operation of each reset, for audit events. */
+const RESET_OPERATION: Readonly<Record<Resettable, Record<Target, OperationId>>> = {
+  invoice: { draft: "invoiceResetToDraft", open: "invoiceResetToOpen" },
+  credit_note: { draft: "creditNoteResetToDraft", open: "creditNoteResetToOpen" },
+  voucher: { draft: "voucherResetToDraft", open: "voucherResetToOpen" },
+};
 
 /** Status codes of draft and open per document type. */
 const TARGET_STATUS: Readonly<Record<Resettable, Record<Target, number>>> = {
@@ -136,6 +144,7 @@ export const resetDocumentStatus = defineTool({
     "execute." +
     FOREIGN_DATA_NOTE,
   class: "W+",
+  operationId: (args) => RESET_OPERATION[args.documentType][args.target],
   operations: [
     "getInvoiceById",
     "getcreditNoteById",
@@ -336,6 +345,13 @@ const ENSHRINE_FROM: Readonly<Record<(typeof ENSHRINABLE)[number], number>> = {
   voucher: 100,
 };
 
+/** The sevdesk operation of each type; with the bare ID it forms the once-per-document lock. */
+const ENSHRINE_OPERATION: Readonly<Record<(typeof ENSHRINABLE)[number], OperationId>> = {
+  invoice: "invoiceEnshrine",
+  credit_note: "creditNoteEnshrine",
+  voucher: "voucherEnshrine",
+};
+
 const enshrineOutput = z.object({
   documentType: z.enum(ENSHRINABLE),
   documentId: z.number().int(),
@@ -355,6 +371,7 @@ export const enshrineDocument = defineTool({
     FOREIGN_DATA_NOTE,
   class: "X",
   defaultEnabled: false,
+  operationId: (args) => ENSHRINE_OPERATION[args.documentType],
   operations: [
     "getInvoiceById",
     "getcreditNoteById",
@@ -369,8 +386,11 @@ export const enshrineDocument = defineTool({
     documentId: documentIdInput,
   }),
   annotations: IRREVERSIBLE_ANNOTATIONS,
-  // The type is part of the target: invoice 5 and voucher 5 are different documents.
-  targetId: (args) => `${args.documentType}:${args.documentId}`,
+  // The bare ID, as sevdesk_api_request derives it from the path: the lock
+  // key is operation plus target, so tool and fallback share one lock and
+  // one unknown-outcome marker per document, while the operation keeps
+  // invoice 5 and voucher 5 apart.
+  targetId: (args) => args.documentId,
   summary: (args) =>
     `Enshrine ${DOCUMENT_LABELS[args.documentType]} ${args.documentId}; this is legally irreversible.`,
   async preview(args, call) {
