@@ -143,8 +143,14 @@ describe("built stdio binary", () => {
     expect(stderr).not.toContain(TEST_TOKEN);
   });
 
-  /** Secret variable names still in the server's process.env after startup. */
-  async function secretsLeftAfterStart(session: StdioSession): Promise<string[]> {
+  interface ProbeReport {
+    /** Secret variable names still in the server's process.env after startup. */
+    present: string[];
+    /** Secret variable names the keychain tool was started with. */
+    keychainEnv?: string[];
+  }
+
+  async function probeReport(session: StdioSession): Promise<ProbeReport> {
     const init = await session.request(1, "initialize", {
       protocolVersion: "2025-11-25",
       capabilities: {},
@@ -156,8 +162,11 @@ describe("built stdio binary", () => {
       .split("\n")
       .find((entry) => entry.startsWith("env-probe "));
     expect(line, "the env probe did not report").toBeDefined();
-    return (JSON.parse(line?.slice("env-probe ".length) ?? "{}") as { present: string[] }).present;
+    return JSON.parse(line?.slice("env-probe ".length) ?? "{}") as ProbeReport;
   }
+
+  const secretsLeftAfterStart = async (session: StdioSession) =>
+    (await probeReport(session)).present;
 
   async function accountInfo(session: StdioSession): Promise<void> {
     session.notify("notifications/initialized");
@@ -194,12 +203,14 @@ describe("built stdio binary", () => {
         env: childEnv({
           // Blank counts as unset, so the keychain is asked.
           SEVDESK_API_TOKEN: "",
+          SEVDESK_CONFIRM_SECRET: "s".repeat(40),
           PROBE_KEYCHAIN_TOKEN: keychainToken,
           SEVDESK_BASE_URL: mockBaseUrl,
         }),
       }),
     );
-    expect(await secretsLeftAfterStart(session)).toEqual([]);
+    // Neither the server afterwards nor the keychain tool sees the secrets.
+    expect(await probeReport(session)).toEqual({ present: [], keychainEnv: [] });
     await accountInfo(session);
     expect(seenHeaders.at(-1)?.authorization).toBe(keychainToken);
     expect(await session.close()).toBe(0);

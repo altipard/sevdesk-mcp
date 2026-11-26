@@ -4,6 +4,8 @@ import { execFile as nodeExecFile } from "node:child_process";
 export const KEYCHAIN_SERVICE = "sevdesk-mcp";
 export const KEYCHAIN_ACCOUNT = "api-token";
 export const KEYCHAIN_TIMEOUT_MS = 5000;
+/** Variables holding secrets of this server; no child process gets them. */
+export const SECRET_ENV_VARIABLES = ["SEVDESK_API_TOKEN", "SEVDESK_CONFIRM_SECRET"] as const;
 const ENTRY = `service ${KEYCHAIN_SERVICE}, account ${KEYCHAIN_ACCOUNT}`;
 
 export interface ExecFileError extends Error {
@@ -16,7 +18,13 @@ export interface ExecFileError extends Error {
 export type ExecFileFn = (
   file: string,
   args: readonly string[],
-  options: { encoding: "utf8"; timeout: number; maxBuffer: number; windowsHide: boolean },
+  options: {
+    encoding: "utf8";
+    timeout: number;
+    maxBuffer: number;
+    windowsHide: boolean;
+    env: Record<string, string | undefined>;
+  },
   callback: (error: ExecFileError | null, stdout: string, stderr: string) => void,
 ) => unknown;
 
@@ -36,6 +44,18 @@ export interface KeychainOptions {
   platform?: NodeJS.Platform;
   execFile?: ExecFileFn;
   timeoutMs?: number;
+  /** Environment the lookup tool starts from; the secrets are removed. */
+  env?: Record<string, string | undefined>;
+}
+
+/**
+ * A copy of `env` without the server's secrets. The rest stays: PATH finds
+ * secret-tool, and the Secret Service needs the D-Bus session variables.
+ */
+function childEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  const copy = { ...env };
+  for (const name of SECRET_ENV_VARIABLES) delete copy[name];
+  return copy;
 }
 
 interface Lookup {
@@ -85,7 +105,13 @@ export function readKeychainToken(options: KeychainOptions = {}): Promise<Keycha
       execFile(
         lookup.file,
         lookup.args,
-        { encoding: "utf8", timeout, maxBuffer: 64 * 1024, windowsHide: true },
+        {
+          encoding: "utf8",
+          timeout,
+          maxBuffer: 64 * 1024,
+          windowsHide: true,
+          env: childEnv(options.env ?? process.env),
+        },
         (error, stdout) => {
           if (error) {
             if (error.code === "ENOENT") resolve({ status: "unavailable" });
@@ -132,7 +158,7 @@ export interface TokenResolution {
  */
 export async function resolveApiToken(
   env: Record<string, string | undefined>,
-  read: () => Promise<KeychainResult> = () => readKeychainToken(),
+  read: () => Promise<KeychainResult> = () => readKeychainToken({ env }),
 ): Promise<TokenResolution> {
   if ((env.SEVDESK_API_TOKEN ?? "").trim() !== "") return { env, source: "env" };
   const result = await read();
