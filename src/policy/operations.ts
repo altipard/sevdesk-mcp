@@ -266,6 +266,8 @@ export const OPERATIONS = {
       { name: "contact[objectName]", in: "query", type: "string", required: false },
       { name: "type", in: "query", type: "string", required: false },
       { name: "main", in: "query", type: "string", required: false },
+      { name: "limit", in: "query", type: "integer", required: false },
+      { name: "offset", in: "query", type: "integer", required: false },
     ],
   },
   createCommunicationWay: {

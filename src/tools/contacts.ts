@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { defineTool, type ToolCall } from "../policy/registry.js";
+import { SevdeskError } from "../sevdesk/errors.js";
 import {
   asRecord,
   badInput,
@@ -124,53 +125,127 @@ async function scanByName(
   return { matches, checked, truncated: true };
 }
 
+/** E-mail addresses checked by an e-mail search, paged like the name scan. */
+export const MAX_EMAILS_SCANNED = 500;
+/** Contacts fetched one by one for an e-mail search, so one call stays bounded. */
+export const MAX_EMAIL_CONTACT_FETCHES = 100;
+
+async function scanEmails(
+  { sevdesk }: ToolCall,
+  needle: string,
+): Promise<{ byContact: Map<number, string>; checked: number; truncated: boolean }> {
+  const byContact = new Map<number, string>();
+  let checked = 0;
+  for (let offset = 0; offset < MAX_EMAILS_SCANNED; offset += SCAN_PAGE) {
+    const body = await sevdesk.call(
+      sevdesk.api.GET("/CommunicationWay", {
+        params: { query: { type: "EMAIL", limit: SCAN_PAGE, offset } },
+      }),
+    );
+    const page = objectsOf(body);
+    checked += page.length;
+    for (const way of page) {
+      const value = text(way.value);
+      const contactId = refId(way.contact);
+      if (value !== null && contactId !== null && fold(value).includes(needle)) {
+        if (!byContact.has(contactId)) byContact.set(contactId, value);
+      }
+    }
+    if (page.length < SCAN_PAGE) return { byContact, checked, truncated: false };
+  }
+  return { byContact, checked, truncated: true };
+}
+
+/** The contact, or undefined if sevdesk no longer has it (404 or empty answer). */
+async function contactOrMissing(
+  { sevdesk }: ToolCall,
+  contactId: number,
+): Promise<Raw | undefined> {
+  try {
+    const body = await sevdesk.call(
+      sevdesk.api.GET("/Contact/{contactId}", { params: { path: { contactId } } }),
+    );
+    return objectsOf(body)[0];
+  } catch (error) {
+    if (error instanceof SevdeskError && error.kind === "not_found") return undefined;
+    throw error;
+  }
+}
+
 async function searchByEmail(
   call: ToolCall,
   needle: string,
-  args: { limit: number; offset: number },
+  args: { limit: number; offset: number; includePersons: boolean },
 ): Promise<SearchOutput> {
-  const { sevdesk } = call;
-  // GET /CommunicationWay declares no paging, so this is one answer of
-  // whatever size sevdesk sends; the result says how many were checked.
-  const body = await sevdesk.call(
-    sevdesk.api.GET("/CommunicationWay", { params: { query: { type: "EMAIL" } } }),
-  );
-  const ways = objectsOf(body);
-  const byContact = new Map<number, string>();
-  for (const way of ways) {
-    const value = text(way.value);
-    const contactId = refId(way.contact);
-    if (value !== null && contactId !== null && fold(value).includes(needle)) {
-      if (!byContact.has(contactId)) byContact.set(contactId, value);
-    }
-  }
-  const ids = [...byContact.keys()].sort((a, b) => a - b);
-  const pageIds = ids.slice(args.offset, args.offset + args.limit);
+  const scan = await scanEmails(call, needle);
+  const ids = [...scan.byContact.keys()].sort((a, b) => a - b);
   const contacts: SearchOutput["contacts"] = [];
-  for (const contactId of pageIds) {
-    const contactBody = await sevdesk.call(
-      sevdesk.api.GET("/Contact/{contactId}", { params: { path: { contactId } } }),
-    );
-    const raw = objectsOf(contactBody)[0];
-    if (raw === undefined) continue;
-    contacts.push({ ...mapContactSummary(raw), matchedEmail: byContact.get(contactId) as string });
+  let missing = 0;
+  let fetches = 0;
+  let fetchCapped = false;
+  let page: SearchOutput["page"];
+
+  if (args.includePersons) {
+    // Every match counts, so total is known and only this page is fetched.
+    for (const contactId of ids.slice(args.offset, args.offset + args.limit)) {
+      const raw = await contactOrMissing(call, contactId);
+      if (raw === undefined) {
+        missing++;
+        continue;
+      }
+      contacts.push({
+        ...mapContactSummary(raw),
+        matchedEmail: scan.byContact.get(contactId) as string,
+      });
+    }
+    page = pageOf(args.offset, args.limit, contacts.length, ids.length);
+  } else {
+    // Whether a match is a person shows only on the contact itself: walk the
+    // matches in order, skip persons, stop when the page is full or the
+    // fetch budget is spent. total is unknown then.
+    let eligible = 0;
+    let index = 0;
+    for (; index < ids.length && contacts.length < args.limit; index++) {
+      if (fetches >= MAX_EMAIL_CONTACT_FETCHES) {
+        fetchCapped = true;
+        break;
+      }
+      const contactId = ids[index] as number;
+      fetches++;
+      const raw = await contactOrMissing(call, contactId);
+      if (raw === undefined) {
+        missing++;
+        continue;
+      }
+      const summary = mapContactSummary(raw);
+      if (summary.isPerson) continue;
+      eligible++;
+      if (eligible > args.offset) {
+        contacts.push({ ...summary, matchedEmail: scan.byContact.get(contactId) as string });
+      }
+    }
+    page = {
+      ...pageOf(args.offset, args.limit, contacts.length, null),
+      hasMore: index < ids.length,
+    };
   }
-  const page = pageOf(args.offset, args.limit, contacts.length, ids.length);
-  // The spec's introduction: a request without limit returns entries "up
-  // to a limit of 100". A full answer may therefore be cut.
-  const truncated = ways.length >= SCAN_PAGE;
+
+  const notes = [
+    scan.truncated &&
+      `Checked the first ${scan.checked} e-mail addresses only; later ones may match too. ` +
+        "Use a more specific query or search by name or customer number.",
+    fetchCapped &&
+      `Stopped after looking up ${MAX_EMAIL_CONTACT_FETCHES} contacts; raise offset for more.`,
+    missing > 0 && `${missing} matching contacts no longer exist in sevdesk and were skipped.`,
+  ].filter((note): note is string => typeof note === "string");
   return {
     contacts,
     page,
     scan: {
       mode: "email",
-      checked: ways.length,
-      truncated,
-      ...(truncated && {
-        note:
-          `sevdesk returned ${ways.length} e-mail addresses in one answer and may have more; ` +
-          "contacts beyond them are not found. Search by name or customer number instead.",
-      }),
+      checked: scan.checked,
+      truncated: scan.truncated || fetchCapped,
+      ...(notes.length > 0 && { note: notes.join(" ") }),
     },
   };
 }
@@ -181,9 +256,9 @@ export const searchContacts = defineTool({
   description:
     "Finds customers, suppliers and other contacts. customerNumber uses sevdesk's own filter " +
     "(exact). query searches name and customer number (case- and accent-insensitive); a query " +
-    "containing '@' searches e-mail addresses instead (persons and organisations alike). " +
-    "sevdesk cannot filter by name, so a " +
-    `query checks at most ${MAX_CONTACTS_SCANNED} contacts and says when it stopped early. ` +
+    "containing '@' searches e-mail addresses instead. sevdesk cannot filter by name or " +
+    `e-mail, so a query checks at most ${MAX_CONTACTS_SCANNED} contacts or ` +
+    `${MAX_EMAILS_SCANNED} e-mail addresses and says when it stopped early. ` +
     "Without filters it lists contacts page by page. Use get_contact for addresses and " +
     "communication details, and the returned id as contactId in the invoice, order and " +
     "voucher searches.",
@@ -201,7 +276,7 @@ export const searchContacts = defineTool({
     includePersons: z
       .boolean()
       .default(true)
-      .describe("Also return persons, not only organisations."),
+      .describe("Also return persons, not only organisations (all search modes)."),
     ...pageInput,
   }),
   outputSchema: searchOutput,

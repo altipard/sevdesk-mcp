@@ -127,6 +127,11 @@ actions:
   - target: "$.paths['/Part'].get.parameters"
     description: Pagination and embed on GET /Part
     update: *listParameters
+  - target: "$.paths['/CommunicationWay'].get.parameters"
+    description: Pagination on GET /CommunicationWay (e-mail search pages through it)
+    update:
+      - $ref: "#/components/parameters/limit"
+      - $ref: "#/components/parameters/offset"
   - target: "$.paths['/CheckAccount'].get"
     description: Pagination and embed on GET /CheckAccount, which has no parameter list upstream
     update:

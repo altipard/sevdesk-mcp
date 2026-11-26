@@ -123,30 +123,113 @@ describe("search_contacts", () => {
     const c = await connect();
     const data = structured<Search>(await c.call("search_contacts", { query: "@MUSTER.example" }));
     expect(api.requests.map(pathOf)).toEqual(["/CommunicationWay", "/Contact/2001"]);
-    expect(queryOf(api.requests[0])).toEqual({ type: "EMAIL" });
+    expect(queryOf(api.requests[0])).toEqual({ type: "EMAIL", limit: "100", offset: "0" });
     expect(data.contacts).toEqual([
       expect.objectContaining({ id: 2001, matchedEmail: "buchhaltung@muster.example" }),
     ]);
     expect(data.scan).toEqual({ mode: "email", checked: 2, truncated: false });
   });
 
-  it("says when the e-mail answer may have been cut", async () => {
+  it("pages through e-mail addresses up to the scan limit and says so", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/CommunicationWay"), ({ request }) => {
+        const offset = Number(new URL(request.url).searchParams.get("offset"));
+        return HttpResponse.json(
+          list(
+            Array.from({ length: 100 }, (_, i) =>
+              communicationWay({
+                id: String(7000 + offset + i),
+                value: `x${offset + i}@other.example`,
+                contact: { id: String(3000 + offset + i), objectName: "Contact" },
+              }),
+            ),
+          ),
+        );
+      }),
+    );
+    const c = await connect();
+    const data = structured<Search>(await c.call("search_contacts", { query: "@muster" }));
+    expect(api.requests.map((r) => queryOf(r).offset)).toEqual(["0", "100", "200", "300", "400"]);
+    expect(data.contacts).toEqual([]);
+    expect(data.scan).toMatchObject({ mode: "email", checked: 500, truncated: true });
+    expect(String(data.scan?.note)).toContain("first 500 e-mail addresses");
+  });
+
+  it("skips matches whose contact is gone instead of failing", async () => {
     api.server.use(
       http.get(sevdeskUrl("/CommunicationWay"), () =>
         HttpResponse.json(
-          list(
-            Array.from({ length: 100 }, (_, i) =>
-              communicationWay({ id: String(7000 + i), value: `x${i}@other.example` }),
-            ),
-          ),
+          list([
+            communicationWay(),
+            communicationWay({ id: "6009", value: "alt@muster.example", contact: { id: "2009" } }),
+          ]),
         ),
+      ),
+      http.get(sevdeskUrl("/Contact/2001"), () => HttpResponse.json(list([contact()]))),
+      http.get(sevdeskUrl("/Contact/2009"), () =>
+        HttpResponse.json({ error: { message: "gone" } }, { status: 404 }),
       ),
     );
     const c = await connect();
     const data = structured<Search>(await c.call("search_contacts", { query: "@muster" }));
+    expect(data.contacts.map((x) => x.id)).toEqual([2001]);
+    expect(String(data.scan?.note)).toContain("1 matching contacts no longer exist");
+  });
+
+  it("leaves persons out when includePersons is false, in every mode", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/CommunicationWay"), () =>
+        HttpResponse.json(
+          list([
+            communicationWay({ contact: { id: "2002" }, value: "erika@muster.example" }),
+            communicationWay(),
+          ]),
+        ),
+      ),
+      http.get(sevdeskUrl("/Contact/2001"), () => HttpResponse.json(list([contact()]))),
+      http.get(sevdeskUrl("/Contact/2002"), () => HttpResponse.json(list([person()]))),
+      http.get(sevdeskUrl("/Contact"), () => HttpResponse.json(list([contact()]))),
+    );
+    const c = await connect();
+    const withPersons = structured<Search>(await c.call("search_contacts", { query: "@muster" }));
+    expect(withPersons.contacts.map((x) => x.id)).toEqual([2001, 2002]);
+    const orgsOnly = structured<Search>(
+      await c.call("search_contacts", { query: "@muster", includePersons: false }),
+    );
+    expect(orgsOnly.contacts.map((x) => x.id)).toEqual([2001]);
+    expect(orgsOnly.page).toMatchObject({ total: null, hasMore: false });
+    await c.call("search_contacts", { query: "muster", includePersons: false });
+    expect(queryOf(api.requests.at(-1))).toMatchObject({ depth: "0" });
+  });
+
+  it("bounds the contact look-ups when persons are filtered out", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/CommunicationWay"), () =>
+        HttpResponse.json(
+          list(
+            Array.from({ length: 99 }, (_, i) =>
+              communicationWay({ id: String(i + 1), contact: { id: String(5000 + i) } }),
+            ).concat(
+              Array.from({ length: 50 }, (_, i) =>
+                communicationWay({ id: String(i + 200), contact: { id: String(6000 + i) } }),
+              ),
+            ),
+          ),
+        ),
+      ),
+      http.get(sevdeskUrl("/Contact/:id"), ({ params }) =>
+        HttpResponse.json(list([person({ id: String(params.id) })])),
+      ),
+    );
+    const c = await connect();
+    const data = structured<Search>(
+      await c.call("search_contacts", { query: "@muster", includePersons: false }),
+    );
+    const lookups = api.requests.filter((r) => /\/Contact\/\d+$/.test(r.url));
+    expect(lookups).toHaveLength(100);
     expect(data.contacts).toEqual([]);
-    expect(data.scan).toMatchObject({ mode: "email", checked: 100, truncated: true });
-    expect(String(data.scan?.note)).toContain("may have more");
+    expect(data.scan).toMatchObject({ truncated: true });
+    expect(String(data.scan?.note)).toContain("Stopped after looking up 100 contacts");
   });
 
   it("rejects query and customerNumber together, and short queries", async () => {
