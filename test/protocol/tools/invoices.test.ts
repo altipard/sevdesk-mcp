@@ -112,7 +112,9 @@ describe("search_invoices", () => {
       { status: "200" },
       { contactId: 0 },
     ]) {
-      expect((await c.call("search_invoices", args)).isError, JSON.stringify(args)).toBe(true);
+      const result = await c.call("search_invoices", args);
+      expect(result.isError, JSON.stringify(args)).toBe(true);
+      expect(textOf(result), JSON.stringify(args)).not.toContain("Internal error");
     }
     const reversed = await c.call("search_invoices", {
       startDate: "2026-02-01",

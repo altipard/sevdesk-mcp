@@ -27,8 +27,12 @@ export const isoDate = z
   .regex(ISO_DATE, { error: "must be a date as YYYY-MM-DD" })
   .refine(
     (value) => {
+      // zod runs refinements even after the regex failed; without this
+      // guard "01.01.2026" would throw a RangeError instead of an issue.
+      if (!ISO_DATE.test(value)) return true;
       const [y, m, d] = value.split("-").map(Number) as [number, number, number];
-      return new Date(Date.UTC(y, m - 1, d)).toISOString().slice(0, 10) === value;
+      const date = new Date(Date.UTC(y, m - 1, d));
+      return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
     },
     { error: "is not a valid calendar date" },
   );
