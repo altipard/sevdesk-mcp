@@ -1,7 +1,7 @@
 {
   "name": "@altipard/sevdesk-mcp",
   "version": "0.1.0",
-  "description": "Curated MCP server for the sevdesk accounting API, read-only by default",
+  "description": "Unofficial sevdesk MCP server: curated, read-only-by-default tools for the sevdesk accounting API (invoices, contacts, vouchers, banking)",
   "license": "MIT",
   "type": "module",
   "repository": {
@@ -13,10 +13,15 @@
     "url": "https://github.com/altipard/sevdesk-mcp/issues"
   },
   "keywords": [
-    "mcp",
-    "model-context-protocol",
     "sevdesk",
-    "accounting"
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "accounting",
+    "bookkeeping",
+    "invoices",
+    "germany",
+    "buchhaltung"
   ],
   "engines": {
     "node": ">=24"
