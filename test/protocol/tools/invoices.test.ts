@@ -308,9 +308,9 @@ describe("list_open_receivables", () => {
       totalsByType: Array<Record<string, unknown>>;
     };
     const standard = structured<Out>(await c.call("list_open_receivables", {}));
-    expect(standard.receivables.map((r) => r.id).sort()).toEqual([1, 4]);
+    expect(standard.receivables.map((r) => r.id).sort()).toEqual([1, 4, 5]);
     expect(standard.totals).toEqual([
-      expect.objectContaining({ currency: "EUR", count: 2, openAmount: 149 }),
+      expect.objectContaining({ currency: "EUR", count: 3, openAmount: 268 }),
     ]);
     expect(standard.totalsByType).toEqual([
       expect.objectContaining({
@@ -318,6 +318,12 @@ describe("list_open_receivables", () => {
         invoiceTypeName: "advance",
         count: 1,
         openAmount: 30,
+      }),
+      expect.objectContaining({
+        invoiceType: "other",
+        invoiceTypeName: "other",
+        count: 1,
+        openAmount: 119,
       }),
       expect.objectContaining({
         invoiceType: "RE",
@@ -334,6 +340,22 @@ describe("list_open_receivables", () => {
     expect(reminders.totalsByType).toEqual([
       expect.objectContaining({ invoiceType: "MA", invoiceTypeName: "reminder", openAmount: 124 }),
     ]);
+
+    // An explicit type list stays exact: untyped invoices are not "other" there.
+    const onlyInvoices = structured<Out>(
+      await c.call("list_open_receivables", { invoiceTypes: ["RE"] }),
+    );
+    expect(onlyInvoices.receivables.map((r) => r.id)).toEqual([1]);
+
+    // Even all five default codes, passed explicitly, are an explicit filter.
+    const explicitDefaults = structured<Out>(
+      await c.call("list_open_receivables", { invoiceTypes: ["RE", "WKR", "TR", "AR", "ER"] }),
+    );
+    expect(explicitDefaults.receivables.map((r) => r.id).sort()).toEqual([1, 4]);
+    expect(explicitDefaults.totals).toEqual([
+      expect.objectContaining({ count: 2, openAmount: 149 }),
+    ]);
+    expect(explicitDefaults.totalsByType.map((t) => t.invoiceType)).toEqual(["AR", "RE"]);
 
     for (const invoiceTypes of [[], ["XX"]]) {
       expect((await c.call("list_open_receivables", { invoiceTypes })).isError).toBe(true);

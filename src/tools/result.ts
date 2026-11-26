@@ -24,21 +24,156 @@ export function present<T extends Record<string, unknown>>(data: T, presentation
 }
 
 /**
+ * Budget for the text of one tool answer (summary line plus JSON). Texts are
+ * capped per field, but a list of 100 entries with long texts still adds up;
+ * this is the same bound the generic tool applies (MAX_RESPONSE_CHARS).
+ */
+export const MAX_TOOL_RESPONSE_CHARS = 100_000;
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** Arrays directly in the answer or one object level down, e.g. `invoice.positions`. */
+function listPaths(data: Record<string, unknown>): string[][] {
+  const paths: string[][] = [];
+  for (const [key, value] of Object.entries(data)) {
+    if (Array.isArray(value)) paths.push([key]);
+    else if (isPlainObject(value)) {
+      for (const [inner, innerValue] of Object.entries(value)) {
+        if (Array.isArray(innerValue)) paths.push([key, inner]);
+      }
+    }
+  }
+  return paths;
+}
+
+function listAt(data: Record<string, unknown>, path: readonly string[]): unknown[] {
+  const [key, inner] = path as [string, string?];
+  const holder = inner === undefined ? data : (data[key] as Record<string, unknown>);
+  return holder[inner ?? key] as unknown[];
+}
+
+/** Copy of `data` with the list at `path` cut to its first `kept` entries. */
+function withList(
+  data: Record<string, unknown>,
+  path: readonly string[],
+  kept: number,
+): Record<string, unknown> {
+  const [key, inner] = path as [string, string?];
+  if (inner === undefined) return { ...data, [key]: (data[key] as unknown[]).slice(0, kept) };
+  const holder = data[key] as Record<string, unknown>;
+  return { ...data, [key]: { ...holder, [inner]: (holder[inner] as unknown[]).slice(0, kept) } };
+}
+
+interface Cut {
+  readonly path: readonly string[];
+  readonly kept: number;
+  readonly total: number;
+}
+
+/**
+ * Marks a cut answer: `truncated` and a note (appended to an existing one),
+ * and for the list a page describes, the page's count and hasMore.
+ */
+function markCut(data: Record<string, unknown>, cuts: readonly Cut[]): Record<string, unknown> {
+  const parts = cuts.map(
+    (cut) => `${cut.path.join(".")}: first ${cut.kept} of ${cut.total} entries`,
+  );
+  const cutNote =
+    `Answer cut to stay under ${MAX_TOOL_RESPONSE_CHARS} characters (${parts.join("; ")}). ` +
+    "Use limit/offset or narrower filters for the rest.";
+  const marked: Record<string, unknown> = {
+    ...data,
+    truncated: true,
+    note: typeof data.note === "string" && data.note !== "" ? `${data.note} ${cutNote}` : cutNote,
+  };
+  const page = data.page;
+  if (isPlainObject(page) && typeof page.count === "number") {
+    const listed = cuts.find((cut) => cut.total === page.count);
+    if (listed) marked.page = { ...page, count: listed.kept, hasMore: true };
+  }
+  return marked;
+}
+
+const OVER_BUDGET_NOTE = `This answer is over ${MAX_TOOL_RESPONSE_CHARS} characters and could not be cut further; narrow the request.`;
+
+const CUT_SUMMARY = `Answer cut to fit ${MAX_TOOL_RESPONSE_CHARS} characters, see note.`;
+
+interface Rendered {
+  readonly data: Record<string, unknown>;
+  readonly text: string;
+}
+
+function render(
+  data: Record<string, unknown>,
+  summary: string | undefined,
+  cut: boolean,
+): Rendered {
+  const json = JSON.stringify(data);
+  // The cut notice goes first: the summary is sliced, the notice must survive.
+  const line = summary
+    ? (cut ? `${CUT_SUMMARY} ${summary}` : summary).slice(0, MAX_SUMMARY_LENGTH)
+    : undefined;
+  return { data, text: line ? `${line}\n${json}` : json };
+}
+
+/**
+ * Cuts lists, largest first, until summary line plus JSON fit the budget.
+ * Always cuts whole entries and re-serializes, so the JSON stays valid and
+ * the text and structuredContent describe the same data.
+ *
+ * Known limit: the budget is not absolute. If no list is left to cut (the
+ * answer has none, or the rest is scalar fields and empty lists), the
+ * answer goes out over budget and its note says so.
+ */
+function fitBudget(data: Record<string, unknown>, summary: string | undefined): Rendered {
+  const whole = render(data, summary, false);
+  if (whole.text.length <= MAX_TOOL_RESPONSE_CHARS) return whole;
+
+  const candidates = listPaths(data)
+    .map((path) => ({ path, size: JSON.stringify(listAt(data, path)).length }))
+    .sort((a, b) => b.size - a.size);
+  let current = data;
+  const cuts: Cut[] = [];
+  for (const { path } of candidates) {
+    const total = listAt(current, path).length;
+    if (total === 0) continue;
+    const attempt = (kept: number) => {
+      const cut = [...cuts, { path, kept, total }];
+      return render(markCut(withList(current, path, kept), cut), summary, true);
+    };
+    let low = 0;
+    let high = total - 1;
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2);
+      if (attempt(mid).text.length <= MAX_TOOL_RESPONSE_CHARS) low = mid;
+      else high = mid - 1;
+    }
+    const rendered = attempt(low);
+    if (rendered.text.length <= MAX_TOOL_RESPONSE_CHARS) return rendered;
+    // Even an empty list is not enough: keep it empty and cut the next one.
+    cuts.push({ path, kept: low, total });
+    current = withList(current, path, low);
+  }
+  const base = cuts.length === 0 ? data : markCut(current, cuts);
+  const note = typeof base.note === "string" && base.note !== "" ? `${base.note} ` : "";
+  return render({ ...base, note: `${note}${OVER_BUDGET_NOTE}` }, summary, cuts.length > 0);
+}
+
+/**
  * Successful tool result: structured data plus the same data as compact
  * JSON text for clients that do not pass structuredContent on, preceded by
- * the tool's summary line if it set one.
+ * the tool's summary line if it set one. Answers over
+ * MAX_TOOL_RESPONSE_CHARS are cut list by list and marked truncated.
  */
 export function okResult<T extends Record<string, unknown>>(data: T): CallToolResult {
   const presentation = presentations.get(data);
-  const json = JSON.stringify(data);
   // One line, so the JSON is always the second line, whatever a summary holds.
-  const summary = presentation?.summary.replace(/\s+/g, " ").trim().slice(0, MAX_SUMMARY_LENGTH);
+  const summary = presentation?.summary.replace(/\s+/g, " ").trim();
+  const fitted = fitBudget(data, summary === "" ? undefined : summary);
   return {
-    content: [
-      { type: "text", text: summary ? `${summary}\n${json}` : json },
-      ...(presentation?.content ?? []),
-    ],
-    structuredContent: data,
+    content: [{ type: "text", text: fitted.text }, ...(presentation?.content ?? [])],
+    structuredContent: fitted.data,
   };
 }
 

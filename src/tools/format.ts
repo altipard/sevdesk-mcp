@@ -111,28 +111,33 @@ export const MAX_TEXT_LENGTH = 1000;
 export const TRUNCATION_MARK = " […]";
 
 /**
- * C0/C1 control characters except tab and newline, plus invisible format
- * characters that can hide or reorder text (soft hyphen, zero-width, line
- * separators, bidi overrides, BOM).
+ * Characters the model would read differently from a human, or not see at
+ * all: control (Cc), format (Cf: zero-width, bidi, soft hyphen, the Unicode
+ * tag block used for ASCII smuggling), private use (Co) and unassigned (Cn)
+ * code points, except tab and newline. The property classes do not cover
+ * variation selectors (marks), the combining grapheme joiner or the Hangul
+ * fillers (letters), which render as nothing, and the line and paragraph
+ * separators (Zl, Zp), so they are listed by hand. ZWNJ and ZWJ are kept here
+ * and judged in stripHidden.
  */
-function isHidden(code: number): boolean {
-  return (
-    (code <= 0x1f && code !== 0x09 && code !== 0x0a) ||
-    (code >= 0x7f && code <= 0x9f) ||
-    code === 0xad ||
-    (code >= 0x200b && code <= 0x200f) ||
-    (code >= 0x2028 && code <= 0x202e) ||
-    (code >= 0x2060 && code <= 0x2069) ||
-    code === 0xfeff
-  );
-}
+const HIDDEN =
+  /(?![\t\n\u200C\u200D])[\p{Cc}\p{Cf}\p{Co}\p{Cn}]|\u034F|[\uFE00-\uFE0F]|[\u061C\u2028\u2029\u115F\u1160\u180E\u3164\uFFA0]|[\u{E0100}-\u{E01EF}]/gu;
+
+/**
+ * Zero-width joiner and non-joiner are Cf too, but carry meaning between
+ * two visible characters: emoji sequences (family) and Persian or Indic
+ * words. HIDDEN leaves them alone; here they are dropped at the edge, next
+ * to whitespace and in runs, where they show nothing.
+ */
+const JOINER = /[\u200C\u200D]/g;
 
 function stripHidden(value: string): string {
-  let out = "";
-  for (const char of value.replace(/\r\n?/g, "\n")) {
-    if (!isHidden(char.codePointAt(0) as number)) out += char;
-  }
-  return out;
+  const cleaned = value.replace(/\r\n?/g, "\n").replace(HIDDEN, "");
+  return cleaned.replace(JOINER, (joiner, offset: number) => {
+    const visible = (char: string | undefined) =>
+      char !== undefined && !/[\s\u200C\u200D]/.test(char);
+    return visible(cleaned[offset - 1]) && visible(cleaned[offset + 1]) ? joiner : "";
+  });
 }
 
 /**
