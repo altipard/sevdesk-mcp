@@ -146,6 +146,23 @@ describe("error mapping", () => {
     expect(error.message).toBe("sevdesk did not answer within 20 ms.");
   });
 
+  it("maps a successful response that is not JSON", async () => {
+    server.use(
+      http.get(
+        url("/Part"),
+        () =>
+          new HttpResponse("<html>maintenance</html>", {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    );
+    const { client } = setup();
+    const error = await captureError(client.call(client.api.GET("/Part")));
+    expect(error.kind).toBe("http_error");
+    expect(error.message).toBe("sevdesk sent a response that is not valid JSON.");
+  });
+
   it("maps a network failure", async () => {
     server.use(http.get(url("/Part"), () => HttpResponse.error()));
     const { client } = setup({ retry: { maxRetries: 0 } });

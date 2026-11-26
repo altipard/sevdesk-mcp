@@ -182,7 +182,18 @@ export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClien
   return {
     api,
     async call<T>(request: Promise<ApiResult<T>>): Promise<T> {
-      const { data, error, response } = await request;
+      let result: ApiResult<T>;
+      try {
+        result = await request;
+      } catch (error) {
+        // openapi-fetch parses the body after our fetch returned; a body
+        // that is not JSON surfaces here as a SyntaxError.
+        if (error instanceof SyntaxError) {
+          throw new SevdeskError("http_error", "sevdesk sent a response that is not valid JSON.");
+        }
+        throw error;
+      }
+      const { data, error, response } = result;
       if (response.ok) return data as T;
       throw mapHttpError({
         status: response.status,
