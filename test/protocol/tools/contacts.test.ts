@@ -314,6 +314,34 @@ describe("search_contacts", () => {
     });
   });
 
+  it("cuts an oversized page to the response budget and says so", async () => {
+    const long = "m".repeat(2000);
+    api.server.use(
+      http.get(sevdeskUrl("/Contact"), () =>
+        HttpResponse.json(
+          list(
+            Array.from({ length: 100 }, (_, i) =>
+              contact({ id: String(9000 + i), name: long, surename: long, familyname: long }),
+            ),
+            250,
+          ),
+        ),
+      ),
+    );
+    const c = await connect();
+    const result = await c.call("search_contacts", { limit: 100 });
+    const data = structured<Search & { truncated?: boolean; note?: string }>(result);
+    expect(data.contacts.length).toBeGreaterThan(0);
+    expect(data.contacts.length).toBeLessThan(100);
+    expect(data.truncated).toBe(true);
+    expect(data.note).toContain("Answer cut");
+    expect(data.page).toMatchObject({ count: data.contacts.length, total: 250, hasMore: true });
+    const [first, second] = textOf(result).split("\n");
+    expect(first).toContain("cut to fit");
+    expect(JSON.parse(second ?? "")).toEqual(data);
+    expect(textOf(result).length).toBeLessThanOrEqual(100_000);
+  });
+
   it("rejects query and customerNumber together, and short queries", async () => {
     const c = await connect();
     const both = await c.call("search_contacts", { query: "ab", customerNumber: "1" });
