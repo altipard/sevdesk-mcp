@@ -37,8 +37,18 @@ const ID_AT_START = new RegExp(
 /** id as the last member of the top-level object (TypeScript clients). */
 const ID_AT_END = new RegExp(String.raw`[{,]\s*"id"\s*:\s*${JSON_ID}\s*\}\s*$`);
 
-/** The id of a message cut off unread, if its start or end names it; else null. */
+/** A request: "method" among the first members (after "jsonrpc" and "id", as clients send them). */
+const IS_REQUEST = new RegExp(
+  String.raw`^\s*\{\s*(?:"jsonrpc"\s*:\s*"2\.0"\s*,\s*)?(?:"id"\s*:\s*${JSON_ID}\s*,\s*)?"method"\s*:`,
+);
+
+/**
+ * The id of a request cut off unread, if its start or end names it; else
+ * null. Only requests: an oversized response from the client carries an id
+ * of the server's own, which must not be answered.
+ */
 function probeId(head: string, tail: string): string | number | null {
+  if (!IS_REQUEST.test(head)) return null;
   const match = ID_AT_START.exec(head) ?? ID_AT_END.exec(tail);
   if (!match?.[1]) return null;
   try {
@@ -53,9 +63,9 @@ function probeId(head: string, tail: string): string | number | null {
  * Passes stdin to the transport line by line and drops any line over
  * STDIO_MAX_MESSAGE_BYTES. The SDK transport ends the whole session when
  * its buffer overflows; here an oversized message only fails itself: what
- * was already passed on is terminated with a newline (the transport skips
- * the unparsable rest), and the client gets a JSON-RPC error with the
- * message's id where its start or end shows it.
+ * was already passed on is closed so that it cannot parse (the transport
+ * skips it), and a request gets a JSON-RPC error with its id where its
+ * start or end shows it.
  */
 class MessageSizeLimit extends Transform {
   #length = 0;
@@ -78,8 +88,10 @@ class MessageSizeLimit extends Transform {
       this.#length += part.length;
       if (!this.#dropping && this.#length > STDIO_MAX_MESSAGE_BYTES) {
         this.#dropping = true;
-        // Ends what the transport already holds of this line.
-        this.push(Buffer.from("\n"));
+        // Ends what the transport already holds of this line, with a byte
+        // JSON never contains: a cut that happens to be valid JSON (a whole
+        // request followed by padding) must not run.
+        this.push(Buffer.from("\u0000\n"));
       }
       if (newline === -1) {
         if (!this.#dropping) this.push(part);

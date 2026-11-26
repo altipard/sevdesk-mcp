@@ -226,7 +226,24 @@ describe("built stdio binary", () => {
     );
     expect(anonymous.error).toMatchObject({ code: -32000 });
 
+    // A whole request followed by padding: the cut would be valid JSON, but
+    // it must not run; the only answer is the error.
+    const before = seenHeaders.length;
+    const padded = await session.rawRequest(
+      6,
+      `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"get_account_info","arguments":{}}}${" ".repeat(16 * 1024 * 1024)}`,
+    );
+    expect(padded.error).toMatchObject({ code: -32000 });
+    // An oversized response from the client carries an id of the server's own: not echoed.
+    const response = await session.rawRequest(
+      null,
+      `{"jsonrpc":"2.0","id":7,"result":{"x":"${padding}"}}`,
+    );
+    expect(response.error).toMatchObject({ code: -32000 });
+
     const list = await session.request(5, "tools/list");
+    expect(seenHeaders.length).toBe(before);
+    expect(session.stdoutLines.filter((line) => line.includes('"id":6'))).toHaveLength(1);
     expect(list.result?.tools).toEqual(expect.arrayContaining([expect.anything()]));
     expect(await session.close()).toBe(0);
     expect(session.stderr.join("")).toContain("stdio message over the size limit dropped");
