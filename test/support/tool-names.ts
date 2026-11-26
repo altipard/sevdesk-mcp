@@ -9,6 +9,7 @@ export const READ_TOOLS = [
   "get_contact",
   "search_invoices",
   "get_invoice",
+  "get_document_pdf",
   "list_open_receivables",
   "search_orders",
   "search_vouchers",
@@ -17,4 +18,5 @@ export const READ_TOOLS = [
   "search_transactions",
   "search_parts",
   "get_tax_guidance",
+  "get_report",
 ] as const;
