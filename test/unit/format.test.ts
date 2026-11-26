@@ -129,7 +129,7 @@ describe("untrusted text", () => {
     ["Arabic letter mark", "\u061C"],
     ["combining grapheme joiner", "\u034F"],
     ["Hangul fillers", "\u115F\u1160\u3164\uFFA0"],
-    ["format characters (Cf)", "\u200B\u200D\u2066\u00AD\uFEFF"],
+    ["format characters (Cf)", "\u200B\u2060\u2066\u00AD\uFEFF"],
     ["line and paragraph separators", "\u2028\u2029"],
     ["control characters (Cc)", "\u0000\u001B\u007F\u0085"],
     ["private use (Co)", "\uE000\u{F0000}"],
@@ -137,6 +137,23 @@ describe("untrusted text", () => {
   ])("drops %s", (_name, hidden) => {
     expect(text(`a${hidden}b`)).toBe("ab");
     expect(text(hidden)).toBeNull();
+  });
+
+  it("keeps ZWJ and ZWNJ between visible characters", () => {
+    const family = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}";
+    expect(text(family)).toBe(family);
+    expect(text(`Familie ${family}!`)).toBe(`Familie ${family}!`);
+    // Persian "mi-khaham" is written with a ZWNJ after the prefix.
+    const persian = "\u0645\u06CC\u200C\u062E\u0648\u0627\u0647\u0645";
+    expect(text(persian)).toBe(persian);
+  });
+
+  it("drops joiners at the edge, next to spaces and in runs", () => {
+    expect(text("\u200Dab\u200C")).toBe("ab");
+    expect(text("a \u200D b")).toBe("a  b");
+    expect(text("a\u200D\u200Cb")).toBe("ab");
+    expect(text("a\u200D\u200D\u200Db")).toBe("ab");
+    expect(text("\u200D\u200C")).toBeNull();
   });
 
   it("keeps umlauts, accents, euro signs, CJK and emoji", () => {

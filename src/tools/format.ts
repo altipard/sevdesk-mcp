@@ -117,13 +117,27 @@ export const TRUNCATION_MARK = " […]";
  * code points, except tab and newline. The property classes do not cover
  * variation selectors (marks), the combining grapheme joiner or the Hangul
  * fillers (letters), which render as nothing, and the line and paragraph
- * separators (Zl, Zp), so they are listed by hand.
+ * separators (Zl, Zp), so they are listed by hand. ZWNJ and ZWJ are kept here
+ * and judged in stripHidden.
  */
 const HIDDEN =
-  /(?![\t\n])[\p{Cc}\p{Cf}\p{Co}\p{Cn}]|\u034F|[\uFE00-\uFE0F]|[\u061C\u2028\u2029\u115F\u1160\u180E\u3164\uFFA0]|[\u{E0100}-\u{E01EF}]/gu;
+  /(?![\t\n\u200C\u200D])[\p{Cc}\p{Cf}\p{Co}\p{Cn}]|\u034F|[\uFE00-\uFE0F]|[\u061C\u2028\u2029\u115F\u1160\u180E\u3164\uFFA0]|[\u{E0100}-\u{E01EF}]/gu;
+
+/**
+ * Zero-width joiner and non-joiner are Cf too, but carry meaning between
+ * two visible characters: emoji sequences (family) and Persian or Indic
+ * words. HIDDEN leaves them alone; here they are dropped at the edge, next
+ * to whitespace and in runs, where they show nothing.
+ */
+const JOINER = /[\u200C\u200D]/g;
 
 function stripHidden(value: string): string {
-  return value.replace(/\r\n?/g, "\n").replace(HIDDEN, "");
+  const cleaned = value.replace(/\r\n?/g, "\n").replace(HIDDEN, "");
+  return cleaned.replace(JOINER, (joiner, offset: number) => {
+    const visible = (char: string | undefined) =>
+      char !== undefined && !/[\s\u200C\u200D]/.test(char);
+    return visible(cleaned[offset - 1]) && visible(cleaned[offset + 1]) ? joiner : "";
+  });
 }
 
 /**
