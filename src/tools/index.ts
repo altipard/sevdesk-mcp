@@ -1,11 +1,14 @@
 import type { ToolDefinition } from "../policy/registry.js";
 import { getAccountInfo } from "./account.js";
+import { getContact, searchContacts } from "./contacts.js";
 import { GENERIC_TOOL_NAME } from "./generic.js";
 import { getInvoice, listOpenReceivables, searchInvoices } from "./invoices.js";
 
 /** Every curated tool. New tools are added here and nowhere else. */
 export const TOOLS: readonly ToolDefinition[] = [
   getAccountInfo,
+  searchContacts,
+  getContact,
   searchInvoices,
   getInvoice,
   listOpenReceivables,

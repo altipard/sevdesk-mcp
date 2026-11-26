@@ -5,6 +5,8 @@
  */
 export const READ_TOOLS = [
   "get_account_info",
+  "search_contacts",
+  "get_contact",
   "search_invoices",
   "get_invoice",
   "list_open_receivables",
