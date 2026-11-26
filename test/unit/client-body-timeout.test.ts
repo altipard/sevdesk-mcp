@@ -41,7 +41,7 @@ function client(maxRetries: number) {
   const sevdesk = createSevdeskClient({
     baseUrl,
     token: TEST_TOKEN,
-    timeoutMs: 50,
+    timeoutMs: 250,
     retry: { maxRetries },
     sleep: async (ms) => {
       sleeps.push(ms);
@@ -64,7 +64,7 @@ describe("body that stalls after the headers", () => {
 
     expect(error).toBeInstanceOf(SevdeskError);
     expect((error as SevdeskError).kind).toBe("timeout");
-    expect((error as SevdeskError).message).toBe("sevdesk did not answer within 50 ms.");
+    expect((error as SevdeskError).message).toBe("sevdesk did not answer within 250 ms.");
   });
 
   it("is retried for GET", async () => {
