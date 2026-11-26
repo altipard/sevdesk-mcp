@@ -7,9 +7,11 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { MAX_VOUCHER_FILE_BYTES } from "../../src/tools/voucher-writes.js";
 import { VERSION } from "../../src/version.js";
 import { TEST_TOKEN } from "../helpers.js";
 import { READ_TOOLS } from "../support/tool-names.js";
+import { pdfAtLimit, voucherArguments, voucherRoute } from "../support/voucher-upload.js";
 
 // Runs the built binary as an MCP client would start it. msw cannot reach a
 // child process, so a real HTTP server on a random port stands in for sevdesk.
@@ -22,6 +24,8 @@ const ENV_PROBE = pathToFileURL(
 let mock: Server;
 let mockBaseUrl: string;
 const seenHeaders: IncomingHttpHeaders[] = [];
+/** Body sizes of the file uploads the mock received. */
+const uploads: number[] = [];
 
 beforeAll(async () => {
   if (!existsSync(BIN)) {
@@ -29,13 +33,26 @@ beforeAll(async () => {
   }
   mock = createServer((req, res) => {
     seenHeaders.push(req.headers);
-    if (req.method === "GET" && req.url === "/api/v1/Tools/bookkeepingSystemVersion") {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ objects: { version: "2.0" } }));
-      return;
-    }
-    res.writeHead(404, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: { message: "not mocked" } }));
+    let bytes = 0;
+    req.on("data", (chunk: Buffer) => {
+      bytes += chunk.length;
+    });
+    req.on("end", () => {
+      uploads.push(...(req.url?.endsWith("/uploadTempFile") ? [bytes] : []));
+      if (req.method === "GET" && req.url === "/api/v1/Tools/bookkeepingSystemVersion") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ objects: { version: "2.0" } }));
+        return;
+      }
+      const answer = voucherRoute(req.method ?? "", req.url ?? "");
+      if (answer !== undefined) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(answer));
+        return;
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "not mocked" } }));
+    });
   });
   await new Promise<void>((resolve) => mock.listen(0, "127.0.0.1", resolve));
   const { port } = mock.address() as AddressInfo;
@@ -53,7 +70,7 @@ function childEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
 
 interface JsonRpcMessage {
   jsonrpc: "2.0";
-  id?: number;
+  id?: number | null;
   result?: Record<string, unknown>;
   error?: unknown;
 }
@@ -68,13 +85,14 @@ class StdioSession {
     createInterface({ input: child.stdout }).on("line", (line) => {
       this.stdoutLines.push(line);
       const message = JSON.parse(line) as JsonRpcMessage;
-      if (message.id !== undefined) this.pending.get(message.id)?.(message);
+      if (message.id === null) this.pending.get(-1)?.(message);
+      else if (message.id !== undefined) this.pending.get(message.id)?.(message);
     });
   }
 
-  request(id: number, method: string, params: Record<string, unknown> = {}) {
+  request(id: number, method: string, params: Record<string, unknown> = {}, timeoutMs = 5000) {
     return new Promise<JsonRpcMessage>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`no answer to ${method}`)), 5000);
+      const timer = setTimeout(() => reject(new Error(`no answer to ${method}`)), timeoutMs);
       this.pending.set(id, (message) => {
         clearTimeout(timer);
         resolve(message);
@@ -85,6 +103,20 @@ class StdioSession {
 
   notify(method: string) {
     this.send({ jsonrpc: "2.0", method });
+  }
+
+  /** Writes a raw line and waits for the answer with `id` (or with id null). */
+  rawRequest(id: number | null, line: string, timeoutMs = 15_000) {
+    return new Promise<JsonRpcMessage>((resolve, reject) => {
+      const key = id ?? -1;
+      const timer = setTimeout(() => reject(new Error(`no answer to raw line ${id}`)), timeoutMs);
+      this.pending.set(key, (message) => {
+        clearTimeout(timer);
+        this.pending.delete(key);
+        resolve(message);
+      });
+      this.child.stdin.write(`${line}\n`);
+    });
   }
 
   private send(message: Record<string, unknown>) {
@@ -142,6 +174,63 @@ describe("built stdio binary", () => {
     expect(stderr).toContain('"msg":"sevdesk request"');
     expect(stderr).not.toContain(TEST_TOKEN);
   });
+
+  it("takes a voucher file at the limit and survives a message over the limit", async () => {
+    const session = new StdioSession(
+      spawn(process.execPath, [BIN], {
+        env: childEnv({
+          SEVDESK_API_TOKEN: TEST_TOKEN,
+          SEVDESK_BASE_URL: mockBaseUrl,
+          SEVDESK_MODE: "write",
+          LOG_LEVEL: "warn",
+        }),
+      }),
+    );
+    await session.request(1, "initialize", {
+      protocolVersion: "2025-11-25",
+      capabilities: {},
+      clientInfo: { name: "stdio-test", version: "0.0.0" },
+    });
+    session.notify("notifications/initialized");
+
+    const created = await session.request(
+      2,
+      "tools/call",
+      { name: "create_voucher", arguments: voucherArguments(pdfAtLimit()) },
+      30_000,
+    );
+    expect(created.result?.isError, JSON.stringify(created.result).slice(0, 500)).toBeFalsy();
+    expect(created.result?.structuredContent).toMatchObject({
+      file: { bytes: MAX_VOUCHER_FILE_BYTES },
+    });
+    expect(uploads.at(-1)).toBeGreaterThan(MAX_VOUCHER_FILE_BYTES);
+
+    // 16 MiB + 1 of JSON: answered with an error naming the request, the
+    // session stays open. The id sits at the end, as TypeScript clients send it.
+    const padding = "A".repeat(16 * 1024 * 1024);
+    const tooLarge = await session.rawRequest(
+      3,
+      `{"method":"tools/call","params":{"name":"create_voucher","arguments":{"x":"${padding}"}},"jsonrpc":"2.0","id":3}`,
+    );
+    expect(tooLarge.error).toMatchObject({ code: -32000 });
+    expect(String((tooLarge.error as { message: string }).message)).toContain("Message too large");
+    // id first, as Python clients send it; and a line without an id at all.
+    const first = await session.rawRequest(
+      4,
+      `{"jsonrpc":"2.0","id":4,"method":"x","params":"${padding}"}`,
+    );
+    expect(first.error).toMatchObject({ code: -32000 });
+    const anonymous = await session.rawRequest(
+      null,
+      `{"jsonrpc":"2.0","method":"x","params":"${padding}"}`,
+    );
+    expect(anonymous.error).toMatchObject({ code: -32000 });
+
+    const list = await session.request(5, "tools/list");
+    expect((list.result?.tools as unknown[]).length).toBeGreaterThan(0);
+    expect(await session.close()).toBe(0);
+    expect(session.stderr.join("")).toContain("stdio message over the size limit dropped");
+  }, 60_000);
 
   interface ProbeReport {
     /** Secret variable names still in the server's process.env after startup. */
