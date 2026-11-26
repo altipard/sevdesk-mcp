@@ -57,6 +57,9 @@ type VoucherSummary = z.infer<typeof voucherSummarySchema>;
 
 const UNPAID_CODES = [100, 150, 750];
 
+/** Positions returned per voucher (sevdesk's page size for unpaged requests). */
+export const MAX_VOUCHER_POSITIONS = 100;
+
 export function mapVoucherSummary(raw: Raw): VoucherSummary {
   const status = statusOf(raw.status, VOUCHER_STATUS);
   const sumGross = amount(raw.sumGross);
@@ -161,7 +164,8 @@ export const getVoucher = defineTool({
   title: "Get a sevdesk voucher",
   description:
     "Returns one voucher by its sevdesk ID with its positions (booking account, tax rate, " +
-    "amounts). Find the ID with search_vouchers." +
+    `amounts), at most ${MAX_VOUCHER_POSITIONS}; positionsTruncated says when more may exist. ` +
+    "Find the ID with search_vouchers." +
     FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "getVoucherById",
@@ -175,6 +179,9 @@ export const getVoucher = defineTool({
       hasDocument: z.boolean().describe("A file (scan, PDF) is attached."),
     }),
     positions: z.array(voucherPositionSchema),
+    positionsTruncated: z
+      .boolean()
+      .describe("sevdesk returned a full answer; further positions may exist."),
   }),
   annotations: READ_ANNOTATIONS,
   async handler({ voucherId }, { sevdesk }) {
@@ -188,7 +195,12 @@ export const getVoucher = defineTool({
         params: { query: { "voucher[id]": voucherId, "voucher[objectName]": "Voucher" } },
       }),
     );
-    const positions = objectsOf(positionsBody)
+    // GET /VoucherPos declares no paging; sevdesk answers unpaged requests
+    // with up to 100 entries, so a full answer may be cut.
+    const rows = objectsOf(positionsBody);
+    const positionsTruncated = rows.length >= MAX_VOUCHER_POSITIONS;
+    const positions = rows
+      .slice(0, MAX_VOUCHER_POSITIONS)
       .filter((pos) => refId(pos.voucher) === null || refId(pos.voucher) === voucherId)
       .map((pos) => ({
         id: integer(pos.id) ?? 0,
@@ -210,11 +222,11 @@ export const getVoucher = defineTool({
       hasDocument: refId(raw.document) !== null,
     };
     return present(
-      { voucher, positions },
+      { voucher, positions, positionsTruncated },
       {
         summary:
           `Voucher ${voucher.id} (${voucher.statusName ?? "unknown status"}), ` +
-          `${positions.length} positions.`,
+          `${positions.length}${positionsTruncated ? "+" : ""} positions.`,
       },
     );
   },

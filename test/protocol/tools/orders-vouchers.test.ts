@@ -201,6 +201,24 @@ describe("get_voucher", () => {
       },
     ]);
     expect(textOf(result).split("\n")[0]).toBe("Voucher 8001 (paid), 1 positions.");
+    expect(structured<{ positionsTruncated: boolean }>(result).positionsTruncated).toBe(false);
+  });
+
+  it("caps positions and flags a full answer", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Voucher/8001"), () => HttpResponse.json(list([voucher()]))),
+      http.get(sevdeskUrl("/VoucherPos"), () =>
+        HttpResponse.json(
+          list(Array.from({ length: 120 }, (_, i) => voucherPosition({ id: String(i + 1) }))),
+        ),
+      ),
+    );
+    const c = await connect();
+    const result = await c.call("get_voucher", { voucherId: 8001 });
+    const data = structured<{ positions: unknown[]; positionsTruncated: boolean }>(result);
+    expect(data.positions).toHaveLength(100);
+    expect(data.positionsTruncated).toBe(true);
+    expect(textOf(result).split("\n")[0]).toBe("Voucher 8001 (unpaid), 100+ positions.");
   });
 
   it("treats an empty answer as not found", async () => {
