@@ -3,6 +3,7 @@ import { HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { Config } from "../../src/config.js";
+import { createPolicyRuntime } from "../../src/policy/runtime.js";
 import { createServer } from "../../src/server.js";
 import { captureLogger, MOCK_BASE_URL, TEST_TOKEN, testConfig } from "../helpers.js";
 
@@ -15,7 +16,10 @@ const versionUrl = `${MOCK_BASE_URL}/Tools/bookkeepingSystemVersion`;
 
 async function connect(config: Config = testConfig()) {
   const { logger, lines } = captureLogger();
-  const server = createServer(config, { logger });
+  const server = createServer(config, {
+    logger,
+    runtime: createPolicyRuntime(config, { transport: "stdio" }),
+  });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
   const client = new Client({ name: "protocol-test", version: "0.0.0" });

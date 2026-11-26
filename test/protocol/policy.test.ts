@@ -196,7 +196,10 @@ describe("registration by mode", () => {
 
   it("read mode of the real server registers no writing tools", async () => {
     const config = testConfig({ mode: "read" });
-    const server = createServer(config, { logger: captureLogger().logger });
+    const server = createServer(config, {
+      logger: captureLogger().logger,
+      runtime: createPolicyRuntime(config, { transport: "stdio" }),
+    });
     const client = new Client({ name: "t", version: "0" });
     const [a, b] = InMemoryTransport.createLinkedPair();
     await server.connect(b);
@@ -209,6 +212,17 @@ describe("registration by mode", () => {
       await client.close();
       await server.close();
     }
+  });
+
+  it("refuses to build a server without a policy runtime", () => {
+    const config = testConfig();
+    const deps = { logger: captureLogger().logger } as unknown as Parameters<
+      typeof createServer
+    >[1];
+    expect(() => createServer(config, deps)).toThrow("per-process policy runtime");
+    expect(() => (createServer as unknown as (c: unknown) => unknown)(config)).toThrow(
+      "per-process policy runtime",
+    );
   });
 
   it("adds an optional confirmation_token only to W+ and X tools", async () => {
