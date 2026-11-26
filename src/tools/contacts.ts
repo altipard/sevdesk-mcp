@@ -156,7 +156,8 @@ async function searchByEmail(
     contacts.push({ ...mapContactSummary(raw), matchedEmail: byContact.get(contactId) as string });
   }
   const page = pageOf(args.offset, args.limit, contacts.length, ids.length);
-  // sevdesk's documented default page size is 100: a full answer may be cut.
+  // The spec's introduction: a request without limit returns entries "up
+  // to a limit of 100". A full answer may therefore be cut.
   const truncated = ways.length >= SCAN_PAGE;
   return {
     contacts,
@@ -180,7 +181,8 @@ export const searchContacts = defineTool({
   description:
     "Finds customers, suppliers and other contacts. customerNumber uses sevdesk's own filter " +
     "(exact). query searches name and customer number (case- and accent-insensitive); a query " +
-    "containing '@' searches e-mail addresses instead. sevdesk cannot filter by name, so a " +
+    "containing '@' searches e-mail addresses instead (persons and organisations alike). " +
+    "sevdesk cannot filter by name, so a " +
     `query checks at most ${MAX_CONTACTS_SCANNED} contacts and says when it stopped early. ` +
     "Without filters it lists contacts page by page. Use get_contact for addresses and " +
     "communication details, and the returned id as contactId in the invoice, order and " +

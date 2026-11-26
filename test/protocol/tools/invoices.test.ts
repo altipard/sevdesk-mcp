@@ -185,6 +185,21 @@ describe("get_invoice", () => {
     expect(textOf(result).split("\n")[0]).toBe("Invoice RE-1001 (open), 2 positions.");
   });
 
+  it("flags positions beyond the first 100", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Invoice/1001"), () => HttpResponse.json(list([invoice()]))),
+      http.get(sevdeskUrl("/Invoice/1001/getPositions"), () =>
+        HttpResponse.json(
+          list(Array.from({ length: 100 }, (_, i) => invoicePosition({ id: String(6000 + i) }))),
+        ),
+      ),
+    );
+    const c = await connect();
+    const result = await c.call("get_invoice", { invoiceId: 1001 });
+    expect(structured<{ positionsTruncated: boolean }>(result).positionsTruncated).toBe(true);
+    expect(textOf(result).split("\n")[0]).toBe("Invoice RE-1001 (open), 100+ positions.");
+  });
+
   it("treats an empty answer as not found", async () => {
     api.server.use(http.get(sevdeskUrl("/Invoice/5"), () => HttpResponse.json({ objects: [] })));
     const c = await connect();

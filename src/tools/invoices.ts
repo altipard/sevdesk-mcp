@@ -134,7 +134,7 @@ export const searchInvoices = defineTool({
   name: "search_invoices",
   title: "Search sevdesk invoices",
   description:
-    "Lists invoices, newest data as sevdesk returns it, filtered by status, invoice date range, " +
+    "Lists invoices in sevdesk's order, filtered by status, invoice date range, " +
     "contact or invoice number. Returns a compact summary per invoice (amounts, due date, open " +
     "amount). Use get_invoice for positions and details, list_open_receivables for what " +
     "customers still owe, and search_contacts first to find a contactId.",

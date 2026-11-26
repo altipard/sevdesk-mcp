@@ -130,6 +130,25 @@ describe("search_contacts", () => {
     expect(data.scan).toEqual({ mode: "email", checked: 2, truncated: false });
   });
 
+  it("says when the e-mail answer may have been cut", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/CommunicationWay"), () =>
+        HttpResponse.json(
+          list(
+            Array.from({ length: 100 }, (_, i) =>
+              communicationWay({ id: String(7000 + i), value: `x${i}@other.example` }),
+            ),
+          ),
+        ),
+      ),
+    );
+    const c = await connect();
+    const data = structured<Search>(await c.call("search_contacts", { query: "@muster" }));
+    expect(data.contacts).toEqual([]);
+    expect(data.scan).toMatchObject({ mode: "email", checked: 100, truncated: true });
+    expect(String(data.scan?.note)).toContain("may have more");
+  });
+
   it("rejects query and customerNumber together, and short queries", async () => {
     const c = await connect();
     const both = await c.call("search_contacts", { query: "ab", customerNumber: "1" });
@@ -191,6 +210,15 @@ describe("get_contact", () => {
     expect(textOf(result).split("\n")[0]).toBe(
       "Contact Muster GmbH: 1 addresses, 2 communication ways.",
     );
+  });
+
+  it("treats an empty answer as not found", async () => {
+    api.server.use(http.get(sevdeskUrl("/Contact/8"), () => HttpResponse.json({ objects: [] })));
+    const c = await connect();
+    const result = await c.call("get_contact", { contactId: 8 });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toBe("sevdesk has no contact with ID 8.");
+    expect(api.requests).toHaveLength(1);
   });
 
   it("says so when sevdesk does not embed the addresses", async () => {
