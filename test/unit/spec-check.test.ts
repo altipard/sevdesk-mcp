@@ -24,8 +24,8 @@ describe("spec check of outgoing requests", () => {
 
   it("flags unknown paths, undeclared keys, wrong types, enums and missing required keys", () => {
     expect(specProblems(get("/Nope"))).toEqual(["GET /api/v1/Nope is not in the spec"]);
-    expect(specProblems(get("/Contact?name=x"))).toEqual([
-      "getContacts does not declare query parameter name",
+    expect(specProblems(get("/Contact?nope=x"))).toEqual([
+      "getContacts does not declare query parameter nope",
     ]);
     expect(specProblems(get("/Invoice?status=300"))).toEqual([
       "status=300 is not one of 50, 100, 200, 750, 1000",

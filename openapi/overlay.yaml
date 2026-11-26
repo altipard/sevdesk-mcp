@@ -112,6 +112,19 @@ actions:
       - $ref: "#/components/parameters/offset"
       - $ref: "#/components/parameters/countAll"
       - $ref: "#/components/parameters/embed"
+  # Undocumented: not in sevdesk's spec or docs. Verified against a live
+  # account on 2026-11-26 (a name returns fewer than all contacts, an
+  # invented name returns none). Matches organisation names only.
+  - target: "$.paths['/Contact'].get.parameters"
+    description: Undocumented name filter on GET /Contact
+    update:
+      - name: name
+        in: query
+        description: >-
+          Undocumented. Only contacts whose organisation name matches. Not
+          guaranteed by sevdesk; callers match the results again themselves.
+        schema:
+          type: string
   - target: "$.paths['/Invoice'].get.parameters"
     description: Pagination and embed on GET /Invoice
     update: *listParameters

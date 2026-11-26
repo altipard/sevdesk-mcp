@@ -27,9 +27,11 @@ import {
 } from "./format.js";
 import { present } from "./result.js";
 
-/** Contacts checked by a name search; the spec has no name filter. */
+/** Contacts checked one by one by a name search. */
 export const MAX_CONTACTS_SCANNED = 500;
 const SCAN_PAGE = 100;
+/** Contacts taken from sevdesk's own name filter when the scan stopped early. */
+export const MAX_NAME_FILTER_RESULTS = 100;
 
 // ---------------------------------------------------------------------------
 // Mapping
@@ -103,7 +105,7 @@ const searchOutput = z.object({
       note: z.string().optional(),
     })
     .optional()
-    .describe("Only for query searches, which sevdesk cannot filter itself."),
+    .describe("Only for query searches, which sevdesk cannot filter reliably itself."),
 });
 type SearchOutput = z.infer<typeof searchOutput>;
 
@@ -124,6 +126,38 @@ async function scanByName(
     if (page.length < SCAN_PAGE) return { matches, checked, truncated: false };
   }
   return { matches, checked, truncated: true };
+}
+
+/**
+ * Organisations sevdesk itself finds by name, for contacts beyond the scan.
+ * The `name` query parameter of GET /Contact is undocumented; the overlay
+ * declares it after a live test showed sevdesk honours it for organisation
+ * names. Every hit is matched locally again, so a server that ignores the
+ * parameter adds no false matches. undefined if sevdesk refuses it (4xx).
+ */
+async function lookupByName(
+  { sevdesk }: ToolCall,
+  query: string,
+  needle: string,
+  depth: "0" | "1",
+): Promise<{ matches: Raw[]; full: boolean } | undefined> {
+  let body: unknown;
+  try {
+    body = await sevdesk.call(
+      sevdesk.api.GET("/Contact", {
+        params: { query: { depth, name: query, limit: MAX_NAME_FILTER_RESULTS, offset: 0 } },
+      }),
+    );
+  } catch (error) {
+    const status = error instanceof SevdeskError ? error.status : undefined;
+    if (status !== undefined && status >= 400 && status < 500) return undefined;
+    throw error;
+  }
+  const page = objectsOf(body);
+  return {
+    matches: page.filter((raw) => matchesName(raw, needle)),
+    full: page.length >= MAX_NAME_FILTER_RESULTS,
+  };
 }
 
 /** E-mail addresses checked by an e-mail search, paged like the name scan. */
@@ -259,9 +293,10 @@ export const searchContacts = defineTool({
   description:
     "Finds customers, suppliers and other contacts. customerNumber uses sevdesk's own filter " +
     "(exact). query searches name and customer number (case- and accent-insensitive); a query " +
-    "containing '@' searches e-mail addresses instead. sevdesk cannot filter by name or " +
-    `e-mail, so a query checks at most ${MAX_CONTACTS_SCANNED} contacts or ` +
-    `${MAX_EMAILS_SCANNED} e-mail addresses and says when it stopped early. ` +
+    "containing '@' searches e-mail addresses instead. sevdesk cannot reliably filter by name " +
+    `or e-mail, so a query checks at most ${MAX_CONTACTS_SCANNED} contacts or ` +
+    `${MAX_EMAILS_SCANNED} e-mail addresses and says when it stopped early; beyond that, ` +
+    "organisations are also looked up by sevdesk's own name filter. " +
     "Without filters it lists contacts page by page. Use get_contact for addresses and " +
     "communication details, and the returned id as contactId in the invoice, order and " +
     "voucher searches." +
@@ -320,8 +355,30 @@ export const searchContacts = defineTool({
     }
 
     const scan = await scanByName(call, needle, depth);
-    const contacts = scan.matches.slice(args.offset, args.offset + args.limit);
-    const page = pageOf(args.offset, args.limit, contacts.length, scan.matches.length);
+    // A complete scan has seen every contact; only beyond it is sevdesk's
+    // name filter asked. Its extra hits follow the scan's, so paging over
+    // the merged list stays stable.
+    const lookup = scan.truncated ? await lookupByName(call, args.query, needle, depth) : undefined;
+    const seen = new Set(scan.matches.map((match) => match.id));
+    const extra: ContactSummary[] = [];
+    for (const raw of lookup?.matches ?? []) {
+      const summary = mapContactSummary(raw);
+      if (seen.has(summary.id)) continue;
+      seen.add(summary.id);
+      extra.push(summary);
+    }
+    const matches = [...scan.matches, ...extra];
+    const contacts = matches.slice(args.offset, args.offset + args.limit);
+    const page = pageOf(args.offset, args.limit, contacts.length, matches.length);
+    const notes = [
+      scan.truncated &&
+        `Checked the first ${scan.checked} contacts only; later ones may match too. ` +
+          "Use customerNumber or a more specific query.",
+      lookup !== undefined &&
+        `sevdesk's name filter found ${extra.length} more organisations beyond them` +
+          `${lookup.full ? ` (first ${MAX_NAME_FILTER_RESULTS} results only)` : ""}; ` +
+          "persons and customer numbers there are not searched.",
+    ].filter((note): note is string => typeof note === "string");
     const output: SearchOutput = {
       contacts,
       page,
@@ -329,11 +386,7 @@ export const searchContacts = defineTool({
         mode: "name",
         checked: scan.checked,
         truncated: scan.truncated,
-        ...(scan.truncated && {
-          note:
-            `Checked the first ${scan.checked} contacts only; later ones may match too. ` +
-            "Use customerNumber or a more specific query.",
-        }),
+        ...(notes.length > 0 && { note: notes.join(" ") }),
       },
     };
     return present(output, {
