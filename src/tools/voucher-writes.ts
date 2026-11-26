@@ -6,7 +6,6 @@ import {
   amount,
   asRecord,
   badInput,
-  cents,
   entityId,
   FOREIGN_DATA_NOTE,
   integer,
@@ -22,18 +21,23 @@ import {
 } from "./format.js";
 import { present } from "./result.js";
 import {
+  bookingLogId,
   CREATE_ANNOTATIONS,
   checkVoucherTax,
   contactName,
   inputText,
   money,
+  OVERPAYING_PAYMENT_TYPES,
   oneLineText,
+  openAfterPayment,
+  overpaymentOf,
+  overpaymentWarning,
   PAYMENT_TYPES,
-  type PaymentType,
   paymentAmountInput,
   paymentTypeMismatch,
   readContact,
   ref,
+  SETTLING_PAYMENT_TYPES,
   STATUS_CHANGE_ANNOTATIONS,
   sevdeskDate,
   shapedOutput,
@@ -468,17 +472,6 @@ export const createVoucher = defineTool({
 /** Statuses sevdesk books payments on: unpaid, transferred and partially paid. */
 const BOOKABLE = [100, 150, 750];
 
-/** Types that settle the voucher whatever is left open (cash discount, bank charges, other). */
-const SETTLING: readonly PaymentType[] = ["CB", "MTC", "O"];
-/** Types meant for paying more than is open. */
-const OVERPAYING: readonly PaymentType[] = ["O", "OF"];
-
-/** Open amount after the booking: 0 for settling types, else open minus the amount. */
-function openAfter(type: PaymentType, paid: number, open: number | null): number | null {
-  if (open === null) return null;
-  return SETTLING.includes(type) ? 0 : Math.max(0, cents(open - paid));
-}
-
 const enshrinedText = (id: number) =>
   `Voucher ${id} is enshrined (festgeschrieben); this server refuses payments on enshrined ` +
   "vouchers. Nothing was booked.";
@@ -548,17 +541,14 @@ export const bookVoucherPayment = defineTool({
           "partially paid vouchers, so the booking will be refused.",
       );
     }
-    const overpayment = open === null ? 0 : Math.max(0, cents(args.amount - open));
-    if (overpayment > 0 && !OVERPAYING.includes(args.paymentType)) {
-      warnings.push(
-        `Overpayment: ${args.amount} is ${overpayment} more than the open amount of ${open}. ` +
-          "Without type O or OF this server refuses the booking at execution.",
-      );
+    const overpayment = overpaymentOf(args.amount, open);
+    if (overpayment > 0 && !OVERPAYING_PAYMENT_TYPES.includes(args.paymentType)) {
+      warnings.push(overpaymentWarning(args.amount, overpayment, open));
     }
-    const after = openAfter(args.paymentType, args.amount, open);
+    const after = openAfterPayment(args.paymentType, args.amount, open);
     // Expected only: the spec says these types settle the rest, not that
     // sevdesk then lists the voucher as paid.
-    const expectedSettled = SETTLING.includes(args.paymentType);
+    const expectedSettled = SETTLING_PAYMENT_TYPES.includes(args.paymentType);
     const mismatch = paymentTypeMismatch(args.paymentType, args.amount, open);
     if (mismatch) warnings.push(mismatch);
     let checkAccount: { id: number; name: string | null } = { id: args.checkAccountId, name: null };
@@ -614,8 +604,8 @@ export const bookVoucherPayment = defineTool({
     const open = voucher.openAmount;
     // The open amount may have dropped since the preview (another payment);
     // an overpayment sevdesk can only book as O or OF is refused here.
-    const overpayment = open === null ? 0 : Math.max(0, cents(args.amount - open));
-    if (overpayment > 0 && !OVERPAYING.includes(args.paymentType)) {
+    const overpayment = overpaymentOf(args.amount, open);
+    if (overpayment > 0 && !OVERPAYING_PAYMENT_TYPES.includes(args.paymentType)) {
       throw badInput(
         `Voucher ${args.voucherId} has ${open} open now; ${args.amount} would overpay it by ` +
           `${overpayment}; this server refuses overpayments without type O or OF. Nothing was booked; call the tool ` +
@@ -637,8 +627,6 @@ export const bookVoucherPayment = defineTool({
         } as never,
       }),
     );
-    // The spec shows the log entry bare; sevdesk usually wraps it in `objects`.
-    const log = objectsOf(body)[0] ?? asRecord(body);
     const output = shapedOutput(
       bookVoucherOutput,
       {
@@ -649,9 +637,9 @@ export const bookVoucherPayment = defineTool({
         paymentType: args.paymentType,
         checkAccountId: args.checkAccountId,
         openBefore: open,
-        openAfterExpected: openAfter(args.paymentType, args.amount, open),
+        openAfterExpected: openAfterPayment(args.paymentType, args.amount, open),
         overpayment,
-        logId: integer(log.id),
+        logId: bookingLogId(body),
       },
       call.logger,
       "book_voucher_payment",
