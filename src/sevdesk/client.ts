@@ -98,8 +98,16 @@ function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
+/**
+ * Check run on every outgoing request before anything is sent. Throws to
+ * refuse it (a SevdeskError of kind "policy").
+ */
+export type RequestGate = (request: Request) => void;
+
 interface FetchPolicy {
   baseUrl: string;
+  /** Checks of a restricted client, in order; each one can refuse. */
+  gates: readonly RequestGate[];
   maxResponseBytes: number;
   /**
    * The request may have a side effect even if it is a GET (single-attempt
@@ -182,6 +190,9 @@ async function readFully(
  */
 function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<Response> {
   return async (original) => {
+    // The scope of a restricted client comes first: a request outside it
+    // is refused before pins, retries or the network see it.
+    for (const gate of policy.gates) gate(original);
     // Pins (preventSendBy, enshrine flags) hold for every caller of the
     // client, not only for the fallback that checks them up front.
     let request: Request;
@@ -307,10 +318,78 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
   };
 }
 
+// openapi-fetch lets a single call replace fetch or the Request class.
+// Either would skip the policy fetch (and with it the scope, pins and
+// timeouts) while still carrying the token header, so they are refused.
+const FORBIDDEN_CALL_OPTIONS = ["fetch", "Request"] as const;
+const CALL_METHODS = ["GET", "PUT", "POST", "DELETE", "OPTIONS", "HEAD", "PATCH", "TRACE"] as const;
+
+/**
+ * The call options as a plain copy, read once, so a getter cannot show one
+ * value here and another to openapi-fetch.
+ */
+function refuseOverrides(init: unknown): unknown {
+  if (typeof init !== "object" || init === null) return init;
+  const copy: Record<string, unknown> = { ...init };
+  for (const option of FORBIDDEN_CALL_OPTIONS) {
+    if (copy[option] !== undefined) {
+      throw new SevdeskError(
+        "policy",
+        `The per-call option "${option}" is not allowed on the sevdesk client. Nothing was sent.`,
+      );
+    }
+  }
+  return copy;
+}
+
+/** The openapi-fetch client with per-call fetch/Request overrides refused. */
+function sealApi(api: SevdeskApi): SevdeskApi {
+  const sealed: Record<string, unknown> = {
+    request: (method: string, url: string, init?: unknown) => {
+      return (api.request as (m: string, u: string, i?: unknown) => unknown)(
+        method,
+        url,
+        refuseOverrides(init),
+      );
+    },
+    use: api.use.bind(api),
+    eject: api.eject.bind(api),
+  };
+  for (const name of CALL_METHODS) {
+    const call = api[name] as (url: string, init?: unknown) => unknown;
+    sealed[name] = (url: string, init?: unknown) => {
+      return call(url, refuseOverrides(init));
+    };
+  }
+  return Object.freeze(sealed) as unknown as SevdeskApi;
+}
+
+/** Builds clients sharing one configuration with additional gates. */
+type ClientFactory = (gates: readonly RequestGate[]) => SevdeskClient;
+
+// Known only to this module, so a restricted client can be narrowed further
+// but never widened: the factory of a restricted client keeps its gates.
+const factories = new WeakMap<SevdeskClient, ClientFactory>();
+
+/**
+ * The same client, limited by `gate`: every request (through `api` and
+ * `apiSingleAttempt`) must pass it, in addition to any gate the client
+ * already has. Only clients built by createSevdeskClient can be
+ * restricted; anything else is refused instead of passed on unchecked.
+ */
+export function restrictClient(client: SevdeskClient, gate: RequestGate): SevdeskClient {
+  const factory = factories.get(client);
+  if (factory === undefined) {
+    throw new TypeError("restrictClient needs a client built by createSevdeskClient");
+  }
+  return factory([gate]);
+}
+
 export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClient {
   const redact: Redactor = createRedactor([options.token]);
-  const policy: FetchPolicy = {
+  const base: FetchPolicy = {
     baseUrl: options.baseUrl,
+    gates: [],
     maxResponseBytes: options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
     sideEffects: false,
     timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
@@ -322,53 +401,61 @@ export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClien
   };
 
   const clientFor = (fetchPolicy: FetchPolicy) =>
-    createClient<paths>({
-      baseUrl: options.baseUrl.replace(/\/+$/, ""),
-      headers: {
-        // sevdesk expects the raw token, without a "Bearer" prefix.
-        Authorization: options.token,
-        "User-Agent": options.userAgent ?? USER_AGENT,
-        Accept: "application/json",
-      },
-      fetch: createPolicyFetch(fetchPolicy),
-    });
-  const api = clientFor(policy);
-  const apiSingleAttempt = clientFor({
-    ...policy,
-    sideEffects: true,
-    retry: { ...policy.retry, maxRetries: 0 },
-  });
+    sealApi(
+      createClient<paths>({
+        baseUrl: options.baseUrl.replace(/\/+$/, ""),
+        headers: {
+          // sevdesk expects the raw token, without a "Bearer" prefix.
+          Authorization: options.token,
+          "User-Agent": options.userAgent ?? USER_AGENT,
+          Accept: "application/json",
+        },
+        fetch: createPolicyFetch(fetchPolicy),
+      }),
+    );
 
-  return {
-    api,
-    apiSingleAttempt,
-    async call<T>(request: Promise<ApiResult<T>>): Promise<T> {
-      let result: ApiResult<T>;
-      try {
-        result = await request;
-      } catch (error) {
-        // openapi-fetch parses the body after our fetch returned; a body
-        // that is not JSON surfaces here as a SyntaxError.
-        if (error instanceof SyntaxError) {
-          throw new SevdeskError("http_error", "sevdesk sent a response that is not valid JSON.");
-        }
-        // Bodies are read inside the fetch policy, so this is a safety net
-        // for a timeout that still escapes. A caller's own abort (AbortError)
-        // is passed through unchanged.
-        if (error instanceof Error && error.name === "TimeoutError") {
-          throw new SevdeskError("timeout", "sevdesk did not answer in time.");
-        }
-        throw error;
+  async function call<T>(request: Promise<ApiResult<T>>): Promise<T> {
+    let result: ApiResult<T>;
+    try {
+      result = await request;
+    } catch (error) {
+      // openapi-fetch parses the body after our fetch returned; a body
+      // that is not JSON surfaces here as a SyntaxError.
+      if (error instanceof SyntaxError) {
+        throw new SevdeskError("http_error", "sevdesk sent a response that is not valid JSON.");
       }
-      const { data, error, response } = result;
-      if (response.ok) return data as T;
-      throw mapHttpError({
-        outcomeUnknown: response.headers.get(OUTCOME_HEADER) === "unknown",
-        status: response.status,
-        body: error,
-        retryAfter: response.headers.get("retry-after"),
-        redact,
-      });
-    },
+      // Bodies are read inside the fetch policy, so this is a safety net
+      // for a timeout that still escapes. A caller's own abort (AbortError)
+      // is passed through unchanged.
+      if (error instanceof Error && error.name === "TimeoutError") {
+        throw new SevdeskError("timeout", "sevdesk did not answer in time.");
+      }
+      throw error;
+    }
+    const { data, error, response } = result;
+    if (response.ok) return data as T;
+    throw mapHttpError({
+      outcomeUnknown: response.headers.get(OUTCOME_HEADER) === "unknown",
+      status: response.status,
+      body: error,
+      retryAfter: response.headers.get("retry-after"),
+      redact,
+    });
+  }
+
+  const build = (gates: readonly RequestGate[]): SevdeskClient => {
+    const policy: FetchPolicy = { ...base, gates };
+    const client: SevdeskClient = Object.freeze({
+      api: clientFor(policy),
+      apiSingleAttempt: clientFor({
+        ...policy,
+        sideEffects: true,
+        retry: { ...policy.retry, maxRetries: 0 },
+      }),
+      call,
+    });
+    factories.set(client, (more) => build([...gates, ...more]));
+    return client;
   };
+  return build([]);
 }
