@@ -236,54 +236,58 @@ export async function runGuarded(
     );
   }
 
-  if (action.class === "W+") return execute();
-
   // X: human approval where the client can ask, otherwise only with an
   // explicit operator release.
-  if (clientSupportsElicitation(env.server, ctx)) {
-    const state = approvalState(ctx);
-    if (state === "pending") {
-      audit("approval_requested");
-      return inputRequired({
-        inputRequests: {
-          [APPROVAL_KEY]: inputRequired.elicit({
-            message: `${action.summary} This cannot be undone. Execute it?`,
-            requestedSchema: {
-              type: "object",
-              properties: {
-                confirm: {
-                  type: "boolean",
-                  title: "Execute",
-                  description: "Yes, execute this irreversible sevdesk action.",
+  if (action.class === "X") {
+    if (clientSupportsElicitation(env.server, ctx)) {
+      const state = approvalState(ctx);
+      if (state === "pending") {
+        audit("approval_requested");
+        return inputRequired({
+          inputRequests: {
+            [APPROVAL_KEY]: inputRequired.elicit({
+              message: `${action.summary} This cannot be undone. Execute it?`,
+              requestedSchema: {
+                type: "object",
+                properties: {
+                  confirm: {
+                    type: "boolean",
+                    title: "Execute",
+                    description: "Yes, execute this irreversible sevdesk action.",
+                  },
                 },
+                required: ["confirm"],
               },
-              required: ["confirm"],
-            },
-          }),
-        },
-      });
+            }),
+          },
+        });
+      }
+      if (state === "declined") {
+        audit("declined");
+        return failure(`The user did not approve ${action.tool}. Nothing was executed.`);
+      }
+    } else if (!action.explicitlyAllowed) {
+      audit("denied", { reason: "no_approval_channel" });
+      return failure(
+        `${action.tool} is irreversible and this client cannot ask the user for approval ` +
+          "(no elicitation support). The operator has to release it explicitly " +
+          "(SEVDESK_ENABLE_TOOLS, for sevdesk_api_request SEVDESK_API_ALLOW).",
+      );
     }
-    if (state === "declined") {
-      audit("declined");
-      return failure(`The user did not approve ${action.tool}. Nothing was executed.`);
-    }
-  } else if (!action.explicitlyAllowed) {
-    audit("denied", { reason: "no_approval_channel" });
-    return failure(
-      `${action.tool} is irreversible and this client cannot ask the user for approval ` +
-        "(no elicitation support). The operator has to release it explicitly " +
-        "(SEVDESK_ENABLE_TOOLS, for sevdesk_api_request SEVDESK_API_ALLOW).",
-    );
   }
 
-  // Single use and idempotency are consumed only now, right before the
-  // upstream call: consuming them earlier would make the approval round
-  // look like a replay.
+  // Every W+ and X token works once (a second bookAmount must not ride on
+  // the same confirmation); X additionally runs only once per target.
+  // Both are consumed only now, right before the upstream call: consuming
+  // them earlier would make the approval round look like a replay.
   const { claims } = verified;
   const nonceTtl = Math.max(1, claims.expiresAt - runtime.now()) + 60_000;
-  const idempotencyKey = `idempotency:${action.operationId ?? action.tool}:${
-    action.targetId ?? `args:${argumentHash(action.args)}`
-  }`;
+  const idempotencyKey =
+    action.class === "X"
+      ? `idempotency:${action.operationId ?? action.tool}:${
+          action.targetId ?? `args:${argumentHash(action.args)}`
+        }`
+      : undefined;
   try {
     if (!(await runtime.nonces.consume(`nonce:${claims.nonce}`, nonceTtl))) {
       audit("denied", { reason: "replay" });
@@ -291,7 +295,7 @@ export async function runGuarded(
         "This confirmation_token was already used. Call the tool again without it for a new preview.",
       );
     }
-    if (!(await runtime.nonces.consume(idempotencyKey, IDEMPOTENCY_TTL_MS))) {
+    if (idempotencyKey && !(await runtime.nonces.consume(idempotencyKey, IDEMPOTENCY_TTL_MS))) {
       audit("denied", { reason: "duplicate" });
       return failure(
         `${action.tool} already ran for this target within the last 24 hours. ` +
@@ -307,7 +311,7 @@ export async function runGuarded(
   }
 
   return execute(async (error) => {
-    if (!isDefiniteRejection(error)) return;
+    if (idempotencyKey === undefined || !isDefiniteRejection(error)) return;
     try {
       await runtime.nonces.release(idempotencyKey);
     } catch (releaseError) {

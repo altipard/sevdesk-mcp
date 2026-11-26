@@ -270,6 +270,50 @@ describe("class W+ confirmation", () => {
     expect(h.audit.map((e) => e.outcome)).toEqual(["confirmation_issued", "ok"]);
   });
 
+  it("accepts each token only once", async () => {
+    const h = await harness({});
+    const token = await preview(h, "mark_sent", { invoiceId: 1 });
+    const call = () =>
+      h.client.callTool({
+        name: "mark_sent",
+        arguments: { invoiceId: 1, confirmation_token: token },
+      });
+    expect((await call()).isError).toBeFalsy();
+    const replay = await call();
+    expect(replay.isError).toBe(true);
+    expect(text(replay)).toContain("already used");
+    expect(executed).toHaveLength(1);
+    expect(h.audit.at(-1)).toMatchObject({ outcome: "denied", reason: "replay" });
+  });
+
+  it("allows a new confirmation for the same target (no idempotency lock for W+)", async () => {
+    const h = await harness({});
+    for (let i = 0; i < 2; i++) {
+      const token = await preview(h, "mark_sent", { invoiceId: 1 });
+      const result = await h.client.callTool({
+        name: "mark_sent",
+        arguments: { invoiceId: 1, confirmation_token: token },
+      });
+      expect(result.isError).toBeFalsy();
+    }
+    expect(executed).toHaveLength(2);
+  });
+
+  it("fails closed when the nonce store is down", async () => {
+    const broken: NonceStore = {
+      consume: () => Promise.reject(new Error("store down")),
+      release: () => Promise.resolve(),
+    };
+    const h = await harness({ nonces: broken });
+    const token = await preview(h, "mark_sent", { invoiceId: 1 });
+    const result = await h.client.callTool({
+      name: "mark_sent",
+      arguments: { invoiceId: 1, confirmation_token: token },
+    });
+    expect(text(result)).toContain("not executed");
+    expect(executed).toEqual([]);
+  });
+
   it("binds the token to the arguments", async () => {
     const h = await harness({});
     const token = await preview(h, "mark_sent", { invoiceId: 1 });
