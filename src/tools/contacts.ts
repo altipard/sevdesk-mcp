@@ -32,6 +32,11 @@ export const MAX_CONTACTS_SCANNED = 500;
 const SCAN_PAGE = 100;
 /** Contacts taken from sevdesk's own name filter when the scan stopped early. */
 export const MAX_NAME_FILTER_RESULTS = 100;
+/**
+ * Upper bound for the name filter request. It only adds to a scan that
+ * already ran, so it gets less time than a normal call and no retries.
+ */
+export const NAME_LOOKUP_TIMEOUT_MS = 10_000;
 
 // ---------------------------------------------------------------------------
 // Mapping
@@ -134,8 +139,9 @@ async function scanByName(
  * declares it after a live test showed sevdesk honours it for organisation
  * names. Every hit is matched locally again, so a server that ignores the
  * parameter adds no false matches. The lookup is optional: any sevdesk
- * error (sevdesk answers some invalid input with 500) yields `failed`, so
- * the caller falls back to the scan; only a local policy refusal is thrown.
+ * error (sevdesk answers some invalid input with 500) or running out of
+ * time yields `failed`, so the caller falls back to the scan; only a local
+ * policy refusal is thrown.
  */
 async function lookupByName(
   { sevdesk }: ToolCall,
@@ -146,12 +152,20 @@ async function lookupByName(
   let body: unknown;
   try {
     body = await sevdesk.call(
-      sevdesk.api.GET("/Contact", {
+      // One attempt within its own time limit: retries and the client's
+      // longer timeout would let an optional request hold up the answer.
+      sevdesk.apiSingleAttempt.GET("/Contact", {
         params: { query: { depth, name: query, limit: MAX_NAME_FILTER_RESULTS, offset: 0 } },
+        signal: AbortSignal.timeout(NAME_LOOKUP_TIMEOUT_MS),
       }),
     );
   } catch (error) {
     if (error instanceof SevdeskError && error.kind !== "policy") return { failed: error };
+    // The client maps the abort to a timeout; this keeps the fallback if
+    // the abort ever surfaces unmapped.
+    if (error instanceof Error && error.name === "TimeoutError") {
+      return { failed: new SevdeskError("timeout", "sevdesk's name filter did not answer.") };
+    }
     throw error;
   }
   const page = objectsOf(body);
@@ -385,9 +399,12 @@ export const searchContacts = defineTool({
           "are not searched.",
       // Kind and status only: sevdesk's error text stays out of the answer.
       failure !== undefined &&
-        `sevdesk's name filter failed (${failure.kind}${
-          failure.status !== undefined ? ` ${failure.status}` : ""
-        }), so only the scan was used.`,
+        (failure.kind === "timeout"
+          ? `sevdesk's name filter did not answer within ${NAME_LOOKUP_TIMEOUT_MS / 1000} s, ` +
+            "so only the scan was used."
+          : `sevdesk's name filter failed (${failure.kind}${
+              failure.status !== undefined ? ` ${failure.status}` : ""
+            }), so only the scan was used.`),
     ].filter((note): note is string => typeof note === "string");
     const output: SearchOutput = {
       contacts,

@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { delay } from "msw";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { NAME_LOOKUP_TIMEOUT_MS } from "../../../src/tools/contacts.js";
 import { address, communicationWay, contact, list, person } from "../../fixtures/sevdesk.js";
 import {
   connect,
@@ -214,6 +216,58 @@ describe("search_contacts", () => {
       "sevdesk's name filter failed (server_error 500), so only the scan was used.",
     );
     expect(textOf(result)).not.toContain("secret upstream text");
+  });
+
+  describe("name filter time limit", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    /** Shortens only the name filter's own limit; the client's timeouts stay real. */
+    function shortenLookupLimit(ms: number) {
+      const timeout = AbortSignal.timeout.bind(AbortSignal);
+      return vi
+        .spyOn(AbortSignal, "timeout")
+        .mockImplementation((limit) => timeout(limit === NAME_LOOKUP_TIMEOUT_MS ? ms : limit));
+    }
+
+    it("falls back to the scan when the name filter hangs", async () => {
+      const spy = shortenLookupLimit(50);
+      api.server.use(
+        http.get(sevdeskUrl("/Contact"), async ({ request }) => {
+          if (!new URL(request.url).searchParams.has("name")) return scanPages(request);
+          await delay("infinite");
+          return HttpResponse.json(list([]));
+        }),
+      );
+      const c = await connect();
+      const result = await c.call("search_contacts", { query: "muster" });
+      expect(result.isError, textOf(result)).toBeFalsy();
+      const data = structured<Search>(result);
+      expect(spy).toHaveBeenCalledWith(NAME_LOOKUP_TIMEOUT_MS);
+      // One lookup attempt, not retried after the abort.
+      expect(api.requests.filter((r) => new URL(r.url).searchParams.has("name"))).toHaveLength(1);
+      expect(data.contacts.map((x) => x.id)).toEqual([3]);
+      expect(data.scan).toMatchObject({ mode: "name", checked: 500, truncated: true });
+      expect(String(data.scan?.note)).toContain(
+        "sevdesk's name filter did not answer within 10 s, so only the scan was used.",
+      );
+    });
+
+    it("does not retry the name filter on a retryable status", async () => {
+      api.server.use(
+        http.get(sevdeskUrl("/Contact"), ({ request }) => {
+          if (!new URL(request.url).searchParams.has("name")) return scanPages(request);
+          return HttpResponse.json({ error: { message: "busy" } }, { status: 503 });
+        }),
+      );
+      const c = await connect();
+      const data = structured<Search>(await c.call("search_contacts", { query: "muster" }));
+      expect(api.requests.filter((r) => new URL(r.url).searchParams.has("name"))).toHaveLength(1);
+      expect(data.contacts.map((x) => x.id)).toEqual([3]);
+      expect(String(data.scan?.note)).toContain("sevdesk's name filter failed (");
+      expect(String(data.scan?.note)).toContain("503), so only the scan was used.");
+    });
   });
 
   it("searches e-mail addresses for a query with @", async () => {
