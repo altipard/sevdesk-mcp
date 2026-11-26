@@ -74,7 +74,9 @@ export const searchOrders = defineTool({
   title: "Search sevdesk orders and estimates",
   description:
     "Lists estimates (Angebote), order confirmations and delivery notes, filtered by status, " +
-    "order date range, contact or order number. Each result names its orderType. Use " +
+    "order date range, contact or order number. Each result names its orderType. sevdesk " +
+    "cannot filter by orderType; that filter is applied to the fetched page, so a page may " +
+    "hold fewer results than limit while more exist (see page.hasMore). Use " +
     "search_invoices for invoices and get_document_pdf (documentType order) for the PDF." +
     FOREIGN_DATA_NOTE,
   class: "R",
@@ -87,9 +89,29 @@ export const searchOrders = defineTool({
     ...dateRangeInput,
     contactId: entityId.optional().describe("Only orders of this contact."),
     orderNumber: z.string().min(1).max(100).optional().describe("Exact order number."),
+    orderType: z
+      .enum(["AN", "AB", "LI"])
+      .optional()
+      .describe(
+        "AN estimates, AB order confirmations, LI delivery notes; filtered after fetching.",
+      ),
     ...pageInput,
   }),
-  outputSchema: z.object({ orders: z.array(orderSummarySchema), page: pageSchema }),
+  outputSchema: z.object({
+    orders: z.array(orderSummarySchema),
+    page: pageSchema.describe(
+      "sevdesk's list before the orderType filter: total, count and hasMore refer to all " +
+        "types; continue with offset + limit.",
+    ),
+    orderTypeFilter: z
+      .object({
+        orderType: z.string(),
+        fetched: z.number().int(),
+        kept: z.number().int(),
+        note: z.string(),
+      })
+      .optional(),
+  }),
   annotations: READ_ANNOTATIONS,
   async handler(args, { sevdesk }) {
     const problem = rangeProblem(args);
@@ -111,8 +133,30 @@ export const searchOrders = defineTool({
         },
       }),
     );
-    const orders = objectsOf(body).map(mapOrderSummary);
-    const page = pageOf(args.offset, args.limit, orders.length, totalOf(body));
-    return present({ orders, page }, { summary: pageSummary(page, "orders") });
+    const fetched = objectsOf(body).map(mapOrderSummary);
+    const page = pageOf(args.offset, args.limit, fetched.length, totalOf(body));
+    if (args.orderType === undefined) {
+      return present({ orders: fetched, page }, { summary: pageSummary(page, "orders") });
+    }
+    const orders = fetched.filter((order) => order.orderType === args.orderType);
+    return present(
+      {
+        orders,
+        page,
+        orderTypeFilter: {
+          orderType: args.orderType,
+          fetched: fetched.length,
+          kept: orders.length,
+          note:
+            "sevdesk has no orderType filter: it was applied to this page only. page.total " +
+            "counts all order types; more matches may follow at offset + limit.",
+        },
+      },
+      {
+        summary:
+          `${orders.length} of ${fetched.length} fetched orders are ${args.orderType} ` +
+          `(offset ${args.offset}${page.hasMore ? ", more available" : ""}).`,
+      },
+    );
   },
 });

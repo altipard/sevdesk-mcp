@@ -66,6 +66,39 @@ describe("search_orders", () => {
     expect(textOf(result).split("\n")[0]).toBe("2 of 2 orders (offset 0).");
   });
 
+  it("filters by order type after fetching and says what page refers to", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Order"), () =>
+        HttpResponse.json(
+          list(
+            [
+              order(),
+              order({ id: "7002", orderType: "AB" }),
+              order({ id: "7003", orderType: "LI" }),
+            ],
+            40,
+          ),
+        ),
+      ),
+    );
+    const c = await connect();
+    const result = await c.call("search_orders", { orderType: "AB", limit: 3 });
+    const data = structured<{
+      orders: Array<{ id: number }>;
+      page: Record<string, unknown>;
+      orderTypeFilter: Record<string, unknown>;
+    }>(result);
+    // Not sent to sevdesk: the spec declares no orderType parameter.
+    expect(queryOf(api.requests[0])).toEqual({ limit: "3", offset: "0", countAll: "true" });
+    expect(data.orders.map((o) => o.id)).toEqual([7002]);
+    expect(data.page).toEqual({ offset: 0, limit: 3, count: 3, total: 40, hasMore: true });
+    expect(data.orderTypeFilter).toMatchObject({ orderType: "AB", fetched: 3, kept: 1 });
+    expect(String(data.orderTypeFilter.note)).toContain("applied to this page only");
+    expect(textOf(result).split("\n")[0]).toBe(
+      "1 of 3 fetched orders are AB (offset 0, more available).",
+    );
+  });
+
   it("reports 401, 404 and 429 as tool errors", async () => {
     await expectHttpErrors(api, "get", "/Order", "search_orders", {});
   });
