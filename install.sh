@@ -327,7 +327,8 @@ verify_checksum() {
         fail "checksum mismatch for $asset; the download is corrupt or has been tampered with. Nothing was installed."
 }
 
-# Prints the version a sevdesk-mcp binary reports in its MCP initialize answer, or nothing.
+# Prints the version a freshly downloaded sevdesk-mcp binary reports in its MCP initialize
+# answer, or nothing. Only used on the staged download, never on an existing file.
 # It runs with a dummy token and an unreachable base URL, so it neither asks the keychain nor
 # reaches sevdesk, and it is stopped after 10 seconds.
 binary_version() { # binary
@@ -344,7 +345,8 @@ binary_version() { # binary
     sed -n 's/.*"serverInfo":{[^}]*"version":"\([0-9A-Za-z.+-]*\)".*/\1/p' "$out" | head -n 1
 }
 
-# Sets BIN_PATH and PREVIOUS (version of the replaced binary, empty if there was none).
+# Sets BIN_PATH and REPLACED (1 if a file was there before). The existing file is never run:
+# it may not be ours, and its version does not matter for the replacement.
 install_binary() { # downloaded-file
     target="$DEST/$BIN_NAME"
     # A random name in the target directory: same file system, so the rename below is atomic
@@ -355,11 +357,8 @@ install_binary() { # downloaded-file
     reported=$(binary_version "$stage")
     [ "$reported" = "$VERSION" ] ||
         fail "the downloaded binary does not run on this system (it reported '${reported:-nothing}', expected $VERSION). Nothing was installed."
-    PREVIOUS=''
-    if [ -e "$target" ]; then
-        PREVIOUS=$(binary_version "$target")
-        PREVIOUS=${PREVIOUS:-unknown version}
-    fi
+    REPLACED=0
+    if [ -e "$target" ] || [ -L "$target" ]; then REPLACED=1; fi
     mv -f "$stage" "$target" || fail "cannot replace $target"
     stage=''
     BIN_PATH=$target
@@ -723,8 +722,8 @@ main() {
     install_binary "$tmp/$asset"
 
     blank
-    if [ -n "$PREVIOUS" ]; then
-        say "Replaced sevdesk-mcp $PREVIOUS with ${ACC}$VERSION${RST} at ${BOLD}$BIN_PATH${RST}"
+    if [ "$REPLACED" = 1 ]; then
+        say "Replaced the existing ${BOLD}$BIN_PATH${RST} with sevdesk-mcp ${ACC}$VERSION${RST}"
     else
         say "${BOLD}sevdesk-mcp${RST} ${ACC}$VERSION${RST} installed to ${BOLD}$BIN_PATH${RST}"
     fi

@@ -126,7 +126,7 @@ describe("install.sh against a stub release", () => {
 
     const again = install(s);
     expect(again.status).toBe(0);
-    expect(again.stdout).toContain(`Replaced sevdesk-mcp ${VERSION} with ${VERSION}`);
+    expect(again.stdout).toContain(`Replaced the existing ${bin} with sevdesk-mcp ${VERSION}`);
   });
 
   it("aborts on a wrong checksum and installs nothing", () => {
@@ -143,6 +143,18 @@ describe("install.sh against a stub release", () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("does not run on this system");
     expect(readdirSync(s.installDir)).toEqual([]);
+  });
+
+  it("replaces an existing file without running it", () => {
+    const s = setup();
+    mkdirSync(s.installDir);
+    const marker = join(s.dir, "ran");
+    writeExecutable(join(s.installDir, "sevdesk-mcp"), `#!/bin/sh\ntouch '${marker}'\n`);
+    const result = install(s, { SEVDESK_MCP_VERSION: VERSION });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Replaced the existing");
+    expect(existsSync(marker)).toBe(false);
+    expect(readFileSync(join(s.installDir, "sevdesk-mcp"), "utf8")).toBe(fakeBinary(VERSION));
   });
 
   it("refuses a directory in place of the binary", () => {
