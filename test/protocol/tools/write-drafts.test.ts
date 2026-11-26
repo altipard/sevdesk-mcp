@@ -147,6 +147,7 @@ describe("create_invoice_draft", () => {
       invoicePosDelete: null,
       discountSave: [],
       discountDelete: null,
+      takeDefaultAddress: false,
     });
     expect(data).toMatchObject({
       invoice: { id: 1101, status: 100, statusName: "draft", sumNet: 250 },

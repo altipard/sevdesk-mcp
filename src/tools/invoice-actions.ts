@@ -1,5 +1,7 @@
 import { z } from "zod";
+import type { Logger } from "../logger.js";
 import { defineTool, type StrictToolAnnotations } from "../policy/registry.js";
+import { SevdeskError } from "../sevdesk/errors.js";
 import {
   cents,
   entityId,
@@ -44,6 +46,17 @@ const IRREVERSIBLE_ANNOTATIONS: StrictToolAnnotations = {
   idempotentHint: false,
   openWorldHint: true,
 };
+
+/**
+ * The handler result checked against its schema. The action has already
+ * happened at this point, so a mismatch is logged and the result returned
+ * anyway: an error here would invite a second booking or e-mail.
+ */
+function shaped<S extends z.ZodType>(schema: S, value: z.infer<S>, logger: Logger, tool: string) {
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) logger.error("tool output does not match its schema", { tool });
+  return parsed.success ? parsed.data : value;
+}
 
 const invoiceIdInput = entityId.describe("sevdesk ID of the invoice (search_invoices).");
 
@@ -132,12 +145,17 @@ export const markInvoiceSent = defineTool({
     const returned = objectsOf(body)[0];
     // sevdesk answers with the invoice; if not, report what is known.
     const invoice = returned ? mapInvoiceState(returned) : before;
-    const output = markSentOutput.parse({
-      invoice,
-      sendType: args.sendType,
-      statusBefore: before.status,
-      statusAfter: returned ? invoice.status : null,
-    });
+    const output = shaped(
+      markSentOutput,
+      {
+        invoice,
+        sendType: args.sendType,
+        statusBefore: before.status,
+        statusAfter: returned ? invoice.status : null,
+      },
+      call.logger,
+      "mark_invoice_sent",
+    );
     return present(output, {
       summary:
         `Invoice ${invoiceLabel(invoice)} marked as ${SEND_TYPES[args.sendType]}; status ` +
@@ -193,7 +211,10 @@ export const bookInvoicePayment = defineTool({
   inputSchema: z.object({
     invoiceId: invoiceIdInput,
     amount: z.number().positive().max(1_000_000_000).describe("Amount paid, in invoice currency."),
-    date: isoDate.optional().describe("Payment date YYYY-MM-DD; default today (German time)."),
+    // Defaulted in the schema, so the date is part of the token-bound arguments.
+    date: isoDate
+      .default(() => todayIso())
+      .describe("Payment date YYYY-MM-DD; default today (German time)."),
     paymentType: z.enum(PAYMENT_TYPES).optional(),
     checkAccountId: entityId.describe("sevdesk check account the money arrived on."),
     checkAccountTransactionId: entityId
@@ -235,7 +256,7 @@ export const bookInvoicePayment = defineTool({
     return {
       ...invoiceFacts(invoice, await contactNameOf(call, invoice.contactId)),
       amount: args.amount,
-      date: args.date ?? todayIso(),
+      date: args.date,
       paymentType: paymentTypeFor(args.paymentType, args.amount, open),
       checkAccount,
       ...(args.checkAccountTransactionId !== undefined && {
@@ -251,7 +272,7 @@ export const bookInvoicePayment = defineTool({
     const invoice = mapInvoiceState(await readInvoice(call, args.invoiceId));
     const open = openOf(invoice);
     const paymentType = paymentTypeFor(args.paymentType, args.amount, open);
-    const date = args.date ?? todayIso();
+    const date = args.date;
     const { sevdesk } = call;
     const body = await sevdesk.call(
       sevdesk.api.PUT("/Invoice/{invoiceId}/bookAmount", {
@@ -268,18 +289,23 @@ export const bookInvoicePayment = defineTool({
       }),
     );
     const overpayment = open === null ? 0 : Math.max(0, cents(args.amount - open));
-    const output = bookOutput.parse({
-      invoiceId: args.invoiceId,
-      invoiceNumber: invoice.invoiceNumber,
-      bookedAmount: args.amount,
-      date,
-      paymentType,
-      checkAccountId: args.checkAccountId,
-      openBefore: open,
-      openAfterExpected: open === null ? null : Math.max(0, cents(open - args.amount)),
-      overpayment,
-      logId: integer((body as { objects?: { id?: unknown } } | undefined)?.objects?.id),
-    });
+    const output = shaped(
+      bookOutput,
+      {
+        invoiceId: args.invoiceId,
+        invoiceNumber: invoice.invoiceNumber,
+        bookedAmount: args.amount,
+        date,
+        paymentType,
+        checkAccountId: args.checkAccountId,
+        openBefore: open,
+        openAfterExpected: open === null ? null : Math.max(0, cents(open - args.amount)),
+        overpayment,
+        logId: integer((body as { objects?: { id?: unknown } } | undefined)?.objects?.id),
+      },
+      call.logger,
+      "book_invoice_payment",
+    );
     return present(output, {
       summary:
         `Booked ${money(args.amount, invoice.currency)} (${paymentType}) on invoice ` +
@@ -385,8 +411,15 @@ export const sendInvoiceEmail = defineTool({
     };
   },
   async handler(args, call) {
-    // Read first: an unknown invoice fails here, before anything is sent.
-    const invoice = mapInvoiceState(await readInvoice(call, args.invoiceId));
+    // Only for the invoice number in the answer. The idempotency key is
+    // already taken here, so a failing read must not end the call: it would
+    // block the invoice for 24 hours without anything having been sent.
+    let invoiceNumber: string | null = null;
+    try {
+      invoiceNumber = mapInvoiceState(await readInvoice(call, args.invoiceId)).invoiceNumber;
+    } catch (error) {
+      if (!(error instanceof SevdeskError) || error.kind === "policy") throw error;
+    }
     const { sevdesk } = call;
     const body = await sevdesk.call(
       sevdesk.api.POST("/Invoice/{invoiceId}/sendViaEmail", {
@@ -403,17 +436,22 @@ export const sendInvoiceEmail = defineTool({
       }),
     );
     const email = objectsOf(body)[0];
-    const output = emailOutput.parse({
-      invoiceId: args.invoiceId,
-      invoiceNumber: invoice.invoiceNumber,
-      toEmail: args.toEmail,
-      ccEmail: args.ccEmail ?? [],
-      bccEmail: args.bccEmail ?? [],
-      subject: args.subject,
-      emailId: email ? integer(email.id) : null,
-    });
+    const output = shaped(
+      emailOutput,
+      {
+        invoiceId: args.invoiceId,
+        invoiceNumber,
+        toEmail: args.toEmail,
+        ccEmail: args.ccEmail ?? [],
+        bccEmail: args.bccEmail ?? [],
+        subject: args.subject,
+        emailId: email ? integer(email.id) : null,
+      },
+      call.logger,
+      "send_invoice_email",
+    );
     return present(output, {
-      summary: `Invoice ${invoiceLabel(invoice)} was sent by e-mail to ${args.toEmail}.`,
+      summary: `Invoice ${invoiceNumber ? `${invoiceNumber} (ID ${args.invoiceId})` : args.invoiceId} was sent by e-mail to ${args.toEmail}.`,
     });
   },
 });
@@ -459,7 +497,7 @@ export const cancelInvoice = defineTool({
       warnings,
     };
   },
-  async handler(args, { sevdesk }) {
+  async handler(args, { sevdesk, logger }) {
     const body = await sevdesk.call(
       sevdesk.api.POST("/Invoice/{invoiceId}/cancelInvoice", {
         params: { path: { invoiceId: args.invoiceId } },
@@ -467,10 +505,15 @@ export const cancelInvoice = defineTool({
     );
     const raw = objectsOf(body)[0];
     const cancellation = raw ? mapInvoiceState(raw) : null;
-    const output = cancelOutput.parse({
-      cancelledInvoiceId: args.invoiceId,
-      cancellationInvoice: cancellation,
-    });
+    const output = shaped(
+      cancelOutput,
+      {
+        cancelledInvoiceId: args.invoiceId,
+        cancellationInvoice: cancellation,
+      },
+      logger,
+      "cancel_invoice",
+    );
     return present(output, {
       summary: cancellation
         ? `Invoice ${args.invoiceId} was cancelled; cancellation invoice ${invoiceLabel(cancellation)}.`

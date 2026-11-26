@@ -226,6 +226,9 @@ export const createInvoiceDraft = defineTool({
       invoicePosDelete: null,
       discountSave: [],
       discountDelete: null,
+      // The spec asks for all four trailing fields, in this order. The
+      // address is set above, from the contact's invoice address.
+      takeDefaultAddress: false,
     };
     const { sevdesk } = call;
     const result = await sevdesk.call(
