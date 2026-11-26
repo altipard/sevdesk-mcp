@@ -230,6 +230,34 @@ describe("client scope of the fallback", () => {
     expect(api.requests).toHaveLength(1);
   });
 
+  it("runs on a scoped client in the server", async () => {
+    // The injected client points elsewhere than the configured base URL,
+    // so only a scoped fallback client refuses this call.
+    api.server.use(http.get(sevdeskUrl("/Invoice"), () => HttpResponse.json({ objects: [] })));
+    const config = testConfig({ baseUrl: "https://configured.mock/api/v1" });
+    const { audit, events } = recordingAudit();
+    const server = createServer(config, {
+      logger: captureLogger().logger,
+      runtime: createPolicyRuntime(config, { transport: "stdio", audit }),
+      sevdesk: createSevdeskClient({ baseUrl: MOCK_BASE_URL, token: TEST_TOKEN }),
+    });
+    const client = await connectServer(server);
+    const result = await client.callTool({
+      name: "sevdesk_api_request",
+      arguments: { operationId: "getInvoices" },
+    });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("sevdesk_api_request may not call");
+    expect(api.requests).toEqual([]);
+    expect(events).toEqual([
+      expect.objectContaining({
+        tool: "sevdesk_api_request",
+        outcome: "denied",
+        reason: "client_scope:outside_base_url",
+      }),
+    ]);
+  });
+
   it("keeps its client on the allowlist, below the tool's own checks", async () => {
     // sevdesk_api_request already refuses unreleased operations itself, so
     // this drives the scoped client directly with requests it never builds.

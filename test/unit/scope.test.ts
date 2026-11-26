@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { silentAuditLog } from "../../src/policy/audit.js";
+import { OPERATIONS, type OperationId } from "../../src/policy/operations.js";
 import {
   defineTool,
   type ToolDefinition,
@@ -85,6 +86,19 @@ describe("checkRequest", () => {
       operationId: "createContact",
     });
     expect(checkRequest(writeScope, "write", BASE, "POST", url("/Contact")).ok).toBe(true);
+  });
+
+  it("maps every operation of the spec back to itself", () => {
+    const all = Object.keys(OPERATIONS) as OperationId[];
+    const scope: ClientScope = { tool: "all", class: "X", operations: new Set(all) };
+    for (const operationId of all) {
+      const { method, path } = OPERATIONS[operationId];
+      const concrete = path.replace(/\{[^}]+\}/g, "1");
+      expect(checkRequest(scope, "full", BASE, method, url(concrete)), operationId).toMatchObject({
+        ok: true,
+        operationId,
+      });
+    }
   });
 
   it("matches the method case-insensitively, as openapi-fetch's request() passes it", () => {
