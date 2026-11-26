@@ -67,6 +67,12 @@ const PROBES: readonly ToolDefinition[] = [
   probe("request_override", (s) =>
     untyped(s.api)("get", "/Invoice", { Request: globalThis.Request }),
   ),
+  probe("header_override", (s) =>
+    untyped(s.api)("get", "/Invoice", { headers: { "X-HTTP-Method-Override": "DELETE" } }),
+  ),
+  probe("middleware_override", (s) =>
+    untyped(s.api)("get", "/Invoice", { middleware: [{ onRequest: () => undefined }] }),
+  ),
   probe("declared_read", (s) => s.api.GET("/Invoice", { params: { query: { limit: 1 } } })),
   probe("declared_extra", (s) => s.api.GET("/Contact"), { operations: ["getContacts"] }),
   probe("with_signal", (s) => s.api.GET("/Invoice", { signal: new AbortController().signal })),
@@ -219,25 +225,27 @@ describe("client scope of curated tools", () => {
     expect(h.audit[0]?.operationId).toBeUndefined();
   });
 
-  it.each(["fetch_override", "request_override"])(
-    "refuses the per-call option of %s",
-    async (tool) => {
-      const h = await harness();
-      const result = await h.call(tool);
-      expect(result.isError).toBe(true);
-      expect(textOf(result)).toContain("is not allowed on the sevdesk client");
-      expect(api.requests).toEqual([]);
-      const option = tool === "fetch_override" ? "fetch" : "Request";
-      expect(h.audit).toEqual([
-        expect.objectContaining({
-          tool,
-          class: "R",
-          outcome: "denied",
-          reason: `client_scope:call_override:${option}`,
-        }),
-      ]);
-    },
-  );
+  it.each([
+    ["fetch_override", "call_override:fetch", "is not allowed on the sevdesk client"],
+    ["request_override", "call_override:Request", "is not allowed on the sevdesk client"],
+    ["middleware_override", "call_override:middleware", "is not allowed on the sevdesk client"],
+    ["header_override", "header:x-http-method-override", "is not allowed on sevdesk requests"],
+  ])("refuses %s before the network and audits it", async (tool, reason, text) => {
+    api.server.use(http.all(sevdeskUrl("/*"), () => HttpResponse.json({ objects: [] })));
+    const h = await harness();
+    const result = await h.call(tool);
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain(text);
+    expect(api.requests).toEqual([]);
+    expect(h.audit).toEqual([
+      expect.objectContaining({
+        tool,
+        class: "R",
+        outcome: "denied",
+        reason: `client_scope:${reason}`,
+      }),
+    ]);
+  });
 
   it("refuses a preview that calls the tool's own write operation", async () => {
     api.server.use(http.all(sevdeskUrl("/*"), () => HttpResponse.json({ objects: [] })));

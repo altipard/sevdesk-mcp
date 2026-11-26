@@ -84,6 +84,65 @@ function backoffDelay(attempt: number, retry: RetryOptions): number {
   return Math.round(exponential * (0.5 + Math.random() * 0.5));
 }
 
+/** fetch's rejection for a redirect under `redirect: "error"`. */
+function isRedirectRefusal(error: unknown): boolean {
+  if (!(error instanceof TypeError)) return false;
+  const cause = (error as { cause?: unknown }).cause;
+  const causeMessage = cause instanceof Error ? cause.message : "";
+  return /redirect/i.test(`${error.message} ${causeMessage}`);
+}
+
+/**
+ * Request headers a call may carry. The client sets Accept, User-Agent and,
+ * with a body, Content-Type; a caller may override those, nothing else.
+ * Method overrides (X-HTTP-Method-Override and relatives) or forwarding
+ * headers could make sevdesk run another operation than the one checked.
+ */
+const ALLOWED_HEADERS = new Set(["accept", "content-type", "user-agent"]);
+
+/** Query keys some frameworks read as the real method. */
+const METHOD_OVERRIDE_QUERY = new Set([
+  "_method",
+  "x-http-method",
+  "x-http-method-override",
+  "x-method-override",
+]);
+
+function refuseCall(
+  gates: readonly RequestGate[],
+  method: string,
+  reason: string,
+  message: string,
+): never {
+  for (const gate of gates) gate.callRefused(method.toUpperCase(), reason);
+  throw new SevdeskError("policy", `${message} Nothing was sent.`);
+}
+
+function refuseSmuggling(gates: readonly RequestGate[], request: Request): void {
+  for (const name of request.headers.keys()) {
+    if (!ALLOWED_HEADERS.has(name)) {
+      const shown = name.slice(0, 60);
+      refuseCall(
+        gates,
+        request.method,
+        `header:${shown}`,
+        `The request header "${shown}" is not allowed on sevdesk requests.`,
+      );
+    }
+  }
+  for (const key of new URL(request.url).searchParams.keys()) {
+    if (METHOD_OVERRIDE_QUERY.has(key.toLowerCase())) {
+      const shown = key.slice(0, 60);
+      refuseCall(
+        gates,
+        request.method,
+        `query:${shown}`,
+        `The query parameter "${shown}" is not allowed on sevdesk requests.`,
+      );
+    }
+  }
+}
+
 function networkErrorCode(error: unknown): string | undefined {
   const cause = (error as { cause?: { code?: unknown } } | undefined)?.cause;
   return typeof cause?.code === "string" ? cause.code : undefined;
@@ -118,12 +177,18 @@ export interface RequestGate {
    * refuse it (a SevdeskError of kind "policy").
    */
   check(request: Request): void;
-  /** Told when a call is refused before a request exists (per-call overrides). */
-  callRefused(method: string, option: string): void;
+  /**
+   * Told when the client refuses a call itself: a per-call override, a
+   * header outside the allowlist or a method-override query. `reason` is
+   * short and machine-readable, e.g. "call_override:fetch".
+   */
+  callRefused(method: string, reason: string): void;
 }
 
 interface FetchPolicy {
   baseUrl: string;
+  /** Added after every check, so nothing before the policy fetch sees it. */
+  token: string;
   /** Checks of a restricted client, in order; each one can refuse. */
   gates: readonly RequestGate[];
   maxResponseBytes: number;
@@ -221,8 +286,10 @@ async function waitUnlessAborted(
  */
 function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<Response> {
   return async (original) => {
-    // The scope of a restricted client comes first: a request outside it
-    // is refused before pins, retries or the network see it.
+    // Headers and method overrides first, then the scope of a restricted
+    // client: a request outside either is refused before pins, retries or
+    // the network see it.
+    refuseSmuggling(policy.gates, original);
     for (const gate of policy.gates) gate.check(original);
     // Pins (preventSendBy, enshrine flags) hold for every caller of the
     // client, not only for the fallback that checks them up front.
@@ -233,6 +300,12 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
       if (error instanceof PinViolation) throw new SevdeskError("policy", error.message);
       throw error;
     }
+    // The token is set only here, after openapi-fetch and every check, so
+    // nothing a caller can hook into (middleware, Request) ever holds it.
+    const headers = new Headers(request.headers);
+    // sevdesk expects the raw token, without a "Bearer" prefix.
+    headers.set("Authorization", policy.token);
+    request = new Request(request, { headers });
     const method = request.method.toUpperCase();
     const mayHaveSideEffect = method !== "GET" || policy.sideEffects;
     const maxAttempts = method === "GET" ? policy.retry.maxRetries + 1 : 1;
@@ -253,7 +326,11 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
       let response: Response;
 
       try {
-        const raw = await untilAborted(fetch(new Request(request, { signal })), signal);
+        // A redirect could lead to a path or host the scope never checked.
+        const raw = await untilAborted(
+          fetch(new Request(request, { signal, redirect: "error" })),
+          signal,
+        );
         response = await readFully(raw, signal, policy.maxResponseBytes);
       } catch (error) {
         if (request.signal.aborted) throw error;
@@ -273,6 +350,15 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
             });
           }
           throw error;
+        }
+        // A refused redirect is an answer, not a transport failure: retrying
+        // would only be redirected again.
+        if (!timeout.aborted && isRedirectRefusal(error)) {
+          const unknown = mayHaveSideEffect ? ` ${OUTCOME_UNKNOWN}` : "";
+          throw new SevdeskError(
+            "http_error",
+            `sevdesk answered with a redirect, which this server does not follow.${unknown}`,
+          );
         }
         const kind = timeout.aborted ? "timeout" : "network";
         const delay = backoffDelay(attempt, policy.retry);
@@ -349,10 +435,11 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
   };
 }
 
-// openapi-fetch lets a single call replace fetch or the Request class.
-// Either would skip the policy fetch (and with it the scope, pins and
-// timeouts) while still carrying the token header, so they are refused.
-const FORBIDDEN_CALL_OPTIONS = ["fetch", "Request"] as const;
+// openapi-fetch lets a single call replace fetch or the Request class, or
+// add middleware. fetch and Request would skip the policy fetch (scope,
+// pins, timeouts); middleware could rewrite the request or read what the
+// call carries. All three are refused.
+const FORBIDDEN_CALL_OPTIONS = ["fetch", "Request", "middleware"] as const;
 const CALL_METHODS = ["GET", "PUT", "POST", "DELETE", "OPTIONS", "HEAD", "PATCH", "TRACE"] as const;
 
 /**
@@ -364,17 +451,21 @@ function refuseOverrides(gates: readonly RequestGate[], method: string, init: un
   const copy: Record<string, unknown> = { ...init };
   for (const option of FORBIDDEN_CALL_OPTIONS) {
     if (copy[option] !== undefined) {
-      for (const gate of gates) gate.callRefused(method.toUpperCase(), option);
-      throw new SevdeskError(
-        "policy",
-        `The per-call option "${option}" is not allowed on the sevdesk client. Nothing was sent.`,
+      refuseCall(
+        gates,
+        method,
+        `call_override:${option}`,
+        `The per-call option "${option}" is not allowed on the sevdesk client.`,
       );
     }
   }
   return copy;
 }
 
-/** The openapi-fetch client with per-call fetch/Request overrides refused. */
+/**
+ * The openapi-fetch client with per-call overrides refused and without
+ * use/eject: client-wide middleware would see every request of the tool.
+ */
 function sealApi(api: SevdeskApi, gates: readonly RequestGate[]): SevdeskApi {
   const sealed: Record<string, unknown> = {
     request: (method: string, url: string, init?: unknown) => {
@@ -384,8 +475,20 @@ function sealApi(api: SevdeskApi, gates: readonly RequestGate[]): SevdeskApi {
         refuseOverrides(gates, String(method), init),
       );
     },
-    use: api.use.bind(api),
-    eject: api.eject.bind(api),
+    use: () =>
+      refuseCall(
+        gates,
+        "USE",
+        "call_override:middleware",
+        "Middleware is not allowed on the sevdesk client.",
+      ),
+    eject: () =>
+      refuseCall(
+        gates,
+        "EJECT",
+        "call_override:middleware",
+        "Middleware is not allowed on the sevdesk client.",
+      ),
   };
   for (const name of CALL_METHODS) {
     const call = api[name] as (url: string, init?: unknown) => unknown;
@@ -421,6 +524,7 @@ export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClien
   const redact: Redactor = createRedactor([options.token]);
   const base: FetchPolicy = {
     baseUrl: options.baseUrl,
+    token: options.token,
     gates: [],
     maxResponseBytes: options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
     sideEffects: false,
@@ -436,9 +540,8 @@ export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClien
     sealApi(
       createClient<paths>({
         baseUrl: options.baseUrl.replace(/\/+$/, ""),
+        // Authorization is added by the policy fetch, after every check.
         headers: {
-          // sevdesk expects the raw token, without a "Bearer" prefix.
-          Authorization: options.token,
           "User-Agent": options.userAgent ?? USER_AGENT,
           Accept: "application/json",
         },

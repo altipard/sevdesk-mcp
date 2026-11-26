@@ -2,7 +2,12 @@ import { delay, HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createLogger } from "../../src/logger.js";
-import { createSevdeskClient, type SevdeskClientOptions } from "../../src/sevdesk/client.js";
+import {
+  createSevdeskClient,
+  type RequestGate,
+  restrictClient,
+  type SevdeskClientOptions,
+} from "../../src/sevdesk/client.js";
 import { SevdeskError, type SevdeskErrorKind } from "../../src/sevdesk/errors.js";
 import { USER_AGENT } from "../../src/version.js";
 import { captureLogger, errorRepresentations, MOCK_BASE_URL, TEST_TOKEN } from "../helpers.js";
@@ -788,4 +793,145 @@ describe("aborting during a retry wait", () => {
     expect(sleeps).toEqual([]);
     expect(calls()).toBe(1);
   });
+});
+
+describe("what reaches the network", () => {
+  afterEach(() => {
+    server.events.removeAllListeners("request:start");
+  });
+  type Untyped = (method: string, path: string, init?: Record<string, unknown>) => Promise<never>;
+
+  function recording() {
+    const seen: Request[] = [];
+    server.events.on("request:start", ({ request }) => {
+      seen.push(request.clone());
+    });
+    return seen;
+  }
+
+  it("does not follow a redirect and does not retry it", async () => {
+    let calls = 0;
+    server.use(
+      http.get(url("/Voucher"), () => {
+        calls++;
+        return HttpResponse.redirect(url("/Contact"), 302);
+      }),
+      http.get(url("/Contact"), () => HttpResponse.json({ objects: ["followed"] })),
+    );
+    const { client } = setup({ retry: { maxRetries: 3 } });
+
+    const error = await captureError(client.call(client.api.GET("/Voucher")));
+
+    expect(error.kind).toBe("http_error");
+    expect(error.message).toBe(
+      "sevdesk answered with a redirect, which this server does not follow.",
+    );
+    expect(calls).toBe(1);
+  });
+
+  it("marks a redirected write as outcome unknown", async () => {
+    server.use(http.post(url("/Contact"), () => HttpResponse.redirect(url("/Contact/1"), 303)));
+    const { client } = setup();
+    const error = await captureError(
+      client.call(client.api.POST("/Contact", { body: {} as never })),
+    );
+    expect(error.message).toContain("does not follow.");
+    expect(error.message).toContain("The outcome is unknown");
+  });
+
+  it("adds the token only after every check, so nothing before the network sees it", async () => {
+    server.use(http.get(url("/Voucher"), () => HttpResponse.json({ objects: [] })));
+    const beforeNetwork: Array<string | null> = [];
+    const gate: RequestGate = {
+      check: (request) => {
+        beforeNetwork.push(request.headers.get("authorization"));
+      },
+      callRefused: () => {},
+    };
+    const seen = recording();
+    const base = createSevdeskClient({ baseUrl: MOCK_BASE_URL, token: TEST_TOKEN });
+    const client = restrictClient(base, gate);
+
+    await client.call(client.api.GET("/Voucher"));
+
+    expect(beforeNetwork).toEqual([null]);
+    expect(seen.at(-1)?.headers.get("authorization")).toBe(TEST_TOKEN);
+  });
+
+  it("refuses middleware, client-wide and per call", async () => {
+    const refused: string[] = [];
+    const gate: RequestGate = {
+      check: () => {},
+      callRefused: (_m, reason) => refused.push(reason),
+    };
+    const client = restrictClient(
+      createSevdeskClient({ baseUrl: MOCK_BASE_URL, token: TEST_TOKEN }),
+      gate,
+    );
+    const middleware = { onRequest: ({ request }: { request: Request }) => request };
+
+    expect(() => client.api.use(middleware)).toThrow(/Middleware is not allowed/);
+    expect(() => client.api.eject(middleware)).toThrow(/Middleware is not allowed/);
+    expect(() => client.api.GET("/Voucher", { middleware: [middleware] } as never)).toThrow(
+      /per-call option "middleware" is not allowed/,
+    );
+    expect(refused).toEqual([
+      "call_override:middleware",
+      "call_override:middleware",
+      "call_override:middleware",
+    ]);
+  });
+
+  it.each([
+    ["X-HTTP-Method-Override", { headers: { "X-HTTP-Method-Override": "DELETE" } }],
+    ["X-HTTP-Method", { params: { header: { "X-HTTP-Method": "DELETE" } } }],
+    ["X-Forwarded-Host", { headers: { "X-Forwarded-Host": "elsewhere.example" } }],
+    ["Authorization", { headers: { Authorization: "other" } }],
+  ])("refuses the request header %s before anything is sent", async (name, init) => {
+    const seen = recording();
+    const refused: string[] = [];
+    const gate: RequestGate = {
+      check: () => {},
+      callRefused: (_m, reason) => refused.push(reason),
+    };
+    const client = restrictClient(
+      createSevdeskClient({ baseUrl: MOCK_BASE_URL, token: TEST_TOKEN }),
+      gate,
+    );
+    const before = seen.length;
+
+    const error = await captureError(
+      client.call((client.api.request as unknown as Untyped)("get", "/Voucher", init)),
+    );
+
+    expect(error.kind).toBe("policy");
+    expect(error.message).toBe(
+      `The request header "${name.toLowerCase()}" is not allowed on sevdesk requests. Nothing was sent.`,
+    );
+    expect(refused).toEqual([`header:${name.toLowerCase()}`]);
+    expect(seen.length).toBe(before);
+  });
+
+  it("lets a caller choose Accept, e.g. for a PDF", async () => {
+    server.use(http.get(url("/Voucher"), () => HttpResponse.json({ objects: [] })));
+    const seen = recording();
+    const { client } = setup();
+    await client.call(client.api.GET("/Voucher", { headers: { Accept: "application/pdf" } }));
+    expect(seen.at(-1)?.headers.get("accept")).toBe("application/pdf");
+  });
+
+  it.each(["_method", "_METHOD", "x-http-method-override"])(
+    "refuses the method-override query %s",
+    async (key) => {
+      const seen = recording();
+      const before = seen.length;
+      const { client } = setup();
+      const error = await captureError(
+        client.call((client.api.request as unknown as Untyped)("get", `/Voucher?${key}=DELETE`)),
+      );
+      expect(error.kind).toBe("policy");
+      expect(error.message).toContain(`"${key}" is not allowed`);
+      expect(seen.length).toBe(before);
+    },
+  );
 });

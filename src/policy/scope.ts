@@ -184,8 +184,8 @@ export function createScopeGate(env: GateEnv): RequestGate {
       deny(request.method, decision.reason, decision.operationId);
       throw new SevdeskError("policy", denialMessage(env.scope, request.method, decision));
     },
-    callRefused(method, option) {
-      deny(method, `call_override:${option}`, undefined);
+    callRefused(method, reason) {
+      deny(method, reason, undefined);
     },
   };
 }
