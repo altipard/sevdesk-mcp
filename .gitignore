@@ -11,3 +11,6 @@ src/generated/
 
 # direnv file, holds secrets
 .envrc
+
+# compiled binaries (npm run build:bin)
+out/
