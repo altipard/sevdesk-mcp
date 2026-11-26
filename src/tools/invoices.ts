@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { defineTool, type ToolCall } from "../policy/registry.js";
+import { SevdeskError } from "../sevdesk/errors.js";
 import {
   addDays,
   amount,
@@ -322,8 +323,8 @@ export const DEFAULT_RECEIVABLE_TYPES = ["RE", "TR", "AR", "ER"] as const;
 /**
  * Time for all pages of one list_open_receivables call. Kept below the 60 s
  * deadline of a single sevdesk call and the 60 s default request timeout of
- * MCP clients, so a partial answer still arrives. Checked before each page:
- * a page already requested is waited for, bounded by the client deadline.
+ * MCP clients, so a partial answer still arrives. Checked before each page
+ * and passed to each page as an abort signal, so a hanging page is cut too.
  */
 export const RECEIVABLES_DEADLINE_MS = 45_000;
 
@@ -344,41 +345,84 @@ const emptyTotals = (currency: string | null): Totals => ({
   overdueAmount: 0,
 });
 
+/** Why a scan stopped before sevdesk had no more invoices. */
+type ScanStop =
+  | { reason: "deadline"; status: 200 | 750 }
+  | { reason: "failed"; status: 200 | 750; offset: number; error: SevdeskError };
+
 interface StatusScan {
   invoices: InvoiceSummary[];
   /** Stopped at MAX_RECEIVABLES_SCANNED. */
   truncated: boolean;
-  /** Stopped at the deadline. */
-  timedOut: boolean;
+  stop?: ScanStop;
+}
+
+/** Shared by both status scans: one deadline, and whether a page was asked yet. */
+interface ScanState {
+  deadline: number;
+  requests: number;
 }
 
 async function scanStatus(
   call: ToolCall,
   status: 200 | 750,
   contactId: number | undefined,
-  deadline: number,
+  state: ScanState,
 ): Promise<StatusScan> {
   const { sevdesk } = call;
   const invoices: InvoiceSummary[] = [];
   for (let offset = 0; offset < MAX_RECEIVABLES_SCANNED; offset += SCAN_PAGE) {
-    if (Date.now() >= deadline) return { invoices, truncated: false, timedOut: true };
-    const body = await sevdesk.call(
-      sevdesk.api.GET("/Invoice", {
-        params: {
-          query: {
-            status,
-            ...(contactId && { "contact[id]": contactId, "contact[objectName]": "Contact" }),
-            limit: SCAN_PAGE,
-            offset,
+    const remaining = state.deadline - Date.now();
+    if (remaining <= 0) return { invoices, truncated: false, stop: { reason: "deadline", status } };
+    // Also cuts a page that hangs, so the deadline holds within a page too.
+    const signal = AbortSignal.timeout(remaining);
+    const first = state.requests === 0;
+    state.requests++;
+    let body: unknown;
+    try {
+      body = await sevdesk.call(
+        sevdesk.api.GET("/Invoice", {
+          params: {
+            query: {
+              status,
+              ...(contactId && { "contact[id]": contactId, "contact[objectName]": "Contact" }),
+              limit: SCAN_PAGE,
+              offset,
+            },
           },
-        },
-      }),
-    );
+          signal,
+        }),
+      );
+    } catch (error) {
+      // A local policy refusal is never a partial answer; nor is a failure
+      // before anything was collected.
+      if (error instanceof SevdeskError && error.kind === "policy") throw error;
+      if (first) throw error;
+      if (signal.aborted)
+        return { invoices, truncated: false, stop: { reason: "deadline", status } };
+      if (error instanceof SevdeskError) {
+        return { invoices, truncated: false, stop: { reason: "failed", status, offset, error } };
+      }
+      throw error;
+    }
     const page = objectsOf(body).map(mapInvoiceSummary);
     invoices.push(...page);
-    if (page.length < SCAN_PAGE) return { invoices, truncated: false, timedOut: false };
+    if (page.length < SCAN_PAGE) return { invoices, truncated: false };
   }
-  return { invoices, truncated: true, timedOut: false };
+  return { invoices, truncated: true };
+}
+
+/** Note for a scan that stopped early; names the cause, never upstream text. */
+function stopNote(stop: ScanStop, checked: number): string {
+  const cause =
+    stop.reason === "deadline"
+      ? `Stopped after ${RECEIVABLES_DEADLINE_MS / 1000} s with ${checked} invoices checked`
+      : `Reading invoices failed at offset ${stop.offset} of status ${stop.status} ` +
+        `(${stop.error.kind}${stop.error.status !== undefined ? ` ${stop.error.status}` : ""}) ` +
+        `after ${checked} invoices`;
+  const skipped =
+    stop.status === 200 ? " Partially paid invoices (status 750) were not queried." : "";
+  return `${cause}; receivables and totals are incomplete.${skipped} Narrow by contactId.`;
 }
 
 export const listOpenReceivables = defineTool({
@@ -390,7 +434,8 @@ export const listOpenReceivables = defineTool({
     "invoice type. Reminders (MA) and cancellations (SR) are left out unless listed in " +
     "invoiceTypes, because they would count amounts twice, and so are recurring-invoice " +
     "templates (WKR), whose invoices appear as RE. Stops after " +
-    `${RECEIVABLES_DEADLINE_MS / 1000} s and marks the answer as incomplete. ` +
+    `${RECEIVABLES_DEADLINE_MS / 1000} s, or when a later page fails, and marks the answer as ` +
+    "incomplete. " +
     "Use it for dunning and cash-flow " +
     "questions; use search_invoices for any other invoice search." +
     FOREIGN_DATA_NOTE,
@@ -432,12 +477,15 @@ export const listOpenReceivables = defineTool({
     // sevdesk sent without a type, as receivables like any other.
     const untypedIncluded = args.invoiceTypes === undefined;
     const types = new Set<string>(args.invoiceTypes ?? DEFAULT_RECEIVABLE_TYPES);
-    const deadline = Date.now() + RECEIVABLES_DEADLINE_MS;
-    const open = await scanStatus(call, 200, args.contactId, deadline);
-    const partial = await scanStatus(call, 750, args.contactId, deadline);
+    const state: ScanState = { deadline: Date.now() + RECEIVABLES_DEADLINE_MS, requests: 0 };
+    const open = await scanStatus(call, 200, args.contactId, state);
+    const partial: StatusScan =
+      open.stop === undefined
+        ? await scanStatus(call, 750, args.contactId, state)
+        : { invoices: [], truncated: false };
     const capped = open.truncated || partial.truncated;
-    const timedOut = open.timedOut || partial.timedOut;
-    const truncated = capped || timedOut;
+    const stop = open.stop ?? partial.stop;
+    const truncated = capped || stop !== undefined;
 
     const all = [...open.invoices, ...partial.invoices]
       .filter((invoice) => (invoice.openAmount ?? 0) > 0)
@@ -479,10 +527,7 @@ export const listOpenReceivables = defineTool({
       capped &&
         `Checked only the first ${MAX_RECEIVABLES_SCANNED} invoices per status; ` +
           "totals may be incomplete. Narrow by contactId.",
-      timedOut &&
-        `Stopped after ${RECEIVABLES_DEADLINE_MS / 1000} s with ` +
-          `${open.invoices.length + partial.invoices.length} invoices checked; ` +
-          "receivables and totals are incomplete. Narrow by contactId.",
+      stop !== undefined && stopNote(stop, open.invoices.length + partial.invoices.length),
     ].filter((note): note is string => typeof note === "string");
     return present(
       {
