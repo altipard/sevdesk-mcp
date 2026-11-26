@@ -272,6 +272,25 @@ describe("sevdesk_api_request class rules", () => {
     expect(seen).toHaveLength(1);
   });
 
+  it("treats different spellings of the same ID as the same target", async () => {
+    api.use(http.delete(`${MOCK_BASE_URL}/Tag/3`, () => HttpResponse.json({ objects: [null] })));
+    const c = await open({ mode: "full", apiAllow: ["deleteTag"] });
+    const run = async (tagId: unknown) => {
+      const args = { operationId: "deleteTag", params: { tagId } };
+      const first = await call(c, args);
+      return call(c, { ...args, confirmation_token: body(first).confirmation_token });
+    };
+    expect((await run(3)).isError).toBeFalsy();
+    const again = await run("003");
+    expect(text(again)).toContain("already ran for this target");
+    expect(seen).toHaveLength(1);
+    expect(c.audit().at(-1)).toMatchObject({
+      outcome: "denied",
+      reason: "duplicate",
+      targetId: "3",
+    });
+  });
+
   it("does not run X when the user declines", async () => {
     const c = await open({ mode: "full", apiAllow: ["deleteTag"] }, "decline");
     const args = { operationId: "deleteTag", params: { tagId: 3 } };

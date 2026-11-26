@@ -102,6 +102,30 @@ describe("buildRequest", () => {
     expect(build("getInvoiceById", { invoiceId: "17" }).path).toBe("/Invoice/17");
   });
 
+  it("canonicalises IDs, so different spellings name the same target", () => {
+    const spellings = ["042", "42", 42, 42.0, "0042"];
+    const built = spellings.map((invoiceId) => build("getInvoiceById", { invoiceId }));
+    for (const b of built) {
+      expect(b.path).toBe("/Invoice/42");
+      expect(b.targetId).toBe("42");
+      expect(b.params).toEqual({ invoiceId: 42 });
+    }
+    expect(build("getInvoiceById", { invoiceId: "0" }).targetId).toBe("0");
+  });
+
+  it("rejects decimal spellings of integer IDs", () => {
+    rejects("getInvoiceById", { invoiceId: "42.0" }, "invoiceId must be a non-negative integer");
+    rejects("getInvoiceById", { invoiceId: "4e1" }, "invoiceId must be a non-negative integer");
+  });
+
+  it("canonicalises query numbers and booleans", () => {
+    const a = build("getInvoices", { status: "0200", startDate: "0017", limit: "05" });
+    const b = build("getInvoices", { status: 200, startDate: 17, limit: 5 });
+    expect(a.path).toBe(b.path);
+    expect(a.params).toEqual(b.params);
+    expect(build("getTransactions", { isBooked: "true" }).params.isBooked).toBe(true);
+  });
+
   it("rejects undeclared parameters, also ones that look like query injection", () => {
     rejects(
       "getInvoiceById",

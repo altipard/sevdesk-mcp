@@ -112,6 +112,12 @@ export interface BuiltRequest {
   readonly path: string;
   readonly targetId: string | undefined;
   readonly appliedDefaults: Readonly<Record<string, unknown>>;
+  /**
+   * Parameters in canonical form (numbers and booleans typed, "042" -> 42),
+   * as sent. Confirmation tokens and idempotency keys are derived from these,
+   * so different spellings of the same ID cannot dodge them.
+   */
+  readonly params: Readonly<Record<string, unknown>>;
 }
 
 const fail = (message: string): never => {
@@ -127,6 +133,40 @@ function primitiveToString(spec: ParamSpec, value: unknown): string {
   if (typeof value === "number" && Number.isFinite(value)) return String(value);
   if (typeof value === "boolean") return String(value);
   return fail(`${spec.name} must be a string, number or boolean`);
+}
+
+/**
+ * Brings numeric and boolean parameters into one canonical form before
+ * anything is derived from them: digit strings become numbers, so "042",
+ * "42" and 42 (and 42.0) name the same object. Path IDs must be
+ * non-negative. Other types are passed on unchanged and checked later.
+ */
+function canonicalValue(spec: ParamSpec, value: unknown): unknown {
+  const inPath = spec.in === "path";
+  switch (spec.type) {
+    case "integer": {
+      const number =
+        typeof value === "string" && /^-?\d{1,15}$/.test(value) ? Number(value) : value;
+      if (typeof number === "number" && Number.isSafeInteger(number) && (!inPath || number >= 0)) {
+        return number === 0 ? 0 : number;
+      }
+      return fail(`${spec.name} must be ${inPath ? "a non-negative integer" : "an integer"}`);
+    }
+    case "number": {
+      const number =
+        typeof value === "string" && /^-?\d{1,15}(\.\d{1,6})?$/.test(value) ? Number(value) : value;
+      if (typeof number === "number" && Number.isFinite(number) && (!inPath || number >= 0)) {
+        return number === 0 ? 0 : number;
+      }
+      return fail(`${spec.name} must be ${inPath ? "a non-negative number" : "a number"}`);
+    }
+    case "boolean":
+      if (typeof value === "boolean") return value;
+      if (value === "true" || value === "false") return value === "true";
+      return fail(`${spec.name} must be true or false`);
+    default:
+      return value;
+  }
 }
 
 function pathValue(spec: ParamSpec, value: unknown): string {
@@ -245,7 +285,7 @@ export function buildRequest(
       if (spec.required) fail(`${operationId} needs the parameter ${spec.name}`);
       continue;
     }
-    values[spec.name] = value;
+    values[spec.name] = canonicalValue(spec, value);
   }
 
   let targetId: string | undefined;
@@ -284,7 +324,14 @@ export function buildRequest(
     fail(`${operationId}: the request URL failed validation`);
   }
 
-  return { operationId, method: operation.method, path: relative, targetId, appliedDefaults };
+  return {
+    operationId,
+    method: operation.method,
+    path: relative,
+    targetId,
+    appliedDefaults,
+    params: values,
+  };
 }
 
 const size = (value: unknown) => (JSON.stringify(value) ?? "null").length;
@@ -418,7 +465,7 @@ export function registerGenericTool(env: RegistrationEnv): boolean {
         tool: GENERIC_TOOL_NAME,
         operationId,
         class: operationClass,
-        args: { operationId, params, body: input.body },
+        args: { operationId, params: built.params, body: input.body },
         confirmationToken: typeof token === "string" && token !== "" ? token : undefined,
         targetId: built.targetId,
         // An X operation can only be in SEVDESK_API_ALLOW by explicit listing
