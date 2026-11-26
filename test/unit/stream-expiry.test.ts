@@ -1,5 +1,6 @@
+import { DEFAULT_MAX_REQUEST_BODY_SIZE } from "@modelcontextprotocol/server";
 import { describe, expect, it } from "vitest";
-import { endStreamAt } from "../../src/http/app.js";
+import { endStreamAt, isLongLivedStream } from "../../src/http/app.js";
 
 function endless(onCancel: (reason: unknown) => void): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
@@ -57,5 +58,48 @@ describe("endStreamAt", () => {
     const wrapped = endStreamAt(sse(endless((r) => (cancelled = r))), Date.now() + 60_000);
     await wrapped.body?.cancel("client gone");
     expect(cancelled).toBe("client gone");
+  });
+});
+
+describe("isLongLivedStream", () => {
+  const post = (body: unknown, headers: Record<string, string> = {}) =>
+    new Request("http://127.0.0.1/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: typeof body === "string" ? body : JSON.stringify(body),
+    });
+  const rpc = (method: string) => ({ jsonrpc: "2.0", id: 1, method, params: {} });
+
+  it("counts the legacy GET stream and subscriptions/listen", async () => {
+    expect(await isLongLivedStream(new Request("http://127.0.0.1/mcp"))).toBe(true);
+    expect(await isLongLivedStream(post(rpc("subscriptions/listen")))).toBe(true);
+    expect(await isLongLivedStream(post([rpc("tools/list"), rpc("subscriptions/listen")]))).toBe(
+      true,
+    );
+  });
+
+  it("does not count tool calls, other methods, broken or oversized bodies", async () => {
+    expect(await isLongLivedStream(post(rpc("tools/call")))).toBe(false);
+    expect(await isLongLivedStream(post(rpc("tools/list")))).toBe(false);
+    expect(await isLongLivedStream(post("{not json"))).toBe(false);
+    expect(await isLongLivedStream(post({ method: 42 }))).toBe(false);
+    expect(
+      await isLongLivedStream(
+        post(rpc("subscriptions/listen"), {
+          "content-length": String(DEFAULT_MAX_REQUEST_BODY_SIZE + 1),
+        }),
+      ),
+    ).toBe(false);
+    const big = `{"method":"subscriptions/listen","pad":"${"x".repeat(DEFAULT_MAX_REQUEST_BODY_SIZE)}"}`;
+    expect(await isLongLivedStream(post(big))).toBe(false);
+    expect(await isLongLivedStream(new Request("http://127.0.0.1/mcp", { method: "DELETE" }))).toBe(
+      false,
+    );
+  });
+
+  it("leaves the body readable for the handler", async () => {
+    const request = post(rpc("subscriptions/listen"));
+    await isLongLivedStream(request);
+    expect(await request.json()).toMatchObject({ method: "subscriptions/listen" });
   });
 });

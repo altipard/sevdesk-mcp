@@ -1,5 +1,6 @@
 import {
   createMcpHandler,
+  DEFAULT_MAX_REQUEST_BODY_SIZE,
   getOAuthProtectedResourceMetadataUrl,
   hostHeaderValidationResponse,
   type McpServerFactory,
@@ -60,15 +61,63 @@ const json = (body: unknown, status: number, headers: Record<string, string> = {
 const methodNotAllowed = () => json({ error: "method_not_allowed" }, 405, { allow: "GET, HEAD" });
 const notFound = () => json({ error: "not_found" }, 404);
 
+const LISTEN_METHOD = "subscriptions/listen";
+
+/** JSON-RPC method names in a body: one message or a (2025) batch. */
+function methodsOf(body: unknown): string[] {
+  const messages = Array.isArray(body) ? body : [body];
+  return messages.flatMap((message) =>
+    typeof message === "object" &&
+    message !== null &&
+    typeof (message as { method?: unknown }).method === "string"
+      ? [(message as { method: string }).method]
+      : [],
+  );
+}
+
+/**
+ * Whether the request opens a stream that only ends when the client leaves:
+ * the legacy GET stream or a 2026-07-28 subscriptions/listen. Reads a copy
+ * of the body, at most as much as the handler itself accepts; anything
+ * larger or unreadable counts as not long-lived (the handler refuses it).
+ */
+export async function isLongLivedStream(request: Request): Promise<boolean> {
+  if (request.method === "GET") return true;
+  if (request.method !== "POST" || request.body === null) return false;
+  const declared = Number(request.headers.get("content-length") ?? "0");
+  if (declared > DEFAULT_MAX_REQUEST_BODY_SIZE) return false;
+  const reader = request.clone().body?.getReader();
+  if (reader === undefined) return false;
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > DEFAULT_MAX_REQUEST_BODY_SIZE) {
+        // Not awaited: cancelling one branch of a tee only settles once the
+        // handler's branch is done too.
+        void reader.cancel().catch(() => {});
+        return false;
+      }
+      chunks.push(value);
+    }
+    const text = new TextDecoder().decode(Buffer.concat(chunks));
+    return methodsOf(JSON.parse(text)).includes(LISTEN_METHOD);
+  } catch {
+    return false;
+  }
+}
+
 // setTimeout fires at once for delays above 2^31-1 ms.
 const MAX_TIMER_MS = 2_147_483_647;
 
 /**
  * Ends an event stream response at `deadlineMs` (the token's exp): the
  * client then has to come back with a fresh token, which the gate checks.
- * Other responses are returned unchanged. A tool call answered as a stream
- * is cut as well if the token expires mid-call; sevdesk calls are bounded
- * by the client deadline, so that only hits calls started just before exp.
+ * Other responses are returned unchanged. Only applied to long-lived
+ * streams (see isLongLivedStream), never to answers of tool calls.
  */
 export function endStreamAt(response: Response, deadlineMs: number, now = Date.now): Response {
   const contentType = response.headers.get("content-type") ?? "";
@@ -124,7 +173,8 @@ export function endStreamAt(response: Response, deadlineMs: number, now = Date.n
  * 3. Protected Resource Metadata, path-aware and at the root (no auth);
  * 4. the MCP endpoint: Origin allowlist (same hosts), then the bearer gate,
  *    which requires sevdesk:read; per-tool scopes are checked by the scope
- *    challenge of each tool. Event streams end when the token expires.
+ *    challenge of each tool. Subscription streams end when the token
+ *    expires; answers to tool calls run to the end.
  * Everything else is 404. The MCP token is only used here and never leaves
  * the process: tools call sevdesk with the server's own API token.
  */
@@ -174,9 +224,13 @@ export function createHttpApp(options: HttpAppOptions): HttpApp {
     }
     const auth = await gate(request);
     if (auth instanceof Response) return auth;
+    // Read before the handler consumes the body.
+    const longLived = await isLongLivedStream(request);
     const response = await mcp.fetch(request, { authInfo: auth });
-    // The gate checked exp once; a stream must not outlive the token.
-    return endStreamAt(response, (auth.expiresAt ?? 0) * 1000);
+    // The gate checked exp once; a subscription must not outlive the token.
+    // Answers to tool calls run to the end, so a write that sevdesk already
+    // executed is never cut off from its result.
+    return longLived ? endStreamAt(response, (auth.expiresAt ?? 0) * 1000) : response;
   };
 
   return {

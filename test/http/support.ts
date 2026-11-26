@@ -142,14 +142,16 @@ export interface SeenRequest {
 /** Stand-in for the sevdesk API: answers every request with a success and records it. */
 export async function startSevdeskMock() {
   const seen: SeenRequest[] = [];
+  const state = { delayMs: 0 };
   const server = createServer((req, res) => {
     let body = "";
     req.setEncoding("utf8");
     req.on("data", (chunk: string) => {
       body += chunk;
     });
-    req.on("end", () => {
+    req.on("end", async () => {
       seen.push({ method: req.method ?? "", url: req.url ?? "", headers: req.headers, body });
+      if (state.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, state.delayMs));
       res.writeHead(200, { "content-type": "application/json" });
       if (req.url?.endsWith("/Tools/bookkeepingSystemVersion")) {
         res.end(JSON.stringify({ objects: { version: "2.0" } }));
@@ -159,7 +161,15 @@ export async function startSevdeskMock() {
     });
   });
   const origin = await listen(server);
-  return { baseUrl: `${origin}/api/v1`, seen, close: () => close(server) };
+  return {
+    baseUrl: `${origin}/api/v1`,
+    seen,
+    /** Delays every answer, e.g. to let a token expire mid-call. */
+    set delayMs(ms: number) {
+      state.delayMs = ms;
+    },
+    close: () => close(server),
+  };
 }
 
 export type SevdeskMock = Awaited<ReturnType<typeof startSevdeskMock>>;
@@ -307,6 +317,7 @@ export function httpFixture() {
     // Clients first, then servers.
     while (cleanups.length > 0) await cleanups.shift()?.();
     state.sevdesk.seen.length = 0;
+    state.sevdesk.delayMs = 0;
   });
   afterAll(async () => {
     await state.iss.close();

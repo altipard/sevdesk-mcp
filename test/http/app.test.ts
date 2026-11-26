@@ -280,6 +280,23 @@ describe("Origin allowlist on the MCP endpoint", () => {
 });
 
 describe("streams end when the token expires", () => {
+  it.each(ERAS)(
+    "lets a tool call answer run to the end past exp (%s)",
+    async (era) => {
+      const server = await fx.server();
+      const exp = Math.floor(Date.now() / 1000) + 2;
+      const token = await signToken(fx.iss, server.resourceUrl.href, { expiresIn: exp });
+      const { client } = await fx.client(server.resourceUrl, token, era);
+      // sevdesk answers only after the token has expired.
+      fx.sevdesk.delayMs = Math.max(0, exp * 1000 - Date.now()) + 500;
+      const result = await client.callTool({ name: "get_account_info", arguments: {} });
+      expect(Date.now()).toBeGreaterThan(exp * 1000);
+      expect(result.isError).toBeFalsy();
+      expect(textOf(result)).toContain("2.0");
+    },
+    10_000,
+  );
+
   it("closes an open subscriptions/listen stream at exp", async () => {
     const server = await fx.server();
     const exp = Math.floor(Date.now() / 1000) + 2;
