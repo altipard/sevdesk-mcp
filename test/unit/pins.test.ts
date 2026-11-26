@@ -23,6 +23,7 @@ describe("matchOperation", () => {
     expect(matchOperation("get", "/Invoice/7/getPdf")).toBe("invoiceGetPdf");
     expect(matchOperation("PUT", "/Invoice/7/getPdf")).toBeUndefined();
     expect(matchOperation("GET", "/Nope")).toBeUndefined();
+    expect(matchOperation("GET", "/invoice/7/GETPDF/")).toBe("invoiceGetPdf");
   });
 });
 
@@ -60,6 +61,46 @@ describe("enforceRequestPins", () => {
     await expect(
       enforceRequestPins(req("/Export/datevCSV?enshrine=true"), MOCK_BASE_URL),
     ).rejects.toThrow(PinViolation);
+  });
+
+  it("checks every occurrence of a pinned parameter and keeps exactly one", async () => {
+    await expect(
+      enforceRequestPins(
+        req("/Invoice/1/getPdf?preventSendBy=true&preventSendBy=false"),
+        MOCK_BASE_URL,
+      ),
+    ).rejects.toThrow("preventSendBy is always true on this server");
+    await expect(
+      enforceRequestPins(req("/Invoice/1/getPdf?PREVENTSENDBY=false"), MOCK_BASE_URL),
+    ).rejects.toThrow(PinViolation);
+    const out = await enforceRequestPins(
+      req("/Invoice/1/getPdf?preventSendBy=true&preventSendBy=true"),
+      MOCK_BASE_URL,
+    );
+    expect(new URL(out.url).searchParams.getAll("preventSendBy")).toEqual(["true"]);
+    const dropped = await enforceRequestPins(
+      req("/Export/datevCSV?enshrine=false&Enshrine=false"),
+      MOCK_BASE_URL,
+    );
+    expect([...new URL(dropped.url).searchParams.keys()]).not.toContain("enshrine");
+    expect([...new URL(dropped.url).searchParams.keys()]).not.toContain("Enshrine");
+  });
+
+  it("normalises case, trailing and double slashes and encoding before matching", async () => {
+    for (const path of [
+      "/invoice/1/getpdf",
+      "/Invoice/1/getPdf/",
+      "//Invoice//1/getPdf",
+      "/Invoice/1/get%50df",
+    ]) {
+      const out = await enforceRequestPins(req(path), MOCK_BASE_URL);
+      expect(new URL(out.url).searchParams.get("preventSendBy"), path).toBe("true");
+    }
+    const upperBase = await enforceRequestPins(
+      new Request("https://sevdesk.mock/API/V1/Invoice/1/getPdf"),
+      MOCK_BASE_URL,
+    );
+    expect(new URL(upperBase.url).searchParams.get("preventSendBy")).toBe("true");
   });
 
   it("passes requests without pins through untouched", async () => {

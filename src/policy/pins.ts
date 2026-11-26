@@ -115,6 +115,8 @@ interface Route {
 }
 
 // Literal paths win over templates ("/Contact/Factory/x" before "/Contact/{id}").
+// Case-insensitive: sevdesk is not known to route case-sensitively, so
+// "/invoice/1/getpdf" must not slip past the pins.
 const ROUTES: readonly Route[] = (
   Object.entries(OPERATIONS) as Array<[OperationId, (typeof OPERATIONS)[OperationId]]>
 )
@@ -127,15 +129,34 @@ const ROUTES: readonly Route[] = (
         .split(/\{[^}]+\}/)
         .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
         .join("[^/]+")}$`,
+      "i",
     ),
   }))
   .sort((a, b) => a.params - b.params);
 
+/**
+ * Normalises a path for matching only: percent-decoded segments, no empty
+ * segments (double or trailing slashes). The request itself is sent as is.
+ */
+export function normalizePath(path: string): string {
+  const segments = path
+    .split("/")
+    .filter((segment) => segment !== "")
+    .map((segment) => {
+      try {
+        return decodeURIComponent(segment);
+      } catch {
+        return segment;
+      }
+    });
+  return `/${segments.join("/")}`;
+}
+
 /** The operation a request targets, by method and path relative to the base URL. */
 export function matchOperation(method: string, relativePath: string): OperationId | undefined {
   const upper = method.toUpperCase();
-  return ROUTES.find((route) => route.method === upper && route.pattern.test(relativePath))
-    ?.operationId;
+  const path = normalizePath(relativePath);
+  return ROUTES.find((route) => route.method === upper && route.pattern.test(path))?.operationId;
 }
 
 /**
@@ -144,9 +165,10 @@ export function matchOperation(method: string, relativePath: string): OperationI
  */
 export async function enforceRequestPins(request: Request, baseUrl: string): Promise<Request> {
   const url = new URL(request.url);
-  const basePath = new URL(baseUrl).pathname.replace(/\/+$/, "");
-  if (!url.pathname.startsWith(`${basePath}/`)) return request;
-  const operationId = matchOperation(request.method, url.pathname.slice(basePath.length));
+  const basePath = normalizePath(new URL(baseUrl).pathname).toLowerCase().replace(/\/$/, "");
+  const path = normalizePath(url.pathname);
+  if (!path.toLowerCase().startsWith(`${basePath}/`)) return request;
+  const operationId = matchOperation(request.method, path.slice(basePath.length));
   if (operationId === undefined) return request;
 
   if (BODY_PINS[operationId] !== undefined && request.body !== null) {
@@ -164,18 +186,24 @@ export async function enforceRequestPins(request: Request, baseUrl: string): Pro
   let changed = false;
   for (const spec of OPERATIONS[operationId].params) {
     if (spec.in !== "query") continue;
-    const present = url.searchParams.get(spec.name);
-    const pinned = pinQueryParam(spec.name, present ?? undefined);
+    // Every occurrence counts: "preventSendBy=true&preventSendBy=false"
+    // must not leave sevdesk to pick one. Names are matched without regard
+    // to case for the same reason.
+    const keys = [...new Set([...url.searchParams.keys()])].filter(
+      (key) => key.toLowerCase() === spec.name.toLowerCase(),
+    );
+    const present = keys.flatMap((key) => url.searchParams.getAll(key));
+    let pinned = pinQueryParam(spec.name, undefined);
     if (pinned === undefined) continue;
-    if (pinned.omit) {
-      if (present !== null) {
-        url.searchParams.delete(spec.name);
-        changed = true;
-      }
-    } else if (present !== String(pinned.value)) {
-      url.searchParams.set(spec.name, String(pinned.value));
-      changed = true;
+    for (const value of present) pinned = pinQueryParam(spec.name, value) ?? pinned;
+    const wanted = pinned.omit ? [] : [String(pinned.value)];
+    if (keys.length === 1 && keys[0] === spec.name && present.join("&") === wanted.join("&")) {
+      continue;
     }
+    if (keys.length === 0 && wanted.length === 0) continue;
+    for (const key of keys) url.searchParams.delete(key);
+    for (const value of wanted) url.searchParams.append(spec.name, value);
+    changed = true;
   }
   return changed ? new Request(url, request) : request;
 }
