@@ -88,7 +88,8 @@ async function harness(options: {
   now?: () => number;
   tools?: readonly ToolDefinition[];
 }): Promise<Harness> {
-  const config = testConfig({ mode: "full", ...options.config });
+  // send_email is X and therefore off unless enabled; most tests need it.
+  const config = testConfig({ mode: "full", enableTools: ["send_email"], ...options.config });
   const auditLines: string[] = [];
   const runtime =
     options.runtime ??
@@ -173,10 +174,24 @@ describe("registration by mode", () => {
     ["read", []],
     ["write", ["create_draft", "mark_sent"]],
     ["full", ["create_draft", "mark_sent", "send_email"]],
-  ] as const)("%s mode registers %j", async (mode, expected) => {
+  ] as const)("%s mode with send_email enabled registers %j", async (mode, expected) => {
     const h = await harness({ config: { mode } });
     const { tools } = await h.client.listTools();
     expect(tools.map((t) => t.name)).toEqual(expected);
+  });
+
+  it("does not register an X tool that SEVDESK_ENABLE_TOOLS does not list", async () => {
+    const h = await harness({ config: { mode: "full", enableTools: [] } });
+    const { tools } = await h.client.listTools();
+    expect(tools.map((t) => t.name)).toEqual(["create_draft", "mark_sent"]);
+  });
+
+  it("does not let SEVDESK_ALLOWED_TOOLS switch on an X tool", async () => {
+    const h = await harness({
+      config: { mode: "full", enableTools: [], allowedTools: ["send_email", "mark_sent"] },
+    });
+    const { tools } = await h.client.listTools();
+    expect(tools.map((t) => t.name)).toEqual(["mark_sent"]);
   });
 
   it("read mode of the real server registers no writing tools", async () => {
@@ -348,21 +363,8 @@ describe.each(["legacy", "modern"] as const)("class X over the %s protocol", (er
     },
   );
 
-  it("refuses without elicitation support unless explicitly allowed", async () => {
+  it("treats SEVDESK_ENABLE_TOOLS as the release when the client cannot ask", async () => {
     const h = await harness({ era });
-    const token = await preview(h, "send_email", { invoiceId: 5 });
-    const result = await h.client.callTool({
-      name: "send_email",
-      arguments: { invoiceId: 5, confirmation_token: token },
-    });
-    expect(result.isError).toBe(true);
-    expect(text(result)).toContain("cannot ask the user for approval");
-    expect(executed).toEqual([]);
-    expect(h.audit.at(-1)).toMatchObject({ outcome: "denied", reason: "no_approval_channel" });
-  });
-
-  it("executes without elicitation when listed in SEVDESK_ALLOWED_TOOLS", async () => {
-    const h = await harness({ era, config: { allowedTools: ["send_email"] } });
     const token = await preview(h, "send_email", { invoiceId: 5 });
     const result = await h.client.callTool({
       name: "send_email",
@@ -373,7 +375,7 @@ describe.each(["legacy", "modern"] as const)("class X over the %s protocol", (er
 });
 
 describe("class X single use and idempotency", () => {
-  const allowed = { allowedTools: ["send_email"] };
+  const allowed = { enableTools: ["send_email"] };
 
   it("rejects a replayed token", async () => {
     const h = await harness({ config: allowed });

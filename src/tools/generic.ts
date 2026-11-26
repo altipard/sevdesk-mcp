@@ -421,6 +421,10 @@ export function registerGenericTool(env: RegistrationEnv): boolean {
         args: { operationId, params, body: input.body },
         confirmationToken: typeof token === "string" && token !== "" ? token : undefined,
         targetId: built.targetId,
+        // An X operation can only be in SEVDESK_API_ALLOW by explicit listing
+        // (the default list holds reads only); that listing is the operator's
+        // release for clients without elicitation. With elicitation the user
+        // is still asked.
         explicitlyAllowed: policy.config.apiAllow?.includes(operationId) ?? false,
         summary: `sevdesk ${operationId}: ${built.method} ${built.path}.`,
         preview: async () => ({

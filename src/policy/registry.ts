@@ -40,7 +40,10 @@ export interface ToolDefinition<S extends ObjectSchema = ObjectSchema> {
   /** Only for R, R+ and W: W+/X calls first return a confirmation preview instead. */
   readonly outputSchema?: ObjectSchema;
   readonly annotations: StrictToolAnnotations;
-  /** false: registered only when listed in SEVDESK_ALLOWED_TOOLS (e.g. enshrine_document). */
+  /**
+   * false: off by default, registered only when listed in SEVDESK_ENABLE_TOOLS
+   * (planned for enshrine_document). X and R+ tools are always off by default.
+   */
   readonly defaultEnabled?: boolean;
   /** ID of the object the call acts on. Required for X (idempotency key). */
   readonly targetId?: (args: z.infer<S>) => string | number | undefined;
@@ -87,15 +90,26 @@ export function defineTool<S extends ObjectSchema>(
   return definition;
 }
 
-/** Explicitly listed in SEVDESK_ALLOWED_TOOLS (an unset list is never explicit). */
-export function isExplicitlyAllowed(config: Config, name: string): boolean {
-  return config.allowedTools?.includes(name) ?? false;
+/**
+ * Explicitly switched on in SEVDESK_ENABLE_TOOLS. For X tools this is also
+ * the operator's release for clients that cannot ask the user (no
+ * elicitation); with elicitation the user is still asked.
+ */
+export function isExplicitlyEnabled(config: Config, name: string): boolean {
+  return config.enableTools.includes(name);
+}
+
+/** Off unless switched on: every X and R+ tool and tools marked defaultEnabled: false. */
+export function isOffByDefault(tool: Pick<ToolDefinition, "class" | "defaultEnabled">): boolean {
+  return tool.class === "X" || tool.class === "R+" || tool.defaultEnabled === false;
 }
 
 /**
- * Registration rule. Rights (mode and scopes) are a hard ceiling no list can
- * lift; SEVDESK_DENIED_TOOLS always wins; a set SEVDESK_ALLOWED_TOOLS means
- * "exactly these". R+ and default-off tools need an explicit listing.
+ * Registration rule:
+ * - rights (mode and scopes) are a hard ceiling no list can lift;
+ * - SEVDESK_DENIED_TOOLS blocks single tools and always wins;
+ * - SEVDESK_ALLOWED_TOOLS, if set, is a whitelist that only narrows;
+ * - tools that are off by default need SEVDESK_ENABLE_TOOLS.
  */
 export function isToolEnabled(
   config: Config,
@@ -104,9 +118,9 @@ export function isToolEnabled(
 ): boolean {
   if (!allows(rights, tool.class)) return false;
   if (config.deniedTools.includes(tool.name)) return false;
-  if (config.allowedTools !== undefined) return isExplicitlyAllowed(config, tool.name);
-  if (tool.class === "R+") return false;
-  return tool.defaultEnabled !== false;
+  if (config.allowedTools !== undefined && !config.allowedTools.includes(tool.name)) return false;
+  if (isOffByDefault(tool)) return isExplicitlyEnabled(config, tool.name);
+  return true;
 }
 
 /** Fails at startup on names in the allow/deny lists that no tool has (typos). */
@@ -115,6 +129,7 @@ export function validateToolNames(config: Config, known: readonly string[]): voi
   for (const [variable, names] of [
     ["SEVDESK_ALLOWED_TOOLS", config.allowedTools ?? []],
     ["SEVDESK_DENIED_TOOLS", config.deniedTools],
+    ["SEVDESK_ENABLE_TOOLS", config.enableTools],
   ] as const) {
     for (const name of names) {
       if (!known.includes(name)) issues.push(`${variable}: unknown tool: ${name}`);
@@ -177,7 +192,7 @@ export function registerTools(
           args: args as Record<string, unknown>,
           confirmationToken: typeof token === "string" && token !== "" ? token : undefined,
           targetId: stringId(definition.targetId?.(args)),
-          explicitlyAllowed: isExplicitlyAllowed(policy.config, definition.name),
+          explicitlyAllowed: isExplicitlyEnabled(policy.config, definition.name),
           summary: definition.summary?.(args) ?? `Run ${definition.name}.`,
           preview:
             definition.preview && (() => definition.preview?.(args, call) ?? Promise.resolve({})),

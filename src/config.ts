@@ -19,10 +19,17 @@ export interface Config {
   mode: Mode;
   baseUrl: string;
   logLevel: LogLevel;
-  /** SEVDESK_ALLOWED_TOOLS. Undefined: the default tool set. Set: exactly these tools. */
+  /** SEVDESK_ALLOWED_TOOLS. Optional whitelist; it only ever narrows the tool set. */
   allowedTools?: readonly string[];
-  /** SEVDESK_DENIED_TOOLS. Always wins over the allowlist. */
+  /** SEVDESK_DENIED_TOOLS. Blocks single tools; always wins. */
   deniedTools: readonly string[];
+  /**
+   * SEVDESK_ENABLE_TOOLS. Switches on tools that are off by default: every
+   * X tool, R+ tools and tools marked defaultEnabled: false. For X tools the
+   * listing also counts as the operator's release for clients without
+   * elicitation.
+   */
+  enableTools: readonly string[];
   /** SEVDESK_API_ALLOW. Undefined: the curated default list of the fallback. */
   apiAllow?: readonly string[];
   /** SEVDESK_CONFIRM_SECRET, HMAC key for confirmation tokens. */
@@ -141,6 +148,7 @@ const envSchema = z.object({
   ),
   SEVDESK_ALLOWED_TOOLS: nameList("tool name"),
   SEVDESK_DENIED_TOOLS: nameList("tool name"),
+  SEVDESK_ENABLE_TOOLS: nameList("tool name"),
   SEVDESK_API_ALLOW: nameList("operationId").superRefine((ids, ctx) => {
     for (const id of ids ?? []) {
       if (classOf(id) === undefined) {
@@ -183,6 +191,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     logLevel: data.LOG_LEVEL,
     ...(data.SEVDESK_ALLOWED_TOOLS && { allowedTools: data.SEVDESK_ALLOWED_TOOLS }),
     deniedTools: data.SEVDESK_DENIED_TOOLS ?? [],
+    enableTools: data.SEVDESK_ENABLE_TOOLS ?? [],
     ...(data.SEVDESK_API_ALLOW && { apiAllow: data.SEVDESK_API_ALLOW }),
     ...(data.SEVDESK_CONFIRM_SECRET && { confirmSecret: data.SEVDESK_CONFIRM_SECRET }),
     confirmTtlSeconds: data.SEVDESK_CONFIRM_TTL_SECONDS,

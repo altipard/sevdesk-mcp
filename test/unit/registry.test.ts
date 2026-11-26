@@ -114,34 +114,51 @@ describe("isToolEnabled", () => {
     ["write", "X", false],
     ["full", "X", true],
     ["none", "R", false],
-  ] as const)("rights %s, class %s: %s", (rights, cls, expected) => {
-    expect(isToolEnabled(testConfig(), rights as Rights, tool(cls))).toBe(expected);
+  ] as const)("rights %s, class %s (enabled): %s", (rights, cls, expected) => {
+    const config = testConfig({ enableTools: ["some_tool"] });
+    expect(isToolEnabled(config, rights as Rights, tool(cls))).toBe(expected);
   });
 
-  it("lets the deny list win over the allowlist", () => {
-    const config = testConfig({ allowedTools: ["some_tool"], deniedTools: ["some_tool"] });
+  it("lets the deny list win over allow and enable lists", () => {
+    const config = testConfig({
+      allowedTools: ["some_tool"],
+      enableTools: ["some_tool"],
+      deniedTools: ["some_tool"],
+    });
     expect(isToolEnabled(config, "full", tool("R"))).toBe(false);
+    expect(isToolEnabled(config, "full", tool("X"))).toBe(false);
   });
 
-  it("restricts to exactly the listed tools when the allowlist is set", () => {
+  it("uses the allowlist only to narrow", () => {
     expect(isToolEnabled(testConfig({ allowedTools: ["other"] }), "full", tool("R"))).toBe(false);
     expect(isToolEnabled(testConfig({ allowedTools: ["some_tool"] }), "full", tool("R"))).toBe(
       true,
     );
+    // Listing an off-by-default tool in the allowlist does not switch it on.
+    expect(isToolEnabled(testConfig({ allowedTools: ["some_tool"] }), "full", tool("X"))).toBe(
+      false,
+    );
   });
 
-  it("never lifts a tool above the rights, even when listed", () => {
-    const config = testConfig({ allowedTools: ["some_tool"] });
+  it("keeps X, R+ and default-off tools off unless enabled", () => {
+    expect(isToolEnabled(testConfig(), "full", tool("X"))).toBe(false);
+    expect(isToolEnabled(testConfig(), "full", tool("R+"))).toBe(false);
+    expect(isToolEnabled(testConfig(), "full", tool("W", { defaultEnabled: false }))).toBe(false);
+    const enabled = testConfig({ enableTools: ["some_tool"] });
+    expect(isToolEnabled(enabled, "full", tool("X"))).toBe(true);
+    expect(isToolEnabled(enabled, "read", tool("R+"))).toBe(true);
+    expect(isToolEnabled(enabled, "write", tool("W", { defaultEnabled: false }))).toBe(true);
+  });
+
+  it("narrows enabled tools by the allowlist too", () => {
+    const config = testConfig({ enableTools: ["some_tool"], allowedTools: ["other"] });
+    expect(isToolEnabled(config, "full", tool("X"))).toBe(false);
+  });
+
+  it("never lifts a tool above the rights, even when enabled", () => {
+    const config = testConfig({ allowedTools: ["some_tool"], enableTools: ["some_tool"] });
     expect(isToolEnabled(config, "read", tool("W"))).toBe(false);
     expect(isToolEnabled(config, "write", tool("X"))).toBe(false);
-  });
-
-  it("enables R+ and default-off tools only when listed explicitly", () => {
-    expect(isToolEnabled(testConfig(), "full", tool("R+"))).toBe(false);
-    expect(isToolEnabled(testConfig(), "full", tool("X", { defaultEnabled: false }))).toBe(false);
-    const listed = testConfig({ allowedTools: ["some_tool"] });
-    expect(isToolEnabled(listed, "read", tool("R+"))).toBe(true);
-    expect(isToolEnabled(listed, "full", tool("X", { defaultEnabled: false }))).toBe(true);
   });
 });
 
@@ -155,7 +172,11 @@ describe("validateToolNames", () => {
     ).not.toThrow();
     try {
       validateToolNames(
-        testConfig({ allowedTools: ["get_acount_info"], deniedTools: ["nope"] }),
+        testConfig({
+          allowedTools: ["get_acount_info"],
+          deniedTools: ["nope"],
+          enableTools: ["x_tool"],
+        }),
         TOOL_NAMES,
       );
       expect.unreachable();
@@ -164,6 +185,7 @@ describe("validateToolNames", () => {
       expect((error as ConfigError).issues).toEqual([
         "SEVDESK_ALLOWED_TOOLS: unknown tool: get_acount_info",
         "SEVDESK_DENIED_TOOLS: unknown tool: nope",
+        "SEVDESK_ENABLE_TOOLS: unknown tool: x_tool",
       ]);
     }
   });

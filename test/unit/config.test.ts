@@ -26,6 +26,7 @@ describe("loadConfig", () => {
       baseUrl: DEFAULT_BASE_URL,
       logLevel: "info",
       deniedTools: [],
+      enableTools: [],
       confirmTtlSeconds: DEFAULT_CONFIRM_TTL_SECONDS,
     });
   });
@@ -44,6 +45,7 @@ describe("loadConfig", () => {
       baseUrl: "http://127.0.0.1:8080/api/v1",
       logLevel: "debug",
       deniedTools: [],
+      enableTools: [],
       confirmTtlSeconds: DEFAULT_CONFIRM_TTL_SECONDS,
     });
   });
@@ -165,11 +167,13 @@ describe("tool and operation lists", () => {
   it("parses comma-separated lists, trims and drops duplicates", () => {
     const config = load({
       SEVDESK_ALLOWED_TOOLS: " get_account_info, sevdesk_api_request ,get_account_info,",
-      SEVDESK_DENIED_TOOLS: "enshrine_document",
+      SEVDESK_DENIED_TOOLS: "sevdesk_api_request",
+      SEVDESK_ENABLE_TOOLS: "send_invoice_email",
       SEVDESK_API_ALLOW: "getContacts,getInvoices",
     });
     expect(config.allowedTools).toEqual(["get_account_info", "sevdesk_api_request"]);
-    expect(config.deniedTools).toEqual(["enshrine_document"]);
+    expect(config.deniedTools).toEqual(["sevdesk_api_request"]);
+    expect(config.enableTools).toEqual(["send_invoice_email"]);
     expect(config.apiAllow).toEqual(["getContacts", "getInvoices"]);
   });
 
@@ -178,6 +182,7 @@ describe("tool and operation lists", () => {
     expect(config.allowedTools).toBeUndefined();
     expect(config.apiAllow).toBeUndefined();
     expect(config.deniedTools).toEqual([]);
+    expect(config.enableTools).toEqual([]);
   });
 
   it("rejects names with characters outside identifiers", () => {

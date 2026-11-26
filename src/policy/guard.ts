@@ -40,7 +40,11 @@ export interface GuardedAction {
   readonly args: Record<string, unknown>;
   readonly confirmationToken?: string | undefined;
   readonly targetId?: string | undefined;
-  /** X only: the operator released this action explicitly for clients without elicitation. */
+  /**
+   * X only: the operator released this action explicitly, which stands in
+   * for human approval on clients without elicitation. Tools: listed in
+   * SEVDESK_ENABLE_TOOLS. Fallback: the operation listed in SEVDESK_API_ALLOW.
+   */
   readonly explicitlyAllowed: boolean;
   /** Human-readable summary for the approval question. */
   readonly summary: string;
@@ -232,7 +236,7 @@ export async function runGuarded(
     return failure(
       `${action.tool} is irreversible and this client cannot ask the user for approval ` +
         "(no elicitation support). The operator has to release it explicitly " +
-        "(SEVDESK_ALLOWED_TOOLS, for sevdesk_api_request SEVDESK_API_ALLOW).",
+        "(SEVDESK_ENABLE_TOOLS, for sevdesk_api_request SEVDESK_API_ALLOW).",
     );
   }
 
