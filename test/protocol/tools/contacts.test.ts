@@ -302,6 +302,42 @@ describe("get_contact", () => {
     expect(api.requests).toHaveLength(1);
   });
 
+  it.each([400, 422])("retries once without the embed when sevdesk answers %i", async (status) => {
+    api.server.use(
+      http.get(sevdeskUrl("/Contact/2001"), ({ request }) =>
+        new URL(request.url).searchParams.has("embed")
+          ? HttpResponse.json({ error: { message: "unknown embed" } }, { status })
+          : HttpResponse.json(list([contact()])),
+      ),
+      http.get(sevdeskUrl("/CommunicationWay"), () => HttpResponse.json(list([]))),
+    );
+    const c = await connect();
+    const data = structured<{ contact: { id: number }; addresses: unknown[]; note?: string }>(
+      await c.call("get_contact", { contactId: 2001 }),
+    );
+    expect(api.requests.map((r) => queryOf(r))).toEqual([
+      { embed: "addresses" },
+      {},
+      { "contact[id]": "2001", "contact[objectName]": "Contact" },
+    ]);
+    expect(data.contact.id).toBe(2001);
+    expect(data.addresses).toEqual([]);
+    expect(data.note).toContain("refused to embed the addresses");
+  });
+
+  it("does not retry other failures and stops after one retry", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Contact/2001"), () =>
+        HttpResponse.json({ error: { message: "bad" } }, { status: 400 }),
+      ),
+    );
+    const c = await connect();
+    const result = await c.call("get_contact", { contactId: 2001 });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("(400)");
+    expect(api.requests).toHaveLength(2);
+  });
+
   it("says so when sevdesk does not embed the addresses", async () => {
     api.server.use(
       http.get(sevdeskUrl("/Contact/2001"), () => HttpResponse.json(list([contact()]))),

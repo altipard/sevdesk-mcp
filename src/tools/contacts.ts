@@ -411,11 +411,26 @@ export const getContact = defineTool({
     // "addresses" is the documented generic embed applied to the contact's
     // address list; the name is not confirmed by the spec, so a missing
     // embed is reported instead of failing.
-    const body = await sevdesk.call(
-      sevdesk.api.GET("/Contact/{contactId}", {
-        params: { path: { contactId }, query: { embed: "addresses" } },
-      }),
-    );
+    let body: unknown;
+    let embedRefused = false;
+    try {
+      body = await sevdesk.call(
+        sevdesk.api.GET("/Contact/{contactId}", {
+          params: { path: { contactId }, query: { embed: "addresses" } },
+        }),
+      );
+    } catch (error) {
+      // If sevdesk rejects the embed itself, the contact is still readable:
+      // try once more without it and say that addresses are missing.
+      const refused =
+        error instanceof SevdeskError &&
+        (error.kind === "bad_request" || error.kind === "validation");
+      if (!refused) throw error;
+      embedRefused = true;
+      body = await sevdesk.call(
+        sevdesk.api.GET("/Contact/{contactId}", { params: { path: { contactId } } }),
+      );
+    }
     const raw = objectsOf(body)[0];
     if (raw === undefined) throw notFound("contact", contactId);
     const waysBody = await sevdesk.call(
@@ -457,9 +472,13 @@ export const getContact = defineTool({
         contact,
         addresses,
         communicationWays,
-        ...(!Array.isArray(embedded) && {
-          note: "sevdesk did not embed the addresses of this contact; they are not listed here.",
-        }),
+        ...(embedRefused
+          ? {
+              note: "sevdesk refused to embed the addresses of this contact; they are not listed here.",
+            }
+          : !Array.isArray(embedded) && {
+              note: "sevdesk did not embed the addresses of this contact; they are not listed here.",
+            }),
       },
       {
         summary:
