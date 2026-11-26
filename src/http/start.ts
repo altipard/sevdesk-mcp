@@ -1,7 +1,7 @@
-import { createServer, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { toNodeHandler } from "@modelcontextprotocol/node";
-import { OAuthError, type OAuthTokenVerifier } from "@modelcontextprotocol/server";
+import { type AuthInfo, OAuthError, type OAuthTokenVerifier } from "@modelcontextprotocol/server";
 import { createRemoteJWKSet } from "jose";
 import {
   type Config,
@@ -21,13 +21,42 @@ import { createServer as createMcpServer } from "../server.js";
 import { createSevdeskClient, type SevdeskClient } from "../sevdesk/client.js";
 import { TOOL_NAMES } from "../tools/index.js";
 import { VERSION } from "../version.js";
-import { createHttpApp, type HttpApp } from "./app.js";
+import { createHttpApp, HTTP_MAX_REQUEST_BODY_BYTES, type HttpApp } from "./app.js";
 import { createJwtVerifier } from "./jwt-verifier.js";
 import {
   type ConnectNonceStore,
   connectRedisNonceStore,
   type RedisNonceConnection,
 } from "./redis.js";
+
+/**
+ * The request line and headers as a body-less Request, built like the
+ * Node adapter builds its Request (same URL and headers), so screen() sees
+ * what fetch() will see later.
+ */
+function headersOnly(req: IncomingMessage): Request {
+  const single = (value: string | string[] | undefined) =>
+    Array.isArray(value) ? value[0] : value;
+  const host = single(req.headers.host) ?? single(req.headers[":authority"]) ?? "localhost";
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (value === undefined || name.startsWith(":")) continue;
+    if (Array.isArray(value)) for (const item of value) headers.append(name, item);
+    else headers.set(name, value);
+  }
+  return new Request(`http://${host}${req.url ?? "/"}`, {
+    method: (req.method ?? "GET").toUpperCase(),
+    headers,
+  });
+}
+
+/** Writes an answer screen() gave; the request body stays unread and Node discards it. */
+async function writeScreened(res: ServerResponse, response: Response): Promise<void> {
+  const headers: Record<string, string> = {};
+  for (const [name, value] of response.headers) headers[name] = value;
+  res.writeHead(response.status, headers);
+  res.end(Buffer.from(await response.arrayBuffer()));
+}
 
 /** How long shutdown waits for in-flight requests before cutting connections. */
 export const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -182,6 +211,7 @@ export async function startHttpServer(options: StartHttpOptions = {}): Promise<R
   let idle: (() => void) | undefined;
   const handle = toNodeHandler(app, {
     onerror: (error) => logger.error("http adapter error", { error }),
+    maxRequestBodySize: HTTP_MAX_REQUEST_BODY_BYTES,
   });
   const server = createServer((req, res) => {
     if (req.method !== "GET") {
@@ -191,8 +221,29 @@ export async function startHttpServer(options: StartHttpOptions = {}): Promise<R
         if (inFlight === 0) idle?.();
       });
     }
-    // The adapter's types predate exactOptionalPropertyTypes (method?: string).
-    void handle(req as Parameters<typeof handle>[0], res);
+    // The adapter reads the whole body before the app runs. Everything that
+    // needs no body (Host, Origin, token, scope) is decided first, so an
+    // unauthenticated client never gets a body buffered.
+    void (async () => {
+      let screened: Response | AuthInfo;
+      try {
+        screened = await app.screen(headersOnly(req));
+      } catch (error) {
+        logger.error("request screening failed", { error });
+        screened = Response.json({ error: "server_error" }, { status: 500 });
+      }
+      if (screened instanceof Response) {
+        await writeScreened(res, screened).catch((error: unknown) =>
+          logger.warn("could not write response", { error }),
+        );
+        return;
+      }
+      // The adapter hands req.auth to app.fetch as authInfo: the admission
+      // stands, the token is not verified a second time.
+      const admitted = Object.assign(req, { auth: screened });
+      // The adapter's types predate exactOptionalPropertyTypes (method?: string).
+      await handle(admitted as Parameters<typeof handle>[0], res);
+    })();
   });
 
   try {

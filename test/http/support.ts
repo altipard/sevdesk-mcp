@@ -18,6 +18,7 @@ import {
 import { RedisNonceStore } from "../../src/policy/redis-nonce-store.js";
 import { TEST_TOKEN } from "../helpers.js";
 import { FakeRedis } from "../support/fake-redis.js";
+import { voucherRoute } from "../support/voucher-upload.js";
 
 export const CONFIRM_SECRET = "an-http-test-secret-of-at-least-32-chars";
 export const READ = "sevdesk:read";
@@ -153,8 +154,11 @@ export async function startSevdeskMock() {
       seen.push({ method: req.method ?? "", url: req.url ?? "", headers: req.headers, body });
       if (state.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, state.delayMs));
       res.writeHead(200, { "content-type": "application/json" });
+      const voucherAnswer = voucherRoute(req.method ?? "", req.url ?? "");
       if (req.url?.endsWith("/Tools/bookkeepingSystemVersion")) {
         res.end(JSON.stringify({ objects: { version: "2.0" } }));
+      } else if (voucherAnswer !== undefined) {
+        res.end(JSON.stringify(voucherAnswer));
       } else {
         res.end(JSON.stringify({ objects: [{ id: "7", objectName: "Contact" }] }));
       }
