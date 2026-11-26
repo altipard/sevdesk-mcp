@@ -74,37 +74,54 @@ interface Cut {
 
 /**
  * Marks a cut answer: `truncated` and a note (appended to an existing one),
- * and for the list a page describes, the page's count, hasMore and
- * nextOffset. The next page then starts after the entries kept, so the cut
- * ones are not skipped.
+ * and for the list a page describes, the page's hasMore and nextOffset.
+ *
+ * nextOffset never skips a cut entry:
+ * - the list is the page (its length is page.count): count becomes the
+ *   entries kept and the next page starts right after them;
+ * - the list was filtered from the page after fetching (search_orders with
+ *   orderType, a top-level list shorter than page.count): the k-th kept
+ *   entry sits at position k or later in the fetched page, so offset + k
+ *   is at or before the first cut one. The next page may repeat entries,
+ *   and the note says so.
+ * With nothing kept there is no safe next offset, so it is null.
  */
 function markCut(data: Record<string, unknown>, cuts: readonly Cut[]): Record<string, unknown> {
   const parts = cuts.map(
     (cut) => `${cut.path.join(".")}: first ${cut.kept} of ${cut.total} entries`,
   );
-  const cutNote =
+  let cutNote =
     `Answer cut to stay under ${MAX_TOOL_RESPONSE_CHARS} characters (${parts.join("; ")}). ` +
     "Use limit/offset or narrower filters for the rest.";
-  const marked: Record<string, unknown> = {
-    ...data,
-    truncated: true,
-    note: typeof data.note === "string" && data.note !== "" ? `${data.note} ${cutNote}` : cutNote,
-  };
+  const marked: Record<string, unknown> = { ...data, truncated: true };
   const page = data.page;
   if (isPlainObject(page) && typeof page.count === "number") {
-    const listed = cuts.find((cut) => cut.total === page.count);
+    const count = page.count;
+    const exact = cuts.find((cut) => cut.total === count);
+    const filtered = exact
+      ? undefined
+      : cuts.find((cut) => cut.path.length === 1 && cut.kept <= count);
+    const listed = exact ?? filtered;
     if (listed) {
-      const next = typeof page.offset === "number" ? page.offset + listed.kept : null;
+      const next =
+        typeof page.offset === "number" && listed.kept > 0 ? page.offset + listed.kept : null;
       marked.page = {
         ...page,
-        count: listed.kept,
+        ...(exact && { count: listed.kept }),
         hasMore: true,
         ...("nextOffset" in page && {
           nextOffset: next !== null && next <= MAX_OFFSET ? next : null,
         }),
       };
+      if (filtered) {
+        cutNote +=
+          " The list was filtered after fetching, so page.nextOffset may repeat entries " +
+          "already returned; it skips none.";
+      }
     }
   }
+  marked.note =
+    typeof data.note === "string" && data.note !== "" ? `${data.note} ${cutNote}` : cutNote;
   return marked;
 }
 
