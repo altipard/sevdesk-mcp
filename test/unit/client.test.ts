@@ -293,6 +293,40 @@ describe("retries", () => {
     expect(calls).toBe(2);
   });
 
+  it("caps exponential backoff at maxDelayMs", async () => {
+    server.use(http.get(url("/Voucher"), () => HttpResponse.json({}, { status: 503 })));
+    const { client, sleeps } = setup({
+      retry: { maxRetries: 5, baseDelayMs: 100, maxDelayMs: 250 },
+    });
+
+    await captureError(client.call(client.api.GET("/Voucher")));
+
+    expect(sleeps).toHaveLength(5);
+    for (const ms of sleeps) expect(ms).toBeLessThanOrEqual(250);
+    // From the third attempt on 100 * 2^n exceeds the cap, so only jitter remains.
+    for (const ms of sleeps.slice(2)) expect(ms).toBeGreaterThanOrEqual(125);
+  });
+
+  it("waits until the HTTP date given in Retry-After", async () => {
+    let calls = 0;
+    const retryAt = new Date(Date.now() + 5000).toUTCString();
+    server.use(
+      http.get(url("/Voucher"), () =>
+        calls++ === 0
+          ? HttpResponse.json({}, { status: 503, headers: { "Retry-After": retryAt } })
+          : HttpResponse.json({ objects: [] }),
+      ),
+    );
+    const { client, sleeps } = setup();
+
+    await client.call(client.api.GET("/Voucher"));
+
+    expect(sleeps).toHaveLength(1);
+    // HTTP dates have second resolution.
+    expect(sleeps[0]).toBeGreaterThan(3000);
+    expect(sleeps[0]).toBeLessThanOrEqual(5000);
+  });
+
   it("does not wait for a Retry-After longer than maxDelayMs", async () => {
     let calls = 0;
     server.use(
@@ -377,18 +411,50 @@ describe("token never leaks", () => {
     },
   );
 
-  it("keeps the token out of network and timeout errors", async () => {
+  it("keeps the token out of network errors", async () => {
     server.use(http.get(url("/Invoice"), () => HttpResponse.error()));
     const { client, logLines } = setup({ retry: { maxRetries: 1 } });
 
     const error = await captureError(client.call(client.api.GET("/Invoice")));
 
+    expect(error.kind).toBe("network");
+    expect(errorRepresentations(error)).not.toContain(TEST_TOKEN);
+    expect(logLines.join("")).not.toContain(TEST_TOKEN);
+  });
+
+  it("keeps the token out of timeout errors", async () => {
+    server.use(
+      http.get(url("/Invoice"), async () => {
+        await delay(500);
+        return HttpResponse.json({ objects: [] });
+      }),
+    );
+    const { client, logLines } = setup({ timeoutMs: 20, retry: { maxRetries: 1 } });
+
+    const error = await captureError(client.call(client.api.GET("/Invoice")));
+
+    expect(error.kind).toBe("timeout");
     expect(errorRepresentations(error)).not.toContain(TEST_TOKEN);
     expect(logLines.join("")).not.toContain(TEST_TOKEN);
   });
 });
 
 describe("timeouts and deadline", () => {
+  it("retries a GET that timed out before the headers", async () => {
+    let calls = 0;
+    server.use(
+      http.get(url("/Part"), async () => {
+        if (calls++ === 0) await delay(500);
+        return HttpResponse.json({ objects: [] });
+      }),
+    );
+    const { client, sleeps } = setup({ timeoutMs: 30 });
+
+    await expect(client.call(client.api.GET("/Part"))).resolves.toEqual({ objects: [] });
+    expect(calls).toBe(2);
+    expect(sleeps).toHaveLength(1);
+  });
+
   it("stops retrying when the next wait would pass the deadline", async () => {
     let clock = 0;
     let calls = 0;
