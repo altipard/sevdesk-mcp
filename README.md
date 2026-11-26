@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>A sevdesk MCP server: ask your AI assistant about invoices, contacts, vouchers and bank transactions in sevdesk.</b><br>
-  Curated tools, read-only by default, every risky action behind a confirmation step.
+  Unofficial. Curated tools, read-only by default; status changes, bookings and irreversible actions need confirmation.
 </p>
 
 <p align="center">
@@ -110,6 +110,7 @@ asset=sevdesk-mcp-linux-x64
 curl -fsSLO "$base/$asset"
 curl -fsSLO "$base/SHA256SUMS"
 grep " $asset\$" SHA256SUMS | sha256sum -c -   # macOS: shasum -a 256 -c -
+mkdir -p ~/.local/bin
 install -m 755 "$asset" ~/.local/bin/sevdesk-mcp
 ```
 
@@ -152,8 +153,23 @@ the client's `env` block.
 All clients start the server as a local process over stdio. The installer's setup writes
 these entries for you; the snippets below are for doing it by hand. Replace
 `/Users/you/.local/bin/sevdesk-mcp` with the absolute path of your binary (`echo
-~/.local/bin/sevdesk-mcp`). To use npx instead, set `"command": "npx"` and
-`"args": ["-y", "@altipard/sevdesk-mcp"]`.
+~/.local/bin/sevdesk-mcp`).
+
+> [!WARNING]
+> Never put the API token into a project or workspace file that goes into a repository
+> (`.cursor/mcp.json`, `.vscode/mcp.json`, `.mcp.json`). Prefer the keychain. Without one,
+> use user-level configuration only: in Cursor reference an environment variable with
+> `${env:SEVDESK_API_TOKEN}`, in VS Code let it prompt with `${input:…}` (below).
+
+**npx instead of the binary.** Set `"command": "npx"` and
+`"args": ["-y", "@altipard/sevdesk-mcp"]`. GUI clients often start without your shell's
+`PATH`, so give the full path to `npx` (`which npx`) or, better, use the binary.
+
+**Windows** has no release binary and no keychain lookup: use npx through `cmd`, for
+example `"command": "cmd", "args": ["/c", "npx", "-y", "@altipard/sevdesk-mcp"]`, and
+supply the token as above. Claude Desktop reads `%APPDATA%\Claude\claude_desktop_config.json`,
+the VS Code user configuration lives in `%APPDATA%\Code\User\mcp.json`, and Cursor uses
+`%USERPROFILE%\.cursor\mcp.json`.
 
 <details>
 <summary>Claude Desktop</summary>
@@ -195,7 +211,8 @@ Leave out `--scope user` to register it for the current project only.
 
 <br>
 
-`~/.cursor/mcp.json` (all projects) or `.cursor/mcp.json` (one project):
+`~/.cursor/mcp.json` (all projects) or `.cursor/mcp.json` (one project, never with a
+token):
 
 ```json
 {
@@ -208,6 +225,9 @@ Leave out `--scope user` to register it for the current project only.
 }
 ```
 
+Without a keychain, in `~/.cursor/mcp.json` only, pass the token from your environment:
+`"env": { "SEVDESK_MODE": "read", "SEVDESK_API_TOKEN": "${env:SEVDESK_API_TOKEN}" }`.
+
 </details>
 
 <details>
@@ -219,7 +239,7 @@ Leave out `--scope user` to register it for the current project only.
 code --add-mcp '{"name":"sevdesk","type":"stdio","command":"/Users/you/.local/bin/sevdesk-mcp","env":{"SEVDESK_MODE":"read"}}'
 ```
 
-Or in `.vscode/mcp.json` in a workspace:
+Or in `.vscode/mcp.json` in a workspace (no token in this file):
 
 ```json
 {
@@ -233,7 +253,8 @@ Or in `.vscode/mcp.json` in a workspace:
 }
 ```
 
-Without a keychain, VS Code can prompt for the token once and store it securely:
+Without a keychain, VS Code can prompt for the token once and store it securely; the
+file then holds only the reference, not the token:
 
 ```json
 {
@@ -261,18 +282,19 @@ Other settings from [Configuration](#configuration), for example
 
 ## What it can do
 
-The server currently ships **read-only** tools. Each one wraps one or a few sevdesk API
-calls, returns a short text plus compact structured JSON, and marks text from sevdesk
-(names, descriptions, payment references) as data, never as instructions.
+The server currently ships **read-only** tools; there are no curated write tools yet.
+Each one wraps one or a few sevdesk API calls and returns a short text plus compact
+structured JSON. `get_document_pdf` and `get_report` return the file as an embedded
+resource.
 
 | Tool | What it does |
 | --- | --- |
 | `get_account_info` | Checks the connection, returns the bookkeeping system version and the server's mode. |
-| `search_contacts` | Finds customers, suppliers and other contacts by name, customer number or e-mail. |
+| `search_contacts` | Finds contacts by name, customer number or e-mail. Name and e-mail search scan at most 500 contacts or addresses, plus up to 100 organisations from sevdesk's own name filter, and say when they stopped early. |
 | `get_contact` | One contact with master data, addresses and communication ways. |
 | `search_invoices` | Lists invoices by status, date range, contact or invoice number, with open amounts. |
 | `get_invoice` | One invoice with positions, amounts, dates and status. |
-| `list_open_receivables` | Open and partially paid invoices with days overdue, totals per currency and type. |
+| `list_open_receivables` | Open and partially paid invoices with days overdue, totals per currency and type. Recurring-invoice templates (WKR) are left out by default; the answer can be marked incomplete after a timeout or failed page. |
 | `get_document_pdf` | The rendered PDF of an invoice, credit note or order, without marking it as sent. |
 | `search_orders` | Estimates, order confirmations and delivery notes by status, date, contact or number. |
 | `search_vouchers` | Vouchers (incoming invoices, receipts) by status, date, text, debit/credit or supplier. |
@@ -286,22 +308,27 @@ calls, returns a short text plus compact structured JSON, and marks text from se
 
 `sevdesk_api_request` only accepts operations on its allowlist. By default that is a
 curated list of side-effect-free reads; `SEVDESK_API_ALLOW` replaces it. Every listed
-operation still has to fit the mode and goes through the same confirmation rules as the
-curated tools.
+operation still has to fit the mode and goes through the confirmation rules below.
+Today `SEVDESK_MODE=write` or `full` only has an effect on `sevdesk_api_request`, and only
+for operations listed in `SEVDESK_API_ALLOW`.
 
 **Planned:** curated write tools (drafts, master data, status changes) and a remote
 HTTP transport with OAuth. The policy layer for both is already in place, see
 [Security model](#security-model).
+
+> [!NOTE]
+> Everything a tool reads (customer names, IBANs, amounts, PDFs) goes to your MCP client
+> and from there to the client's model provider.
 
 ## Security model
 
 An accounting system is not a place for an assistant to improvise, so the defaults are
 strict and every relaxation is an explicit setting.
 
-- **Mode.** `SEVDESK_MODE` sets the ceiling: `read` (default) registers only reading
-  tools, `write` adds drafts, master data and status changes, `full` adds irreversible
-  actions (sending e-mail, cancellation, enshrining, deleting). No other setting can lift
-  a tool above the mode.
+- **Mode.** `SEVDESK_MODE` sets the ceiling: `read` (default) allows only reads, `write`
+  adds drafts, master data and status changes, `full` adds irreversible actions (sending
+  e-mail, cancellation, enshrining, deleting). No other setting can lift an operation above
+  the mode. With no curated write tools yet, this applies to `sevdesk_api_request`.
 - **Risk classes.** Every sevdesk operation is classified: `R` plain read, `R+` bulk
   export, `W` correctable change, `W+` status or booking change, `X` irreversible. An
   operation without a class is refused everywhere.
@@ -309,17 +336,21 @@ strict and every relaxation is an explicit setting.
   `SEVDESK_DENIED_TOOLS` removes tools and always wins, `SEVDESK_ENABLE_TOOLS` switches on
   tools that are off by default (bulk exports and every irreversible tool), still capped by
   the mode. Unknown tool names stop the server at startup.
-- **Confirmation tokens.** `W+` and `X` actions run in two steps: the first call returns a
+- **Confirmation tokens.** `W` changes run directly, within the mode and allowlist.
+  `W+` and `X` actions run in two steps: the first call returns a
   preview and a signed confirmation token bound to exactly that action, the second call
   with the token executes it. Tokens expire (`SEVDESK_CONFIRM_TTL_SECONDS`).
 - **Irreversible actions** additionally need a single-use token, run at most once per
-  target and require human approval: the client asks the user (MCP elicitation), or, for
+  target within 24 hours in the same server process, and require human approval: the client asks the user (MCP elicitation), or, for
   clients that cannot ask, the operator's explicit listing in `SEVDESK_ENABLE_TOOLS` or
   `SEVDESK_API_ALLOW` counts as the release.
 - **Audit log.** Every write attempt is logged to stderr as a JSON line, whatever
   `LOG_LEVEL` says: who, which tool or operation, which object, and the outcome. Arguments,
   bodies and tokens are never logged; the API token and confirmation secret are redacted
-  from all output.
+  from log lines, audit entries and error text.
+- **Text from sevdesk.** Names, descriptions and payment references are marked as data,
+  not instructions, and hidden characters are stripped. A model can still be misled by
+  such text, so review what it proposes.
 
 ## Configuration
 
@@ -372,7 +403,8 @@ the binary.
 **test account**, never production:
 
 ```sh
-SEVDESK_LIVE_TEST_TOKEN=... npm run test:live
+read -rs SEVDESK_LIVE_TEST_TOKEN && export SEVDESK_LIVE_TEST_TOKEN   # paste, Enter
+npm run test:live
 ```
 
 It always runs in `read` mode, aborts if any non-read tool is registered, and prints only
