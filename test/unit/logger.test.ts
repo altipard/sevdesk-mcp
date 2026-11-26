@@ -37,4 +37,15 @@ describe("createLogger", () => {
     expect(output).toContain("[REDACTED]");
     expect(JSON.parse(output).error.message).toBe("failed with [REDACTED]");
   });
+
+  it("does not let fields override time, level or msg", () => {
+    const lines: string[] = [];
+    const logger = createLogger({ level: "debug", write: (line) => lines.push(line) });
+
+    logger.warn("real message", { time: "fake", level: "debug", msg: "fake", extra: 1 });
+
+    const entry = JSON.parse(lines[0] ?? "");
+    expect(entry).toMatchObject({ level: "warn", msg: "real message", extra: 1 });
+    expect(entry.time).not.toBe("fake");
+  });
 });

@@ -8,7 +8,11 @@ export type Redactor = (text: string) => string;
  * and upstream response text echoed into tool results.
  */
 export function createRedactor(secrets: readonly string[]): Redactor {
-  const active = secrets.filter((secret) => secret.length > 0);
+  // Also match the JSON-escaped form, so a secret inside serialized data is
+  // caught even if it contains characters JSON escapes.
+  const active = [
+    ...new Set(secrets.flatMap((secret) => [secret, JSON.stringify(secret).slice(1, -1)])),
+  ].filter((secret) => secret.length > 0);
   if (active.length === 0) return (text) => text;
   return (text) => {
     let out = text;

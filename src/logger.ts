@@ -44,7 +44,8 @@ export function createLogger(options: LoggerOptions): Logger {
 
   const log = (level: LogLevel, msg: string, fields?: LogFields): void => {
     if (LOG_LEVELS.indexOf(level) < threshold) return;
-    const entry = { time: new Date().toISOString(), level, msg, ...fields };
+    // Fields first: a field named time, level or msg must not hide the real ones.
+    const entry = { ...fields, time: new Date().toISOString(), level, msg };
     let line: string;
     try {
       line = JSON.stringify(entry, replacer);
