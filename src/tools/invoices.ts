@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { defineTool, type ToolCall } from "../policy/registry.js";
+import { SevdeskError } from "../sevdesk/errors.js";
 import {
   addDays,
   amount,
@@ -313,9 +314,19 @@ const INVOICE_TYPE_CODES = Object.keys(INVOICE_TYPE) as [string, ...string[]];
 /**
  * Receivables by default: reminders (MA) only repeat the amount of the
  * invoice they remind of, and cancellations (SR) are not owed by the
- * customer, so counting them would double or distort the totals.
+ * customer, so counting them would double or distort the totals. WKR is
+ * the template of a recurring invoice; the invoices it creates are RE, so
+ * the template itself is owed by no one.
  */
-export const DEFAULT_RECEIVABLE_TYPES = ["RE", "WKR", "TR", "AR", "ER"] as const;
+export const DEFAULT_RECEIVABLE_TYPES = ["RE", "TR", "AR", "ER"] as const;
+
+/**
+ * Time for all pages of one list_open_receivables call. Kept below the 60 s
+ * deadline of a single sevdesk call and the 60 s default request timeout of
+ * MCP clients, so a partial answer still arrives. Checked before each page
+ * and passed to each page as an abort signal, so a hanging page is cut too.
+ */
+export const RECEIVABLES_DEADLINE_MS = 45_000;
 
 function addTo(entry: Totals, invoice: { openAmount: number | null; overdue: boolean }): void {
   entry.count++;
@@ -334,31 +345,84 @@ const emptyTotals = (currency: string | null): Totals => ({
   overdueAmount: 0,
 });
 
+/** Why a scan stopped before sevdesk had no more invoices. */
+type ScanStop =
+  | { reason: "deadline"; status: 200 | 750 }
+  | { reason: "failed"; status: 200 | 750; offset: number; error: SevdeskError };
+
+interface StatusScan {
+  invoices: InvoiceSummary[];
+  /** Stopped at MAX_RECEIVABLES_SCANNED. */
+  truncated: boolean;
+  stop?: ScanStop;
+}
+
+/** Shared by both status scans: one deadline, and whether a page was asked yet. */
+interface ScanState {
+  deadline: number;
+  requests: number;
+}
+
 async function scanStatus(
   call: ToolCall,
   status: 200 | 750,
   contactId: number | undefined,
-): Promise<{ invoices: InvoiceSummary[]; truncated: boolean }> {
+  state: ScanState,
+): Promise<StatusScan> {
   const { sevdesk } = call;
   const invoices: InvoiceSummary[] = [];
   for (let offset = 0; offset < MAX_RECEIVABLES_SCANNED; offset += SCAN_PAGE) {
-    const body = await sevdesk.call(
-      sevdesk.api.GET("/Invoice", {
-        params: {
-          query: {
-            status,
-            ...(contactId && { "contact[id]": contactId, "contact[objectName]": "Contact" }),
-            limit: SCAN_PAGE,
-            offset,
+    const remaining = state.deadline - Date.now();
+    if (remaining <= 0) return { invoices, truncated: false, stop: { reason: "deadline", status } };
+    // Also cuts a page that hangs, so the deadline holds within a page too.
+    const signal = AbortSignal.timeout(remaining);
+    const first = state.requests === 0;
+    state.requests++;
+    let body: unknown;
+    try {
+      body = await sevdesk.call(
+        sevdesk.api.GET("/Invoice", {
+          params: {
+            query: {
+              status,
+              ...(contactId && { "contact[id]": contactId, "contact[objectName]": "Contact" }),
+              limit: SCAN_PAGE,
+              offset,
+            },
           },
-        },
-      }),
-    );
+          signal,
+        }),
+      );
+    } catch (error) {
+      // A local policy refusal is never a partial answer; nor is a failure
+      // before anything was collected.
+      if (error instanceof SevdeskError && error.kind === "policy") throw error;
+      if (first) throw error;
+      if (signal.aborted)
+        return { invoices, truncated: false, stop: { reason: "deadline", status } };
+      if (error instanceof SevdeskError) {
+        return { invoices, truncated: false, stop: { reason: "failed", status, offset, error } };
+      }
+      throw error;
+    }
     const page = objectsOf(body).map(mapInvoiceSummary);
     invoices.push(...page);
     if (page.length < SCAN_PAGE) return { invoices, truncated: false };
   }
   return { invoices, truncated: true };
+}
+
+/** Note for a scan that stopped early; names the cause, never upstream text. */
+function stopNote(stop: ScanStop, checked: number): string {
+  const cause =
+    stop.reason === "deadline"
+      ? `Stopped after ${RECEIVABLES_DEADLINE_MS / 1000} s with ${checked} invoices checked`
+      : `Reading invoices failed at offset ${stop.offset} of status ${stop.status} ` +
+        `(${stop.error.kind}${stop.error.status !== undefined ? ` ${stop.error.status}` : ""}) ` +
+        `after ${checked} invoices`;
+  const skipped =
+    stop.status === 200 ? " Partially paid invoices (status 750) were not queried." : "";
+  return `${cause}; receivables and totals are incomplete.${skipped} Narrow by contactId.`;
 }
 
 export const listOpenReceivables = defineTool({
@@ -368,7 +432,11 @@ export const listOpenReceivables = defineTool({
     "Lists invoices customers still have to pay (status open or partially paid) with open " +
     "amount, due date and days overdue, sorted by due date, plus totals per currency and per " +
     "invoice type. Reminders (MA) and cancellations (SR) are left out unless listed in " +
-    "invoiceTypes, because they would count amounts twice. Use it for dunning and cash-flow " +
+    "invoiceTypes, because they would count amounts twice, and so are recurring-invoice " +
+    "templates (WKR), whose invoices appear as RE. Stops after " +
+    `${RECEIVABLES_DEADLINE_MS / 1000} s, or when a later page fails, and marks the answer as ` +
+    "incomplete. " +
+    "Use it for dunning and cash-flow " +
     "questions; use search_invoices for any other invoice search." +
     FOREIGN_DATA_NOTE,
   class: "R",
@@ -382,8 +450,8 @@ export const listOpenReceivables = defineTool({
       .max(INVOICE_TYPE_CODES.length)
       .optional()
       .describe(
-        "Invoice types to include (RE invoice, WKR recurring, TR partial, AR advance, ER final, " +
-          "MA reminder, SR cancellation). Default: RE, WKR, TR, AR, ER.",
+        "Invoice types to include (RE invoice, WKR recurring-invoice template, TR partial, " +
+          "AR advance, ER final, MA reminder, SR cancellation). Default: RE, TR, AR, ER.",
       ),
     ...pageInput,
   }),
@@ -395,21 +463,29 @@ export const listOpenReceivables = defineTool({
       .array(typeTotalsSchema)
       .describe("The same totals split by invoice type and currency."),
     page: pageSchema,
-    truncated: z.boolean(),
+    truncated: z
+      .boolean()
+      .describe("Not every open invoice was checked (scan or time limit); totals may be low."),
     note: z.string().optional(),
   }),
   annotations: READ_ANNOTATIONS,
   async handler(args, call) {
     const asOf = todayIso();
     // The default is applied here, not in the schema, so the standard filter
-    // is the absence of the input: even all five default codes passed
+    // is the absence of the input: even all four default codes passed
     // explicitly stay exact. Only the standard filter takes in invoices
     // sevdesk sent without a type, as receivables like any other.
     const untypedIncluded = args.invoiceTypes === undefined;
     const types = new Set<string>(args.invoiceTypes ?? DEFAULT_RECEIVABLE_TYPES);
-    const open = await scanStatus(call, 200, args.contactId);
-    const partial = await scanStatus(call, 750, args.contactId);
-    const truncated = open.truncated || partial.truncated;
+    const state: ScanState = { deadline: Date.now() + RECEIVABLES_DEADLINE_MS, requests: 0 };
+    const open = await scanStatus(call, 200, args.contactId, state);
+    const partial: StatusScan =
+      open.stop === undefined
+        ? await scanStatus(call, 750, args.contactId, state)
+        : { invoices: [], truncated: false };
+    const capped = open.truncated || partial.truncated;
+    const stop = open.stop ?? partial.stop;
+    const truncated = capped || stop !== undefined;
 
     const all = [...open.invoices, ...partial.invoices]
       .filter((invoice) => (invoice.openAmount ?? 0) > 0)
@@ -447,6 +523,12 @@ export const listOpenReceivables = defineTool({
     const sums = totalList
       .map((t) => `${t.openAmount} ${/^[A-Z]{3}$/.test(t.currency ?? "") ? t.currency : ""}`.trim())
       .join(", ");
+    const notes = [
+      capped &&
+        `Checked only the first ${MAX_RECEIVABLES_SCANNED} invoices per status; ` +
+          "totals may be incomplete. Narrow by contactId.",
+      stop !== undefined && stopNote(stop, open.invoices.length + partial.invoices.length),
+    ].filter((note): note is string => typeof note === "string");
     return present(
       {
         asOf,
@@ -459,14 +541,12 @@ export const listOpenReceivables = defineTool({
         ),
         page,
         truncated,
-        ...(truncated && {
-          note:
-            `Checked only the first ${MAX_RECEIVABLES_SCANNED} invoices per status; ` +
-            "totals may be incomplete. Narrow by contactId.",
-        }),
+        ...(notes.length > 0 && { note: notes.join(" ") }),
       },
       {
-        summary: `${pageSummary(page, "open receivables")}${sums ? ` Open in total: ${sums}.` : ""}`,
+        summary: `${pageSummary(page, "open receivables")}${
+          sums ? ` Open in ${truncated ? "what was checked" : "total"}: ${sums}.` : ""
+        }${truncated ? " Incomplete, see note." : ""}`,
       },
     );
   },

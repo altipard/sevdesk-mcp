@@ -82,6 +82,8 @@ describe("search_contacts", () => {
     const result = await c.call("search_contacts", { query: "MULLER" });
     const data = structured<Search>(result);
     expect(queryOf(api.requests[0])).toEqual({ depth: "1", limit: "100", offset: "0" });
+    // The scan saw every contact, so sevdesk's name filter is not asked.
+    expect(api.requests).toHaveLength(1);
     expect(data.contacts.map((x) => x.id)).toEqual([2010]);
     expect(data.scan).toEqual({ mode: "name", checked: 3, truncated: false });
     expect(textOf(result).split("\n")[0]).toBe(
@@ -102,10 +104,116 @@ describe("search_contacts", () => {
     );
     const c = await connect();
     const data = structured<Search>(await c.call("search_contacts", { query: "muster", limit: 5 }));
-    expect(api.requests).toHaveLength(5);
+    // Five scan pages, then one request with sevdesk's name filter.
+    expect(api.requests).toHaveLength(6);
+    expect(queryOf(api.requests[5])).toEqual({
+      depth: "1",
+      name: "muster",
+      limit: "100",
+      offset: "0",
+    });
     expect(data.scan).toMatchObject({ checked: 500, truncated: true });
     expect(String(data.scan?.note)).toContain("first 500 contacts");
     expect(data.page).toEqual({ offset: 0, limit: 5, count: 5, total: 500, hasMore: true });
+  });
+
+  /** 500 contacts named "Firma n", of which only id 3 matches "muster". */
+  const scanPages = (request: Request) => {
+    const offset = Number(new URL(request.url).searchParams.get("offset"));
+    return HttpResponse.json(
+      list(
+        Array.from({ length: 100 }, (_, i) => {
+          const id = offset + i + 1;
+          return contact({ id: String(id), name: id === 3 ? "Muster GmbH" : `Firma ${id}` });
+        }),
+      ),
+    );
+  };
+
+  it("adds organisations found by sevdesk's name filter beyond the scan limit", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Contact"), ({ request }) => {
+        if (!new URL(request.url).searchParams.has("name")) return scanPages(request);
+        return HttpResponse.json(
+          list([
+            contact({ id: "3", name: "Muster GmbH" }),
+            contact({ id: "9001", name: "Zebra Muster AG" }),
+            contact({ id: "9002", name: "Unrelated KG" }),
+          ]),
+        );
+      }),
+    );
+    const c = await connect();
+    const data = structured<Search>(
+      await c.call("search_contacts", { query: "Müster", includePersons: false }),
+    );
+    // Sent as typed; only the local re-match folds accents.
+    expect(queryOf(api.requests[5])).toMatchObject({ depth: "0", name: "Müster" });
+    expect(data.contacts.map((x) => x.id)).toEqual([3, 9001]);
+    expect(data.page).toMatchObject({ count: 2, total: 2, hasMore: false });
+    expect(data.scan).toMatchObject({ mode: "name", checked: 500, truncated: true });
+    expect(String(data.scan?.note)).toContain("name filter found 1 more organisations");
+    expect(String(data.scan?.note)).toContain("may miss umlaut and spelling variants");
+    expect(String(data.scan?.note)).not.toContain("first 100 results");
+
+    const second = structured<Search>(
+      await c.call("search_contacts", { query: "muster", limit: 1, offset: 1 }),
+    );
+    expect(second.contacts.map((x) => x.id)).toEqual([9001]);
+  });
+
+  it("adds no duplicates or false matches if sevdesk ignores the name filter", async () => {
+    api.server.use(http.get(sevdeskUrl("/Contact"), ({ request }) => scanPages(request)));
+    const c = await connect();
+    const data = structured<Search>(await c.call("search_contacts", { query: "muster" }));
+    expect(api.requests).toHaveLength(6);
+    expect(data.contacts.map((x) => x.id)).toEqual([3]);
+    expect(String(data.scan?.note)).toContain(
+      "name filter found 0 more organisations beyond them (first 100 results only)",
+    );
+  });
+
+  it("falls back to the plain scan if sevdesk refuses the name filter", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Contact"), ({ request }) => {
+        if (!new URL(request.url).searchParams.has("name")) return scanPages(request);
+        return HttpResponse.json({ error: { message: "unknown parameter" } }, { status: 400 });
+      }),
+    );
+    const c = await connect();
+    const result = await c.call("search_contacts", { query: "muster" });
+    expect(result.isError).toBeFalsy();
+    const data = structured<Search>(result);
+    expect(api.requests).toHaveLength(6);
+    expect(data.contacts.map((x) => x.id)).toEqual([3]);
+    expect(data.scan).toEqual({
+      mode: "name",
+      checked: 500,
+      truncated: true,
+      note:
+        "Checked the first 500 contacts only; later ones may match too. " +
+        "Use customerNumber or a more specific query. " +
+        "sevdesk's name filter failed (bad_request 400), so only the scan was used.",
+    });
+  });
+
+  it("falls back to the plain scan on a server error from the name filter", async () => {
+    // sevdesk answers some invalid input with 500; the lookup is optional.
+    api.server.use(
+      http.get(sevdeskUrl("/Contact"), ({ request }) => {
+        if (!new URL(request.url).searchParams.has("name")) return scanPages(request);
+        return HttpResponse.json({ error: { message: "secret upstream text" } }, { status: 500 });
+      }),
+    );
+    const c = await connect();
+    const result = await c.call("search_contacts", { query: "muster" });
+    expect(result.isError).toBeFalsy();
+    const data = structured<Search>(result);
+    expect(data.contacts.map((x) => x.id)).toEqual([3]);
+    expect(String(data.scan?.note)).toContain(
+      "sevdesk's name filter failed (server_error 500), so only the scan was used.",
+    );
+    expect(textOf(result)).not.toContain("secret upstream text");
   });
 
   it("searches e-mail addresses for a query with @", async () => {

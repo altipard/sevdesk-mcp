@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { unixSeconds } from "../../../src/tools/format.js";
 import { invoice, invoicePosition, list } from "../../fixtures/sevdesk.js";
 import {
@@ -347,9 +347,9 @@ describe("list_open_receivables", () => {
     );
     expect(onlyInvoices.receivables.map((r) => r.id)).toEqual([1]);
 
-    // Even all five default codes, passed explicitly, are an explicit filter.
+    // Even all four default codes, passed explicitly, are an explicit filter.
     const explicitDefaults = structured<Out>(
-      await c.call("list_open_receivables", { invoiceTypes: ["RE", "WKR", "TR", "AR", "ER"] }),
+      await c.call("list_open_receivables", { invoiceTypes: ["RE", "TR", "AR", "ER"] }),
     );
     expect(explicitDefaults.receivables.map((r) => r.id).sort()).toEqual([1, 4]);
     expect(explicitDefaults.totals).toEqual([
@@ -360,6 +360,175 @@ describe("list_open_receivables", () => {
     for (const invoiceTypes of [[], ["XX"]]) {
       expect((await c.call("list_open_receivables", { invoiceTypes })).isError).toBe(true);
     }
+  });
+
+  it("leaves recurring-invoice templates out unless asked for", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Invoice"), ({ request }) => {
+        if (new URL(request.url).searchParams.get("status") === "750") {
+          return HttpResponse.json(list([]));
+        }
+        return HttpResponse.json(
+          list([
+            invoice({ id: "1", invoiceType: "RE" }),
+            invoice({ id: "2", invoiceType: "WKR", sumGross: "60" }),
+          ]),
+        );
+      }),
+    );
+    const c = await connect();
+    type Out = { receivables: Array<{ id: number }>; totals: Array<Record<string, unknown>> };
+    const standard = structured<Out>(await c.call("list_open_receivables", {}));
+    expect(standard.receivables.map((r) => r.id)).toEqual([1]);
+    expect(standard.totals).toEqual([expect.objectContaining({ count: 1, openAmount: 119 })]);
+
+    const templates = structured<Out>(
+      await c.call("list_open_receivables", { invoiceTypes: ["WKR"] }),
+    );
+    expect(templates.receivables.map((r) => r.id)).toEqual([2]);
+    expect(templates.totals).toEqual([expect.objectContaining({ count: 1, openAmount: 60 })]);
+  });
+
+  it("stops at the time limit and returns what it has, marked incomplete", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      api.server.use(
+        http.get(sevdeskUrl("/Invoice"), ({ request }) => {
+          const params = new URL(request.url).searchParams;
+          const offset = Number(params.get("offset"));
+          // Each page takes 20 s, so the third one starts past the limit.
+          vi.setSystemTime(Date.now() + 20_000);
+          return HttpResponse.json(
+            list(
+              Array.from({ length: 100 }, (_, i) =>
+                invoice({ id: String(offset + i + 1), invoiceDate: "2020-01-01T00:00:00+01:00" }),
+              ),
+            ),
+          );
+        }),
+      );
+      const c = await connect();
+      const result = await c.call("list_open_receivables", { limit: 1 });
+      expect(result.isError).toBeFalsy();
+      const data = structured<{
+        receivables: Array<{ id: number }>;
+        totals: Array<Record<string, unknown>>;
+        truncated: boolean;
+        note?: string;
+        page: Record<string, unknown>;
+      }>(result);
+      // 45 s limit: pages at 0 s and 20 s run, the check at 40 s still
+      // passes, the one at 60 s stops, and status 750 is never asked.
+      expect(api.requests.map((r) => queryOf(r).offset)).toEqual(["0", "100", "200"]);
+      expect(api.requests.every((r) => queryOf(r).status === "200")).toBe(true);
+      expect(data.truncated).toBe(true);
+      expect(data.note).toBe(
+        "Stopped after 45 s with 300 invoices checked; receivables and totals are incomplete. " +
+          "Partially paid invoices (status 750) were not queried. Narrow by contactId.",
+      );
+      expect(data.page).toMatchObject({ count: 1, total: 300, hasMore: true });
+      expect(data.totals).toEqual([expect.objectContaining({ count: 300 })]);
+      expect(textOf(result).split("\n")[0]).toBe(
+        "1 of 300 open receivables (offset 0, more available). " +
+          "Open in what was checked: 35700 EUR. Incomplete, see note.",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  const fullPage = (offset: number) =>
+    HttpResponse.json(
+      list(Array.from({ length: 100 }, (_, i) => invoice({ id: String(offset + i + 1) }))),
+    );
+
+  it("cuts a hanging page at the time limit and returns what it has", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      api.server.use(
+        http.get(sevdeskUrl("/Invoice"), async ({ request }) => {
+          const offset = Number(new URL(request.url).searchParams.get("offset"));
+          if (offset === 0) {
+            // The first page leaves 50 ms of the 45 s; the second never answers.
+            vi.setSystemTime(Date.now() + 44_950);
+            return fullPage(0);
+          }
+          await new Promise(() => {});
+          return fullPage(offset);
+        }),
+      );
+      const c = await connect();
+      const started = performance.now();
+      const result = await c.call("list_open_receivables", {});
+      expect(performance.now() - started).toBeLessThan(5_000);
+      expect(result.isError).toBeFalsy();
+      const data = structured<{ truncated: boolean; note?: string; page: { total: number } }>(
+        result,
+      );
+      expect(api.requests.map((r) => queryOf(r).offset)).toEqual(["0", "100"]);
+      expect(data.truncated).toBe(true);
+      expect(data.page.total).toBe(100);
+      expect(data.note).toBe(
+        "Stopped after 45 s with 100 invoices checked; receivables and totals are incomplete. " +
+          "Partially paid invoices (status 750) were not queried. Narrow by contactId.",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the pages it has when a later page fails", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Invoice"), ({ request }) => {
+        const offset = Number(new URL(request.url).searchParams.get("offset"));
+        if (offset === 0) return fullPage(0);
+        return HttpResponse.json({ error: { message: "secret upstream text" } }, { status: 500 });
+      }),
+    );
+    const c = await connect();
+    const result = await c.call("list_open_receivables", {});
+    expect(result.isError).toBeFalsy();
+    const data = structured<{ truncated: boolean; note?: string; page: { total: number } }>(result);
+    expect(api.requests).toHaveLength(2);
+    expect(data.truncated).toBe(true);
+    expect(data.page.total).toBe(100);
+    expect(data.note).toBe(
+      "Reading invoices failed at offset 100 of status 200 (server_error 500) after 100 " +
+        "invoices; receivables and totals are incomplete. Partially paid invoices (status 750) " +
+        "were not queried. Narrow by contactId.",
+    );
+    expect(textOf(result)).not.toContain("secret upstream text");
+    expect(textOf(result).split("\n")[0]).toContain("Incomplete, see note.");
+  });
+
+  it("keeps the open invoices when the partially paid scan fails", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Invoice"), ({ request }) => {
+        if (new URL(request.url).searchParams.get("status") === "200") {
+          return HttpResponse.json(list([invoice({ id: "1" })]));
+        }
+        return HttpResponse.json({ error: { message: "boom" } }, { status: 500 });
+      }),
+    );
+    const c = await connect();
+    const data = structured<{ receivables: Array<{ id: number }>; note?: string }>(
+      await c.call("list_open_receivables", {}),
+    );
+    expect(data.receivables.map((r) => r.id)).toEqual([1]);
+    expect(data.note).toBe(
+      "Reading invoices failed at offset 0 of status 750 (server_error 500) after 1 " +
+        "invoices; receivables and totals are incomplete. Narrow by contactId.",
+    );
+  });
+
+  it("fails when the first page fails", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Invoice"), () =>
+        HttpResponse.json({ error: { message: "boom" } }, { status: 500 }),
+      ),
+    );
+    const c = await connect();
+    expect((await c.call("list_open_receivables", {})).isError).toBe(true);
   });
 
   it("pages through sevdesk and stops at the scan limit with a note", async () => {

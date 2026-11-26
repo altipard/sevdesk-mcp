@@ -192,6 +192,7 @@ export const OPERATIONS = {
       { name: "offset", in: "query", type: "integer", required: false },
       { name: "countAll", in: "query", type: "boolean", required: false },
       { name: "embed", in: "query", type: "string", required: false },
+      { name: "name", in: "query", type: "string", required: false },
     ],
   },
   createContact: {
