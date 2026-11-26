@@ -9,11 +9,20 @@
 // prints response content and never the token. Exit code 1 if a tool failed.
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { berlinDate, liveBaseUrl } from "./base-url.ts";
 
 const token = process.env.SEVDESK_LIVE_TEST_TOKEN?.trim();
 if (!token) {
   console.log("live smoke skipped: SEVDESK_LIVE_TEST_TOKEN is not set");
   process.exit(0);
+}
+
+let baseUrl;
+try {
+  baseUrl = liveBaseUrl(process.env.SEVDESK_LIVE_BASE_URL);
+} catch (error) {
+  console.log(`abort: ${error.message}`);
+  process.exit(1);
 }
 
 // Always rebuild: an older dist would smoke-test old code.
@@ -34,11 +43,10 @@ const config = loadConfig({
   SEVDESK_API_TOKEN: token,
   SEVDESK_MODE: "read",
   LOG_LEVEL: "error",
-  // Only a smoke-specific override, so a SEVDESK_BASE_URL left in the shell
-  // cannot send the test-account token elsewhere.
-  ...(process.env.SEVDESK_LIVE_BASE_URL && {
-    SEVDESK_BASE_URL: process.env.SEVDESK_LIVE_BASE_URL,
-  }),
+  // Only a smoke-specific override, limited to https on sevdesk hosts, so
+  // neither a SEVDESK_BASE_URL left in the shell nor a typo can send the
+  // test-account token elsewhere.
+  ...(baseUrl && { SEVDESK_BASE_URL: baseUrl }),
 });
 if (config.mode !== "read") throw new Error("live smoke must run in read mode");
 
@@ -104,8 +112,8 @@ async function run(name, args, describe = (data) => `count=${countOf(data)}`) {
 
 const skip = (name, why) => line(name, "skipped", why);
 const firstId = (data, key) => data?.[key]?.[0]?.id;
-const today = new Date().toISOString().slice(0, 10);
-const monthAgo = new Date(Date.now() - 30 * 86_400_000).toISOString().slice(0, 10);
+const today = berlinDate();
+const monthAgo = berlinDate(Date.now() - 30 * 86_400_000);
 
 line("tool", "result", "detail");
 await run("get_account_info", {}, () => "count=1");
