@@ -117,3 +117,41 @@ describe("guard on HTTP derives rights and subject per call", () => {
     expect(audit[0]).toMatchObject({ subject: "unidentified", outcome: "denied" });
   });
 });
+
+describe("guard with a failing audit sink", () => {
+  it("keeps a successful action a success and logs the sink failure", async () => {
+    const config = testConfig({ mode: "write" });
+    const runtime = createPolicyRuntime(config, {
+      transport: "stdio",
+      secret: Buffer.from("g".repeat(32)),
+      audit: {
+        record: () => {
+          throw new Error("disk full");
+        },
+      },
+    });
+    const { logger, lines } = captureLogger();
+    let executed = 0;
+    const result = await runGuarded(
+      { policy: requestPolicy(config, runtime, undefined), server: noElicitation, logger },
+      ctx,
+      {
+        key: "w_tool",
+        tool: "w_tool",
+        class: "W",
+        args: {},
+        explicitlyAllowed: false,
+        summary: "w.",
+        execute: async () => {
+          executed++;
+          return { ok: true };
+        },
+      },
+    );
+    expect(result).toMatchObject({ structuredContent: { ok: true } });
+    expect((result as { isError?: boolean }).isError).toBeUndefined();
+    expect(executed).toBe(1);
+    expect(lines.join("")).toContain("audit sink failed");
+    expect(lines.join("")).toContain("disk full");
+  });
+});

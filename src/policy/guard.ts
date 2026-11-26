@@ -159,15 +159,19 @@ export async function runGuarded(
   const audited = action.class !== "R" && action.class !== "R+";
   const audit = (outcome: AuditOutcome, extra: { reason?: string; status?: number } = {}) => {
     if (!audited) return;
-    runtime.audit.record({
-      subject: identity.subject,
-      tool: action.tool,
-      operationId: action.operationId,
-      targetId: action.targetId,
-      class: action.class,
-      outcome,
-      ...extra,
-    });
+    try {
+      runtime.audit.record({
+        subject: identity.subject,
+        tool: action.tool,
+        operationId: action.operationId,
+        targetId: action.targetId,
+        class: action.class,
+        outcome,
+        ...extra,
+      });
+    } catch (error) {
+      logger.error("audit sink failed", { tool: action.tool, outcome, error });
+    }
   };
 
   if (!allows(identity.rights, action.class)) {
@@ -179,10 +183,9 @@ export async function runGuarded(
   }
 
   const execute = async (onError?: (error: unknown) => Promise<void>) => {
+    let output: ToolOutput;
     try {
-      const output = await action.execute();
-      audit("ok");
-      return okResult(output);
+      output = await action.execute();
     } catch (error) {
       const status = error instanceof SevdeskError ? error.status : undefined;
       audit("error", {
@@ -192,6 +195,10 @@ export async function runGuarded(
       await onError?.(error);
       return errorResult(action.tool, error, logger);
     }
+    // Outside the try: the action has happened, so a failing audit sink
+    // must not turn it into an error that invites a retry.
+    audit("ok");
+    return okResult(output);
   };
 
   if (action.class === "R" || action.class === "R+" || action.class === "W") return execute();
