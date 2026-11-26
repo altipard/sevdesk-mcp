@@ -92,8 +92,12 @@ export function checkBodyPins(operationId: OperationId, body: unknown): void {
           "Sending and status changes run through their own confirmed operations.",
       );
     }
+    // Only a number or plain digits: "0x64" or "1e2" also read as 100 in JS,
+    // but nobody knows how sevdesk reads them.
     const numeric =
-      typeof value === "number" || typeof value === "string" ? Number(value) : Number.NaN;
+      typeof value === "number" || (typeof value === "string" && /^\d{1,6}$/.test(value))
+        ? Number(value)
+        : Number.NaN;
     if (!pin.allow.includes(numeric)) {
       throw new PinViolation(
         `${operationId}: ${field} may only be ${pin.allow.join(" or ")} (draft) on this server. ` +

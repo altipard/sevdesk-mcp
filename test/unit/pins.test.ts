@@ -178,6 +178,10 @@ describe("body pins", () => {
     ["voucherFactorySaveVoucher", { voucher: { status: 100 } }, "voucher.status may only be 50"],
     ["voucherFactorySaveVoucher", { voucher: { status: "abc" } }, "voucher.status may only be 50"],
     ["createTransaction", { status: 400 }, "createTransaction: status may only be 100"],
+    ["createInvoiceByFactory", { invoice: { status: "0x64" } }, "invoice.status may only be 100"],
+    ["createInvoiceByFactory", { invoice: { status: "1e2" } }, "invoice.status may only be 100"],
+    ["createInvoiceByFactory", { invoice: { status: " 100" } }, "invoice.status may only be 100"],
+    ["createInvoiceByFactory", { invoice: { status: true } }, "invoice.status may only be 100"],
   ] as const)("reject %s with %j", (id, body, message) => {
     expect(() => checkBodyPins(id, body)).toThrow(PinViolation);
     expect(() => checkBodyPins(id, body)).toThrow(message);
