@@ -7,7 +7,7 @@ import { createPolicyRuntime } from "../../src/policy/runtime.js";
 import { createServer } from "../../src/server.js";
 import { createSevdeskClient } from "../../src/sevdesk/client.js";
 import { captureLogger, MOCK_BASE_URL, TEST_TOKEN, testConfig } from "../helpers.js";
-import { specProblems } from "./spec.js";
+import { readOnlyProblems, specProblems } from "./spec.js";
 
 export interface MockApi {
   readonly server: SetupServer;
@@ -28,7 +28,7 @@ export function mockSevdesk(): MockApi {
     server.listen({ onUnhandledFrame: "error" });
     server.events.on("request:start", ({ request }) => {
       requests.push(request.clone());
-      problems.push(...specProblems(request));
+      problems.push(...specProblems(request), ...readOnlyProblems(request));
     });
   });
   afterEach(() => {
@@ -126,7 +126,8 @@ export function pathOf(request: Request | undefined): string {
 }
 
 /**
- * Asserts the standard failure behaviour of a tool for 401, 404 and 429:
+ * Asserts the standard failure behaviour of a tool for 400, 401, 404, 422
+ * and 429:
  * an MCP tool error with a readable message and no token in it.
  */
 export async function expectHttpErrors(
@@ -137,7 +138,9 @@ export async function expectHttpErrors(
   args: Record<string, unknown>,
 ): Promise<void> {
   const cases: Array<[number, string]> = [
+    [400, "(400)"],
     [401, "SEVDESK_API_TOKEN"],
+    [422, "(422)"],
     [404, "(404)"],
     [429, "rate limit"],
   ];

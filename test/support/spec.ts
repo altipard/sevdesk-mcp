@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { classOf } from "../../src/policy/classification.js";
 import { MOCK_BASE_URL } from "../helpers.js";
 
 /**
@@ -12,6 +13,7 @@ import { MOCK_BASE_URL } from "../helpers.js";
 
 interface Schema {
   type?: string;
+  format?: string;
   enum?: unknown[];
   properties?: Record<string, Schema>;
   items?: Schema;
@@ -63,6 +65,8 @@ function parametersOf(operation: Operation): Parameter[] {
   );
 }
 
+const DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+
 function checkValue(name: string, value: string, schema: Schema | undefined): string | undefined {
   if (schema === undefined) return undefined;
   switch (schema.type) {
@@ -77,6 +81,13 @@ function checkValue(name: string, value: string, schema: Schema | undefined): st
       break;
     default:
       break;
+  }
+  // Offsets as +01:00 or Z; sevdesk documents ISO 8601 for date-time.
+  if (schema.format === "date-time" && !DATE_TIME.test(value)) {
+    return `${name}=${value} is not an ISO 8601 date-time with offset`;
+  }
+  if (schema.format === "date" && !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return `${name}=${value} is not a date (YYYY-MM-DD)`;
   }
   if (schema.enum && !schema.enum.map(String).includes(value)) {
     return `${name}=${value} is not one of ${schema.enum.join(", ")}`;
@@ -147,4 +158,19 @@ export function specProblems(request: Request): string[] {
 /** operationId a request targets, or undefined. */
 export function operationOf(request: Request): string | undefined {
   return routeOf(request)?.operation.operationId;
+}
+
+/**
+ * The read tools may only read: every request must be a GET on an
+ * operation of class R. A tool that slipped onto a writing, exporting or
+ * status-changing endpoint fails here, whatever its own annotations say.
+ */
+export function readOnlyProblems(request: Request): string[] {
+  const operationId = operationOf(request);
+  const problems: string[] = [];
+  if (request.method !== "GET") problems.push(`${request.method} ${request.url} is not a GET`);
+  if (operationId !== undefined && classOf(operationId) !== "R") {
+    problems.push(`${operationId} is class ${classOf(operationId) ?? "unclassified"}, not R`);
+  }
+  return problems;
 }

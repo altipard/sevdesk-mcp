@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MOCK_BASE_URL } from "../helpers.js";
-import { operationOf, specProblems } from "../support/spec.js";
+import { operationOf, readOnlyProblems, specProblems } from "../support/spec.js";
 
 const get = (path: string) => new Request(`${MOCK_BASE_URL}${path}`);
 
@@ -35,8 +35,28 @@ describe("spec check of outgoing requests", () => {
     expect(specProblems(get("/ReceiptGuidance/forAccountNumber"))).toEqual([
       "forAccountNumber requires query parameter accountNumber",
     ]);
+    expect(specProblems(get("/CheckAccountTransaction?startDate=2026-01-01"))).toEqual([
+      "startDate=2026-01-01 is not an ISO 8601 date-time with offset",
+    ]);
+    expect(
+      specProblems(get("/CheckAccountTransaction?startDate=2026-01-01T00%3A00%3A00%2B01%3A00")),
+    ).toEqual([]);
+    expect(specProblems(get("/CheckAccount/1/getBalanceAtDate?date=01.01.2026"))).toEqual([
+      "date=01.01.2026 is not a date (YYYY-MM-DD)",
+    ]);
     expect(specProblems(get("/Report/contactlist?sevQuery%5Bfilter%5D%5Bbogus%5D=1"))).toEqual([
       "sevQuery[filter][bogus] is not declared in sevQuery",
     ]);
+  });
+
+  it("allows read tools only GET requests on class R operations", () => {
+    expect(readOnlyProblems(get("/Invoice"))).toEqual([]);
+    expect(readOnlyProblems(get("/Invoice/1/getPdf"))).toEqual([]);
+    expect(readOnlyProblems(get("/Export/datevCSV"))).toEqual([
+      "exportDatevDepricated is class R+, not R",
+    ]);
+    expect(
+      readOnlyProblems(new Request(`${MOCK_BASE_URL}/Contact`, { method: "POST", body: "{}" })),
+    ).toEqual([`POST ${MOCK_BASE_URL}/Contact is not a GET`, "createContact is class W, not R"]);
   });
 });
