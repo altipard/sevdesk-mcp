@@ -5,6 +5,7 @@ import {
   buildRequest,
   DEFAULT_API_ALLOW,
   DEFAULT_LIMIT,
+  MAX_LIMIT,
   RequestBuildError,
   shapeResponse,
 } from "../../src/tools/generic.js";
@@ -56,6 +57,17 @@ describe("buildRequest", () => {
     expect(list.appliedDefaults).toEqual({ limit: DEFAULT_LIMIT });
     expect(build("getInvoices", { limit: 5 }).appliedDefaults).toEqual({});
     expect(build("getTags").path).toBe("/Tag");
+  });
+
+  it("caps limit at the maximum and reports it", () => {
+    const capped = build("getInvoices", { limit: 500 });
+    expect(capped.path).toBe(`/Invoice?limit=${MAX_LIMIT}`);
+    expect(capped.appliedDefaults).toEqual({ limit: MAX_LIMIT });
+    const exact = build("getInvoices", { limit: MAX_LIMIT });
+    expect(exact.appliedDefaults).toEqual({});
+    expect(build("getInvoicePositionsById", { invoiceId: 1, limit: "1000" }).params.limit).toBe(
+      MAX_LIMIT,
+    );
   });
 
   it("encodes bracketed reference filters", () => {

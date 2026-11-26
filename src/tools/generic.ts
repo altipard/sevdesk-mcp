@@ -80,6 +80,8 @@ export const DEFAULT_API_ALLOW: readonly OperationId[] = [
 
 /** Applied when an operation declares `limit` and the caller sets none. */
 export const DEFAULT_LIMIT = 50;
+/** Upper bound for `limit`; larger values are lowered and reported. */
+export const MAX_LIMIT = 100;
 /** Upper bound for the serialized response handed to the model. */
 export const MAX_RESPONSE_CHARS = 100_000;
 const MAX_VALUE_LENGTH = 1000;
@@ -266,9 +268,15 @@ export function buildRequest(
       if (pinned?.omit) continue;
       if (pinned) value = pinned.value;
     }
-    if (value === undefined && spec.name === "limit" && spec.in === "query") {
-      value = DEFAULT_LIMIT;
-      appliedDefaults.limit = DEFAULT_LIMIT;
+    if (spec.name === "limit" && spec.in === "query") {
+      if (value === undefined) {
+        value = DEFAULT_LIMIT;
+        appliedDefaults.limit = DEFAULT_LIMIT;
+      } else if (Number(value) > MAX_LIMIT) {
+        // Larger pages would only be cut by the size bound afterwards.
+        value = MAX_LIMIT;
+        appliedDefaults.limit = MAX_LIMIT;
+      }
     }
     if (value === undefined || value === null) {
       if (spec.required) fail(`${operationId} needs the parameter ${spec.name}`);
@@ -400,7 +408,7 @@ export function registerGenericTool(env: RegistrationEnv): RegisteredTool | unde
       .optional()
       .describe(
         'Path and query parameters by their name in the sevdesk API spec, e.g. {"invoiceId": 42}. ' +
-          `Lists default to limit ${DEFAULT_LIMIT}.`,
+          `Lists default to limit ${DEFAULT_LIMIT}, at most ${MAX_LIMIT}.`,
       ),
     body: z
       .record(z.string(), z.unknown())
