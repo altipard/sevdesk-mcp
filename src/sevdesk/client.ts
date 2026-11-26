@@ -216,8 +216,22 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
       } catch (error) {
         if (request.signal.aborted) throw error;
         // Too large is a verdict on the answer, not a transport failure:
-        // retrying would only download it again.
-        if (error instanceof SevdeskError) throw error;
+        // retrying would only download it again. A write that sevdesk did
+        // not refuse (status < 400, or a 5xx) may have happened even though
+        // its answer was dropped, so the caller must check before repeating.
+        if (error instanceof SevdeskError) {
+          const status = error.status;
+          if (
+            error.kind === "response_too_large" &&
+            mayHaveSideEffect &&
+            (status === undefined || status < 400 || status >= 500)
+          ) {
+            throw new SevdeskError(error.kind, `${error.message} ${OUTCOME_UNKNOWN}`, {
+              ...(status !== undefined && { status }),
+            });
+          }
+          throw error;
+        }
         const kind = timeout.aborted ? "timeout" : "network";
         const delay = backoffDelay(attempt, policy.retry);
         const deadlineHit = canRetry && !fitsDeadline(delay);

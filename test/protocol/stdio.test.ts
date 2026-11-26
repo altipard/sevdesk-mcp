@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { VERSION } from "../../src/version.js";
 import { TEST_TOKEN } from "../helpers.js";
+import { READ_TOOLS } from "../support/tool-names.js";
 
 // Runs the built binary as an MCP client would start it. msw cannot reach a
 // child process, so a real HTTP server on a random port stands in for sevdesk.
@@ -113,7 +114,7 @@ describe("built stdio binary", () => {
 
     const list = await session.request(2, "tools/list");
     const tools = list.result?.tools as Array<{ name: string; annotations?: unknown }>;
-    expect(tools.map((tool) => tool.name)).toEqual(["get_account_info", "sevdesk_api_request"]);
+    expect(tools.map((tool) => tool.name)).toEqual([...READ_TOOLS, "sevdesk_api_request"]);
     for (const tool of tools) expect(tool.annotations).toMatchObject({ readOnlyHint: true });
 
     const call = await session.request(3, "tools/call", {

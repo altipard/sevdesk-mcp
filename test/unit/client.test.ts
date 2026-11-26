@@ -664,6 +664,41 @@ describe("timeouts and deadline", () => {
     expect(sleeps).toEqual([]);
   });
 
+  it("warns of an unknown outcome when a write's oversized answer was not a refusal", async () => {
+    const big = { objects: { name: "x".repeat(2000) } };
+    server.use(
+      http.post(url("/Contact"), () => HttpResponse.json(big, { status: 201 })),
+      http.put(url("/Contact/:id"), () => HttpResponse.json(big, { status: 422 })),
+      http.get(url("/Voucher"), () => HttpResponse.json(big)),
+    );
+    const { client } = setup({ maxResponseBytes: 1000 });
+
+    const created = await captureError(
+      client.call(client.api.POST("/Contact", { body: { name: "A" } as never })),
+    );
+    expect(created.kind).toBe("response_too_large");
+    expect(created.status).toBe(201);
+    expect(created.message).toBe(
+      "sevdesk sent more than 1000 bytes; the response was dropped. Narrow the request. " +
+        "The outcome is unknown: check sevdesk before retrying.",
+    );
+
+    const refused = await captureError(
+      client.call(
+        client.api.PUT("/Contact/{contactId}", {
+          params: { path: { contactId: 1 } },
+          body: {} as never,
+        }),
+      ),
+    );
+    expect(refused.message).not.toContain("outcome is unknown");
+
+    const sideEffectGet = await captureError(client.call(client.apiSingleAttempt.GET("/Voucher")));
+    expect(sideEffectGet.message).toContain("The outcome is unknown");
+    const plainGet = await captureError(client.call(client.api.GET("/Voucher")));
+    expect(plainGet.message).not.toContain("outcome is unknown");
+  });
+
   it("accepts a response within the byte limit", async () => {
     server.use(http.get(url("/Tag"), () => HttpResponse.json({ objects: [] })));
     const { client } = setup({ maxResponseBytes: 1000 });

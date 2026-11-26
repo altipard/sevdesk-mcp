@@ -9,6 +9,7 @@ import { createPolicyRuntime } from "../../src/policy/runtime.js";
 import { createServer } from "../../src/server.js";
 import { createSevdeskClient } from "../../src/sevdesk/client.js";
 import { captureLogger, MOCK_BASE_URL, TEST_TOKEN, testConfig } from "../helpers.js";
+import { READ_TOOLS } from "../support/tool-names.js";
 
 const api = setupServer();
 const seen: Request[] = [];
@@ -121,11 +122,9 @@ describe("sevdesk_api_request allowlist", () => {
 
   it("is not registered when nothing usable is listed or it is denied", async () => {
     const none = await open({ mode: "read", apiAllow: ["createContact"] });
-    expect((await none.client.listTools()).tools.map((t) => t.name)).toEqual(["get_account_info"]);
+    expect((await none.client.listTools()).tools.map((t) => t.name)).toEqual([...READ_TOOLS]);
     const denied = await open({ deniedTools: ["sevdesk_api_request"] });
-    expect((await denied.client.listTools()).tools.map((t) => t.name)).toEqual([
-      "get_account_info",
-    ]);
+    expect((await denied.client.listTools()).tools.map((t) => t.name)).toEqual([...READ_TOOLS]);
   });
 });
 
@@ -145,6 +144,24 @@ describe("sevdesk_api_request requests", () => {
     expect(seen.map((r) => r.url)).toEqual([`${MOCK_BASE_URL}/Invoice?status=200&limit=50`]);
     expect(seen[0]?.headers.get("authorization")).toBe(TEST_TOKEN);
     expect(c.audit()).toEqual([]);
+  });
+
+  it("reports a lowered limit as clampedParams, not as a default", async () => {
+    api.use(http.get(`${MOCK_BASE_URL}/Invoice`, () => HttpResponse.json({ objects: [] })));
+    const c = await open();
+    const result = await call(c, { operationId: "getInvoices", params: { limit: 1000 } });
+    expect(body(result)).toEqual({
+      operationId: "getInvoices",
+      clampedParams: {
+        limit: {
+          requested: 1000,
+          applied: 100,
+          note: "limit is at most 100 on this server; page with offset for more.",
+        },
+      },
+      data: { objects: [] },
+    });
+    expect(seen.map((r) => r.url)).toEqual([`${MOCK_BASE_URL}/Invoice?limit=100`]);
   });
 
   it("rejects injection attempts before any request", async () => {
@@ -315,6 +332,25 @@ describe("sevdesk_api_request class rules", () => {
       reason: "duplicate",
       targetId: "3",
     });
+  });
+
+  it("treats SEVDESK_API_ALLOW as the operator's release for X when the client cannot ask", async () => {
+    api.use(http.delete(`${MOCK_BASE_URL}/Tag/3`, () => HttpResponse.json({ objects: [null] })));
+    // No elicitation capability and no answer handler: nobody can be asked.
+    const c = await open({ mode: "full", apiAllow: ["deleteTag"] });
+    const args = { operationId: "deleteTag", params: { tagId: 3 } };
+    const first = await call(c, args);
+    expect(body(first).status).toBe("confirmation_required");
+    expect(seen).toEqual([]);
+
+    const done = await call(c, { ...args, confirmation_token: body(first).confirmation_token });
+
+    expect(done.isError).toBeFalsy();
+    expect(body(done)).toMatchObject({ operationId: "deleteTag" });
+    expect(seen.map((r) => `${r.method} ${new URL(r.url).pathname}`)).toEqual([
+      "DELETE /api/v1/Tag/3",
+    ]);
+    expect(c.audit().map((e) => e.outcome)).toEqual(["confirmation_issued", "ok"]);
   });
 
   it("does not run X when the user declines", async () => {

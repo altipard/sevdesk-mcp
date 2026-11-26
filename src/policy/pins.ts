@@ -45,14 +45,34 @@ export function pinQueryParam(name: string, value: unknown): PinnedParam | undef
 interface BodyPin {
   /** Field path inside the JSON body. */
   readonly path: readonly string[];
-  /** Allowed values (compared as numbers); without it the field must be absent or null. */
+  /** Allowed values (compared as numbers); without allow/allowText the field must be absent or null. */
   readonly allow?: readonly number[];
+  /** Allowed string values, compared exactly. */
+  readonly allowText?: readonly string[];
+  /** Why other values are refused, appended to the error. */
+  readonly reason?: string;
 }
 
-const draftOnly = (prefix: readonly string[], draft: number, extra: readonly string[] = []) => [
+// payDate would record a payment on a draft: payments run through the
+// confirmed bookAmount operations instead.
+const draftOnly = (
+  prefix: readonly string[],
+  draft: number,
+  extra: readonly BodyPin[] = [],
+): BodyPin[] => [
   { path: [...prefix, "status"], allow: [draft] },
-  ...["sendDate", "sendType", "enshrined", ...extra].map((field) => ({ path: [...prefix, field] })),
+  ...["sendDate", "sendType", "enshrined", "payDate"].map((field) => ({
+    path: [...prefix, field],
+  })),
+  ...extra,
 ];
+
+/**
+ * Invoice types a draft operation may create. SR (cancellation) and MA
+ * (dunning) have their own flows (cancelInvoice, reminders) with their own
+ * class; creating them as a plain draft would skip those rules.
+ */
+export const DRAFT_INVOICE_TYPES = ["RE", "WKR", "TR", "AR", "ER"] as const;
 
 /**
  * Body fields of W operations that would reach W+ (or X) effects without a
@@ -61,7 +81,13 @@ const draftOnly = (prefix: readonly string[], draft: number, extra: readonly str
  * change drafts; status changes run through their own confirmed operations.
  */
 export const BODY_PINS: Readonly<Partial<Record<OperationId, readonly BodyPin[]>>> = {
-  createInvoiceByFactory: draftOnly(["invoice"], 100),
+  createInvoiceByFactory: draftOnly(["invoice"], 100, [
+    {
+      path: ["invoice", "invoiceType"],
+      allowText: DRAFT_INVOICE_TYPES,
+      reason: "Cancellation (SR) and dunning (MA) invoices run through their own operations.",
+    },
+  ]),
   createcreditNote: draftOnly(["creditNote"], 100),
   createOrder: draftOnly(["order"], 100),
   updateOrder: draftOnly([], 100),
@@ -86,6 +112,13 @@ export function checkBodyPins(operationId: OperationId, body: unknown): void {
     const value = fieldAt(body, pin.path);
     if (value === undefined || value === null) continue;
     const field = pin.path.join(".");
+    if (pin.allowText !== undefined) {
+      if (typeof value === "string" && pin.allowText.includes(value)) continue;
+      throw new PinViolation(
+        `${operationId}: ${field} may only be ${pin.allowText.join(", ")} on this server.` +
+          (pin.reason ? ` ${pin.reason}` : ""),
+      );
+    }
     if (pin.allow === undefined) {
       throw new PinViolation(
         `${operationId}: ${field} must not be set on this server. ` +
@@ -115,6 +148,8 @@ interface Route {
 }
 
 // Literal paths win over templates ("/Contact/Factory/x" before "/Contact/{id}").
+// Case-insensitive: sevdesk is not known to route case-sensitively, so
+// "/invoice/1/getpdf" must not slip past the pins.
 const ROUTES: readonly Route[] = (
   Object.entries(OPERATIONS) as Array<[OperationId, (typeof OPERATIONS)[OperationId]]>
 )
@@ -127,15 +162,34 @@ const ROUTES: readonly Route[] = (
         .split(/\{[^}]+\}/)
         .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
         .join("[^/]+")}$`,
+      "i",
     ),
   }))
   .sort((a, b) => a.params - b.params);
 
+/**
+ * Normalises a path for matching only: percent-decoded segments, no empty
+ * segments (double or trailing slashes). The request itself is sent as is.
+ */
+export function normalizePath(path: string): string {
+  const segments = path
+    .split("/")
+    .filter((segment) => segment !== "")
+    .map((segment) => {
+      try {
+        return decodeURIComponent(segment);
+      } catch {
+        return segment;
+      }
+    });
+  return `/${segments.join("/")}`;
+}
+
 /** The operation a request targets, by method and path relative to the base URL. */
 export function matchOperation(method: string, relativePath: string): OperationId | undefined {
   const upper = method.toUpperCase();
-  return ROUTES.find((route) => route.method === upper && route.pattern.test(relativePath))
-    ?.operationId;
+  const path = normalizePath(relativePath);
+  return ROUTES.find((route) => route.method === upper && route.pattern.test(path))?.operationId;
 }
 
 /**
@@ -144,10 +198,21 @@ export function matchOperation(method: string, relativePath: string): OperationI
  */
 export async function enforceRequestPins(request: Request, baseUrl: string): Promise<Request> {
   const url = new URL(request.url);
-  const basePath = new URL(baseUrl).pathname.replace(/\/+$/, "");
-  if (!url.pathname.startsWith(`${basePath}/`)) return request;
-  const operationId = matchOperation(request.method, url.pathname.slice(basePath.length));
-  if (operationId === undefined) return request;
+  const basePath = normalizePath(new URL(baseUrl).pathname).toLowerCase().replace(/\/$/, "");
+  const path = normalizePath(url.pathname);
+  if (!path.toLowerCase().startsWith(`${basePath}/`)) return request;
+  const operationId = matchOperation(request.method, path.slice(basePath.length));
+  if (operationId === undefined) {
+    // A getPdf path that no route recognises (";x=1", "%00", a stray
+    // suffix) could still reach sevdesk's PDF handler without the
+    // preventSendBy pin, so it is refused rather than passed through.
+    if (/getpdf/i.test(path) || /getpdf/i.test(url.pathname)) {
+      throw new PinViolation(
+        "This getPdf path does not match a known sevdesk operation and is refused.",
+      );
+    }
+    return request;
+  }
 
   if (BODY_PINS[operationId] !== undefined && request.body !== null) {
     const type = request.headers.get("content-type") ?? "";
@@ -164,18 +229,24 @@ export async function enforceRequestPins(request: Request, baseUrl: string): Pro
   let changed = false;
   for (const spec of OPERATIONS[operationId].params) {
     if (spec.in !== "query") continue;
-    const present = url.searchParams.get(spec.name);
-    const pinned = pinQueryParam(spec.name, present ?? undefined);
+    // Every occurrence counts: "preventSendBy=true&preventSendBy=false"
+    // must not leave sevdesk to pick one. Names are matched without regard
+    // to case for the same reason.
+    const keys = [...new Set([...url.searchParams.keys()])].filter(
+      (key) => key.toLowerCase() === spec.name.toLowerCase(),
+    );
+    const present = keys.flatMap((key) => url.searchParams.getAll(key));
+    let pinned = pinQueryParam(spec.name, undefined);
     if (pinned === undefined) continue;
-    if (pinned.omit) {
-      if (present !== null) {
-        url.searchParams.delete(spec.name);
-        changed = true;
-      }
-    } else if (present !== String(pinned.value)) {
-      url.searchParams.set(spec.name, String(pinned.value));
-      changed = true;
+    for (const value of present) pinned = pinQueryParam(spec.name, value) ?? pinned;
+    const wanted = pinned.omit ? [] : [String(pinned.value)];
+    if (keys.length === 1 && keys[0] === spec.name && present.join("&") === wanted.join("&")) {
+      continue;
     }
+    if (keys.length === 0 && wanted.length === 0) continue;
+    for (const key of keys) url.searchParams.delete(key);
+    for (const value of wanted) url.searchParams.append(spec.name, value);
+    changed = true;
   }
   return changed ? new Request(url, request) : request;
 }

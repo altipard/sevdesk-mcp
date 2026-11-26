@@ -36,13 +36,13 @@ export interface PolicyRuntimeOptions {
 }
 
 /**
- * HTTP needs an explicit NonceStore: with SEVDESK_CONFIRM_SECRET shared,
+ * HTTP needs an explicit NonceStore that declares itself shared: with SEVDESK_CONFIRM_SECRET shared,
  * tokens stay valid across restarts and instances, but an in-memory store
  * forgets its nonces, so a token could be replayed against another instance
  * or after a restart. The in-memory default is for stdio and tests only.
  */
 export function createPolicyRuntime(config: Config, options: PolicyRuntimeOptions): PolicyRuntime {
-  if (options.transport === "http" && options.nonces === undefined) {
+  if (options.transport === "http" && options.nonces?.shared !== true) {
     throw new ConfigError([
       "HTTP transport needs a shared NonceStore; the in-memory store is only for stdio",
     ]);

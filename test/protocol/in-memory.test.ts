@@ -6,6 +6,7 @@ import type { Config } from "../../src/config.js";
 import { createPolicyRuntime } from "../../src/policy/runtime.js";
 import { createServer } from "../../src/server.js";
 import { captureLogger, MOCK_BASE_URL, TEST_TOKEN, testConfig } from "../helpers.js";
+import { READ_TOOLS } from "../support/tool-names.js";
 
 const api = setupServer();
 beforeAll(() => api.listen({ onUnhandledFrame: "error" }));
@@ -40,7 +41,7 @@ describe("MCP protocol over the in-memory transport", () => {
     try {
       const { tools } = await client.listTools();
 
-      expect(tools.map((tool) => tool.name)).toEqual(["get_account_info", "sevdesk_api_request"]);
+      expect(tools.map((tool) => tool.name)).toEqual([...READ_TOOLS, "sevdesk_api_request"]);
       const tool = tools.find((t) => t.name === "get_account_info");
       expect(tool?.inputSchema.type).toBe("object");
       expect(tool?.outputSchema).toMatchObject({

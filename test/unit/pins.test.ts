@@ -23,6 +23,7 @@ describe("matchOperation", () => {
     expect(matchOperation("get", "/Invoice/7/getPdf")).toBe("invoiceGetPdf");
     expect(matchOperation("PUT", "/Invoice/7/getPdf")).toBeUndefined();
     expect(matchOperation("GET", "/Nope")).toBeUndefined();
+    expect(matchOperation("GET", "/invoice/7/GETPDF/")).toBe("invoiceGetPdf");
   });
 });
 
@@ -60,6 +61,63 @@ describe("enforceRequestPins", () => {
     await expect(
       enforceRequestPins(req("/Export/datevCSV?enshrine=true"), MOCK_BASE_URL),
     ).rejects.toThrow(PinViolation);
+  });
+
+  it("checks every occurrence of a pinned parameter and keeps exactly one", async () => {
+    await expect(
+      enforceRequestPins(
+        req("/Invoice/1/getPdf?preventSendBy=true&preventSendBy=false"),
+        MOCK_BASE_URL,
+      ),
+    ).rejects.toThrow("preventSendBy is always true on this server");
+    await expect(
+      enforceRequestPins(req("/Invoice/1/getPdf?PREVENTSENDBY=false"), MOCK_BASE_URL),
+    ).rejects.toThrow(PinViolation);
+    const out = await enforceRequestPins(
+      req("/Invoice/1/getPdf?preventSendBy=true&preventSendBy=true"),
+      MOCK_BASE_URL,
+    );
+    expect(new URL(out.url).searchParams.getAll("preventSendBy")).toEqual(["true"]);
+    const dropped = await enforceRequestPins(
+      req("/Export/datevCSV?enshrine=false&Enshrine=false"),
+      MOCK_BASE_URL,
+    );
+    expect([...new URL(dropped.url).searchParams.keys()]).not.toContain("enshrine");
+    expect([...new URL(dropped.url).searchParams.keys()]).not.toContain("Enshrine");
+  });
+
+  it("normalises case, trailing and double slashes and encoding before matching", async () => {
+    for (const path of [
+      "/invoice/1/getpdf",
+      "/Invoice/1/getPdf/",
+      "//Invoice//1/getPdf",
+      "/Invoice/1/get%50df",
+    ]) {
+      const out = await enforceRequestPins(req(path), MOCK_BASE_URL);
+      expect(new URL(out.url).searchParams.get("preventSendBy"), path).toBe("true");
+    }
+    const upperBase = await enforceRequestPins(
+      new Request("https://sevdesk.mock/API/V1/Invoice/1/getPdf"),
+      MOCK_BASE_URL,
+    );
+    expect(new URL(upperBase.url).searchParams.get("preventSendBy")).toBe("true");
+  });
+
+  it("refuses getPdf paths that match no operation", async () => {
+    for (const path of [
+      "/Invoice/1/getPdf;x=1",
+      "/Invoice/1/getPdf%00",
+      "/Invoice/1/getPdf.json",
+      "/invoice/1/GETPDFX",
+      "/Something/getpdf",
+    ]) {
+      await expect(enforceRequestPins(req(path), MOCK_BASE_URL), path).rejects.toThrow(
+        PinViolation,
+      );
+    }
+    // Paths outside the base URL are not sevdesk's business here.
+    const outside = new Request("https://sevdesk.mock/other/getPdf");
+    expect(await enforceRequestPins(outside, MOCK_BASE_URL)).toBe(outside);
   });
 
   it("passes requests without pins through untouched", async () => {
@@ -141,6 +199,30 @@ describe("body pins", () => {
     ).not.toThrow();
     expect(() => checkBodyPins("createTransaction", { status: 100 })).not.toThrow();
     expect(() => checkBodyPins("getInvoices", { anything: 1 })).not.toThrow();
+  });
+
+  it("limit invoice types of drafts and refuse a pay date on drafts", () => {
+    for (const type of ["RE", "WKR", "TR", "AR", "ER"]) {
+      expect(() =>
+        checkBodyPins("createInvoiceByFactory", { invoice: { invoiceType: type } }),
+      ).not.toThrow();
+    }
+    for (const type of ["SR", "MA", "re", "", 1]) {
+      expect(() =>
+        checkBodyPins("createInvoiceByFactory", { invoice: { invoiceType: type } }),
+      ).toThrow("invoice.invoiceType may only be RE, WKR, TR, AR, ER on this server");
+    }
+    for (const [id, body] of [
+      ["createInvoiceByFactory", { invoice: { payDate: "2026-11-26" } }],
+      ["voucherFactorySaveVoucher", { voucher: { payDate: 1764115200 } }],
+      ["createcreditNote", { creditNote: { payDate: "26.11.2026" } }],
+      ["updateOrder", { payDate: "2026-11-26" }],
+    ] as const) {
+      expect(() => checkBodyPins(id, body), id).toThrow("payDate must not be set");
+    }
+    expect(() =>
+      checkBodyPins("voucherFactorySaveVoucher", { voucher: { status: 50, payDate: null } }),
+    ).not.toThrow();
   });
 
   it.each([
