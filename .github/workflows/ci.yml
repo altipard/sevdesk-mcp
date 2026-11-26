@@ -31,3 +31,39 @@ jobs:
       - run: npm ci
 
       - run: npm run check
+
+  install-script:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - run: shellcheck -s sh install.sh
+
+      # dash is /bin/sh on Debian and Ubuntu, the strictest common POSIX shell.
+      - run: dash install.sh --help
+      - run: SEVDESK_MCP_VERSION=0.0.0 dash install.sh --dry-run
+
+  # Same build as the release, so a bun or bundling problem shows up before main.
+  binary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm install --global bun@1.4.4
+
+      - run: npm run build:bin
+
+      - run: npm run smoke:bin
