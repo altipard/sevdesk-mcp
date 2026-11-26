@@ -452,6 +452,13 @@ export const searchContacts = defineTool({
           : `sevdesk's name filter failed (${failure.kind}${
               failure.status !== undefined ? ` ${failure.status}` : ""
             }), so only the scan was used.`),
+      // Each call runs the lookup again, and its extra hits follow the
+      // scan's: if it answered for an earlier page but not this one (or the
+      // other way round), the merged list differs between the calls.
+      failure !== undefined &&
+        args.offset > 0 &&
+        "Earlier pages may have included its results, so matches can have shifted or be " +
+          "missing between pages; repeat the search from offset 0 for a consistent list.",
     ].filter((note): note is string => typeof note === "string");
     const output: SearchOutput = {
       contacts,

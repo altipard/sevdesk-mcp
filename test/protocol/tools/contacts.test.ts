@@ -215,6 +215,23 @@ describe("search_contacts", () => {
     });
   });
 
+  it("warns that pages can shift when the name filter fails on a later page", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Contact"), ({ request }) => {
+        if (!new URL(request.url).searchParams.has("name")) return scanPages(request);
+        return HttpResponse.json({ error: { message: "unknown parameter" } }, { status: 400 });
+      }),
+    );
+    const c = await connect();
+    const later = structured<Search>(
+      await c.call("search_contacts", { query: "muster", limit: 1, offset: 1 }),
+    );
+    expect(String(later.scan?.note)).toContain("matches can have shifted or be missing");
+    expect(String(later.scan?.note)).toContain("repeat the search from offset 0");
+    const first = structured<Search>(await c.call("search_contacts", { query: "muster" }));
+    expect(String(first.scan?.note)).not.toContain("shifted");
+  });
+
   it("falls back to the plain scan on a server error from the name filter", async () => {
     // sevdesk answers some invalid input with 500; the lookup is optional.
     api.server.use(
