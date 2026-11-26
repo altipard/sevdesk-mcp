@@ -1,0 +1,70 @@
+# Local development for the HTTP transport.
+#
+#   docker compose up -d redis
+#   REDIS_URL=redis://localhost:6379 npm run start:http   (with the variables
+#   from .env.example set in your shell)
+#
+# or everything in containers:
+#
+#   docker compose --profile app up --build
+#
+# Ports are bound to localhost only.
+services:
+  redis:
+    image: redis:8.2.3-alpine@sha256:08ad0b1d280850169a790dba1393ff7a90aef951fc19632cf4d3ce4f78e679ba
+    # Same rules as in production (see REDIS_URL in .env.example):
+    # - persistence via AOF, fsync on every write: a Redis that forgets a
+    #   used nonce on restart makes a still valid confirmation usable again;
+    # - maxmemory-policy noeviction: under memory pressure Redis must refuse
+    #   writes (the server then fails closed), never drop nonces;
+    # - a Redis of its own, not a shared cache that others flush or evict.
+    # The server also detects lost data via a sentinel key and then refuses
+    # confirmations until it is restarted.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - always
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mcp:
+    profiles: ["app"]
+    build: .
+    # Shutdown waits up to 10 s for in-flight requests and exits at the
+    # latest after 15 s. Give it more than that before SIGKILL; on Kubernetes
+    # set terminationGracePeriodSeconds to at least 20 for the same reason.
+    stop_grace_period: 20s
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3000:3000"
+    # Taken from your shell; missing values make the server stop with a
+    # clear configuration error.
+    environment:
+      PORT: "3000"
+      SEVDESK_API_TOKEN: ${SEVDESK_API_TOKEN:-}
+      SEVDESK_CONFIRM_SECRET: ${SEVDESK_CONFIRM_SECRET:-}
+      SEVDESK_MODE: ${SEVDESK_MODE:-read}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      MCP_RESOURCE_URL: ${MCP_RESOURCE_URL:-http://localhost:3000/mcp}
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-localhost}
+      OAUTH_ISSUER: ${OAUTH_ISSUER:-}
+      OAUTH_JWKS_URL: ${OAUTH_JWKS_URL:-}
+      OAUTH_ALGORITHMS: ${OAUTH_ALGORITHMS:-RS256}
+      OAUTH_ALLOW_INSECURE_HTTP: ${OAUTH_ALLOW_INSECURE_HTTP:-false}
+      REDIS_URL: redis://redis:6379
+
+volumes:
+  redis-data:

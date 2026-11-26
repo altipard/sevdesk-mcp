@@ -1,4 +1,4 @@
-import type { McpServer, ServerContext } from "@modelcontextprotocol/server";
+import type { McpServer, ScopeChallengeHandler, ServerContext } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { type Config, ConfigError } from "../config.js";
 import type { Logger } from "../logger.js";
@@ -6,7 +6,7 @@ import { restrictClient, type SevdeskClient } from "../sevdesk/client.js";
 import type { OperationClass } from "./classification.js";
 import { CONFIRMATION_TOKEN_DESCRIPTION, runGuarded, type ToolOutput } from "./guard.js";
 import type { OperationId } from "./operations.js";
-import { allows, type Rights } from "./rights.js";
+import { allows, minRights, type Rights } from "./rights.js";
 import type { RequestPolicy } from "./runtime.js";
 import {
   type ClientScope,
@@ -171,6 +171,16 @@ export interface RegistrationEnv {
   readonly server: McpServer;
   readonly policy: RequestPolicy;
   readonly deps: ToolDeps;
+  /**
+   * Rights tools are registered for, instead of policy.rights. The HTTP
+   * transport passes the mode: tools/list then shows what the instance
+   * offers, and a token without the scope gets a 403 step-up instead of an
+   * unknown tool. Never above the mode. The guard and the client scope keep
+   * checking policy.rights at call time.
+   */
+  readonly registrationRights?: Rights;
+  /** Scope check before the handler runs (HTTP: 403 insufficient_scope with the scope). */
+  readonly scopeChallenge?: (definition: ToolDefinition) => ScopeChallengeHandler | undefined;
 }
 
 const stringId = (value: string | number | undefined) =>
@@ -219,8 +229,12 @@ export function registerTools(
   const { server, policy, deps } = env;
   const config = configForTools(deps.config);
   const registered: string[] = [];
+  const registrationRights =
+    env.registrationRights === undefined
+      ? policy.rights
+      : minRights(env.registrationRights, policy.config.mode);
   for (const definition of definitions) {
-    if (!isToolEnabled(policy.config, policy.rights, definition)) continue;
+    if (!isToolEnabled(policy.config, registrationRights, definition)) continue;
     // Definitions built without defineTool still must not declare more
     // than their class.
     const problems = scopeProblems(definition);
@@ -243,6 +257,7 @@ export function registerTools(
         })
       : definition.inputSchema;
 
+    const scopeChallenge = env.scopeChallenge?.(definition);
     server.registerTool(
       definition.name,
       {
@@ -251,6 +266,7 @@ export function registerTools(
         inputSchema,
         ...(definition.outputSchema && { outputSchema: definition.outputSchema }),
         annotations: { ...definition.annotations },
+        ...(scopeChallenge && { scopeChallenge }),
       },
       async (input: Record<string, unknown>, ctx: ServerContext) => {
         const { confirmation_token: token, ...rest } = input;

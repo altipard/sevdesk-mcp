@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
-import { type Config, ConfigError, loadConfig } from "../config.js";
+import { type Config, ConfigError, forgetSecrets, loadConfig } from "../config.js";
 import { resolveApiToken, SECRET_ENV_VARIABLES } from "../keychain.js";
 import { createLogger } from "../logger.js";
 import { validateToolNames } from "../policy/registry.js";
@@ -13,20 +13,6 @@ import { VERSION } from "../version.js";
 // stdout carries the MCP protocol. Everything else, including startup
 // errors, goes to stderr.
 
-/**
- * Drops the secrets from the environment once the config holds them, so
- * code running later in this process (a dependency, a tool) cannot read
- * them from process.env, and child processes do not inherit them.
- *
- * This does not protect against local readers of the environment the
- * process was started with: the parent (the MCP client and its config
- * file), /proc/<pid>/environ on Linux or `ps eww` on macOS still show the
- * original values. Against those, the keychain is the better place.
- */
-function forgetSecrets(...envs: Array<Record<string, string | undefined>>): void {
-  for (const env of envs) for (const name of SECRET_ENV_VARIABLES) delete env[name];
-}
-
 // Without SEVDESK_API_TOKEN the token comes from the system keychain, so it
 // does not have to sit in a client configuration file.
 const token = await resolveApiToken(process.env);
@@ -35,7 +21,9 @@ let config: Config;
 try {
   config = loadConfig(token.env);
   // token.env is process.env itself, or a copy holding the keychain token.
-  forgetSecrets(process.env, token.env);
+  // Afterwards code running in this process cannot read the secrets from
+  // the environment, and child processes do not inherit them.
+  forgetSecrets(SECRET_ENV_VARIABLES, process.env, token.env);
   validateToolNames(config, TOOL_NAMES);
 } catch (error) {
   if (error instanceof ConfigError) {
