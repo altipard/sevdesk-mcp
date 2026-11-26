@@ -347,9 +347,9 @@ describe("list_open_receivables", () => {
     );
     expect(onlyInvoices.receivables.map((r) => r.id)).toEqual([1]);
 
-    // Even all five default codes, passed explicitly, are an explicit filter.
+    // Even all four default codes, passed explicitly, are an explicit filter.
     const explicitDefaults = structured<Out>(
-      await c.call("list_open_receivables", { invoiceTypes: ["RE", "WKR", "TR", "AR", "ER"] }),
+      await c.call("list_open_receivables", { invoiceTypes: ["RE", "TR", "AR", "ER"] }),
     );
     expect(explicitDefaults.receivables.map((r) => r.id).sort()).toEqual([1, 4]);
     expect(explicitDefaults.totals).toEqual([
@@ -360,6 +360,33 @@ describe("list_open_receivables", () => {
     for (const invoiceTypes of [[], ["XX"]]) {
       expect((await c.call("list_open_receivables", { invoiceTypes })).isError).toBe(true);
     }
+  });
+
+  it("leaves recurring-invoice templates out unless asked for", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Invoice"), ({ request }) => {
+        if (new URL(request.url).searchParams.get("status") === "750") {
+          return HttpResponse.json(list([]));
+        }
+        return HttpResponse.json(
+          list([
+            invoice({ id: "1", invoiceType: "RE" }),
+            invoice({ id: "2", invoiceType: "WKR", sumGross: "60" }),
+          ]),
+        );
+      }),
+    );
+    const c = await connect();
+    type Out = { receivables: Array<{ id: number }>; totals: Array<Record<string, unknown>> };
+    const standard = structured<Out>(await c.call("list_open_receivables", {}));
+    expect(standard.receivables.map((r) => r.id)).toEqual([1]);
+    expect(standard.totals).toEqual([expect.objectContaining({ count: 1, openAmount: 119 })]);
+
+    const templates = structured<Out>(
+      await c.call("list_open_receivables", { invoiceTypes: ["WKR"] }),
+    );
+    expect(templates.receivables.map((r) => r.id)).toEqual([2]);
+    expect(templates.totals).toEqual([expect.objectContaining({ count: 1, openAmount: 60 })]);
   });
 
   it("pages through sevdesk and stops at the scan limit with a note", async () => {

@@ -313,9 +313,11 @@ const INVOICE_TYPE_CODES = Object.keys(INVOICE_TYPE) as [string, ...string[]];
 /**
  * Receivables by default: reminders (MA) only repeat the amount of the
  * invoice they remind of, and cancellations (SR) are not owed by the
- * customer, so counting them would double or distort the totals.
+ * customer, so counting them would double or distort the totals. WKR is
+ * the template of a recurring invoice; the invoices it creates are RE, so
+ * the template itself is owed by no one.
  */
-export const DEFAULT_RECEIVABLE_TYPES = ["RE", "WKR", "TR", "AR", "ER"] as const;
+export const DEFAULT_RECEIVABLE_TYPES = ["RE", "TR", "AR", "ER"] as const;
 
 function addTo(entry: Totals, invoice: { openAmount: number | null; overdue: boolean }): void {
   entry.count++;
@@ -368,7 +370,9 @@ export const listOpenReceivables = defineTool({
     "Lists invoices customers still have to pay (status open or partially paid) with open " +
     "amount, due date and days overdue, sorted by due date, plus totals per currency and per " +
     "invoice type. Reminders (MA) and cancellations (SR) are left out unless listed in " +
-    "invoiceTypes, because they would count amounts twice. Use it for dunning and cash-flow " +
+    "invoiceTypes, because they would count amounts twice, and so are recurring-invoice " +
+    "templates (WKR), whose invoices appear as RE. " +
+    "Use it for dunning and cash-flow " +
     "questions; use search_invoices for any other invoice search." +
     FOREIGN_DATA_NOTE,
   class: "R",
@@ -382,8 +386,8 @@ export const listOpenReceivables = defineTool({
       .max(INVOICE_TYPE_CODES.length)
       .optional()
       .describe(
-        "Invoice types to include (RE invoice, WKR recurring, TR partial, AR advance, ER final, " +
-          "MA reminder, SR cancellation). Default: RE, WKR, TR, AR, ER.",
+        "Invoice types to include (RE invoice, WKR recurring-invoice template, TR partial, " +
+          "AR advance, ER final, MA reminder, SR cancellation). Default: RE, TR, AR, ER.",
       ),
     ...pageInput,
   }),
@@ -402,7 +406,7 @@ export const listOpenReceivables = defineTool({
   async handler(args, call) {
     const asOf = todayIso();
     // The default is applied here, not in the schema, so the standard filter
-    // is the absence of the input: even all five default codes passed
+    // is the absence of the input: even all four default codes passed
     // explicitly stay exact. Only the standard filter takes in invoices
     // sevdesk sent without a type, as receivables like any other.
     const untypedIncluded = args.invoiceTypes === undefined;
