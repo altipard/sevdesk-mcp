@@ -3,12 +3,11 @@
 //   SEVDESK_LIVE_TEST_TOKEN=<token of a sevdesk test account> npm run test:live
 //
 // Not part of npm run check or CI. Without the token it prints "skipped" and
-// exits 0. With it, it builds if needed, starts the server in read mode
+// exits 0. With it, it builds, starts the server in read mode
 // (whatever SEVDESK_MODE says), calls every read tool once with limit 1 and
 // prints only tool name, ok or error code, and a count or size. It never
 // prints response content and never the token. Exit code 1 if a tool failed.
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const token = process.env.SEVDESK_LIVE_TEST_TOKEN?.trim();
@@ -17,10 +16,9 @@ if (!token) {
   process.exit(0);
 }
 
+// Always rebuild: an older dist would smoke-test old code.
 const root = fileURLToPath(new URL("../../", import.meta.url));
-if (!existsSync(new URL("../../dist/server.js", import.meta.url))) {
-  execFileSync("npm", ["run", "build"], { cwd: root, stdio: ["ignore", "ignore", "inherit"] });
-}
+execFileSync("npm", ["run", "build"], { cwd: root, stdio: ["ignore", "ignore", "inherit"] });
 
 const dist = (path) => new URL(`../../dist/${path}`, import.meta.url).href;
 const { loadConfig } = await import(dist("config.js"));
@@ -36,7 +34,11 @@ const config = loadConfig({
   SEVDESK_API_TOKEN: token,
   SEVDESK_MODE: "read",
   LOG_LEVEL: "error",
-  ...(process.env.SEVDESK_BASE_URL && { SEVDESK_BASE_URL: process.env.SEVDESK_BASE_URL }),
+  // Only a smoke-specific override, so a SEVDESK_BASE_URL left in the shell
+  // cannot send the test-account token elsewhere.
+  ...(process.env.SEVDESK_LIVE_BASE_URL && {
+    SEVDESK_BASE_URL: process.env.SEVDESK_LIVE_BASE_URL,
+  }),
 });
 if (config.mode !== "read") throw new Error("live smoke must run in read mode");
 
