@@ -153,6 +153,7 @@ describe("search_contacts", () => {
     expect(data.page).toMatchObject({ count: 2, total: 2, hasMore: false });
     expect(data.scan).toMatchObject({ mode: "name", checked: 500, truncated: true });
     expect(String(data.scan?.note)).toContain("name filter found 1 more organisations");
+    expect(String(data.scan?.note)).toContain("may miss umlaut and spelling variants");
     expect(String(data.scan?.note)).not.toContain("first 100 results");
 
     const second = structured<Search>(
@@ -191,19 +192,28 @@ describe("search_contacts", () => {
       truncated: true,
       note:
         "Checked the first 500 contacts only; later ones may match too. " +
-        "Use customerNumber or a more specific query.",
+        "Use customerNumber or a more specific query. " +
+        "sevdesk's name filter failed (bad_request 400), so only the scan was used.",
     });
   });
 
-  it("still fails on a server error from the name filter", async () => {
+  it("falls back to the plain scan on a server error from the name filter", async () => {
+    // sevdesk answers some invalid input with 500; the lookup is optional.
     api.server.use(
       http.get(sevdeskUrl("/Contact"), ({ request }) => {
         if (!new URL(request.url).searchParams.has("name")) return scanPages(request);
-        return HttpResponse.json({ error: { message: "boom" } }, { status: 500 });
+        return HttpResponse.json({ error: { message: "secret upstream text" } }, { status: 500 });
       }),
     );
     const c = await connect();
-    expect((await c.call("search_contacts", { query: "muster" })).isError).toBe(true);
+    const result = await c.call("search_contacts", { query: "muster" });
+    expect(result.isError).toBeFalsy();
+    const data = structured<Search>(result);
+    expect(data.contacts.map((x) => x.id)).toEqual([3]);
+    expect(String(data.scan?.note)).toContain(
+      "sevdesk's name filter failed (server_error 500), so only the scan was used.",
+    );
+    expect(textOf(result)).not.toContain("secret upstream text");
   });
 
   it("searches e-mail addresses for a query with @", async () => {

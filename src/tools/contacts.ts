@@ -133,14 +133,16 @@ async function scanByName(
  * The `name` query parameter of GET /Contact is undocumented; the overlay
  * declares it after a live test showed sevdesk honours it for organisation
  * names. Every hit is matched locally again, so a server that ignores the
- * parameter adds no false matches. undefined if sevdesk refuses it (4xx).
+ * parameter adds no false matches. The lookup is optional: any sevdesk
+ * error (sevdesk answers some invalid input with 500) yields `failed`, so
+ * the caller falls back to the scan; only a local policy refusal is thrown.
  */
 async function lookupByName(
   { sevdesk }: ToolCall,
   query: string,
   needle: string,
   depth: "0" | "1",
-): Promise<{ matches: Raw[]; full: boolean } | undefined> {
+): Promise<{ matches: Raw[]; full: boolean } | { failed: SevdeskError }> {
   let body: unknown;
   try {
     body = await sevdesk.call(
@@ -149,8 +151,7 @@ async function lookupByName(
       }),
     );
   } catch (error) {
-    const status = error instanceof SevdeskError ? error.status : undefined;
-    if (status !== undefined && status >= 400 && status < 500) return undefined;
+    if (error instanceof SevdeskError && error.kind !== "policy") return { failed: error };
     throw error;
   }
   const page = objectsOf(body);
@@ -296,7 +297,8 @@ export const searchContacts = defineTool({
     "containing '@' searches e-mail addresses instead. sevdesk cannot reliably filter by name " +
     `or e-mail, so a query checks at most ${MAX_CONTACTS_SCANNED} contacts or ` +
     `${MAX_EMAILS_SCANNED} e-mail addresses and says when it stopped early; beyond that, ` +
-    "organisations are also looked up by sevdesk's own name filter. " +
+    `up to ${MAX_NAME_FILTER_RESULTS} organisations are also looked up by sevdesk's own name ` +
+    "filter, which may miss umlaut and spelling variants. " +
     "Without filters it lists contacts page by page. Use get_contact for addresses and " +
     "communication details, and the returned id as contactId in the invoice, order and " +
     "voucher searches." +
@@ -359,9 +361,10 @@ export const searchContacts = defineTool({
     // name filter asked. Its extra hits follow the scan's, so paging over
     // the merged list stays stable.
     const lookup = scan.truncated ? await lookupByName(call, args.query, needle, depth) : undefined;
+    const found = lookup !== undefined && "matches" in lookup ? lookup : undefined;
     const seen = new Set(scan.matches.map((match) => match.id));
     const extra: ContactSummary[] = [];
-    for (const raw of lookup?.matches ?? []) {
+    for (const raw of found?.matches ?? []) {
       const summary = mapContactSummary(raw);
       if (seen.has(summary.id)) continue;
       seen.add(summary.id);
@@ -370,14 +373,21 @@ export const searchContacts = defineTool({
     const matches = [...scan.matches, ...extra];
     const contacts = matches.slice(args.offset, args.offset + args.limit);
     const page = pageOf(args.offset, args.limit, contacts.length, matches.length);
+    const failure = lookup !== undefined && "failed" in lookup ? lookup.failed : undefined;
     const notes = [
       scan.truncated &&
         `Checked the first ${scan.checked} contacts only; later ones may match too. ` +
           "Use customerNumber or a more specific query.",
-      lookup !== undefined &&
+      found !== undefined &&
         `sevdesk's name filter found ${extra.length} more organisations beyond them` +
-          `${lookup.full ? ` (first ${MAX_NAME_FILTER_RESULTS} results only)` : ""}; ` +
-          "persons and customer numbers there are not searched.",
+          `${found.full ? ` (first ${MAX_NAME_FILTER_RESULTS} results only)` : ""}; ` +
+          "it may miss umlaut and spelling variants, and persons and customer numbers there " +
+          "are not searched.",
+      // Kind and status only: sevdesk's error text stays out of the answer.
+      failure !== undefined &&
+        `sevdesk's name filter failed (${failure.kind}${
+          failure.status !== undefined ? ` ${failure.status}` : ""
+        }), so only the scan was used.`,
     ].filter((note): note is string => typeof note === "string");
     const output: SearchOutput = {
       contacts,
