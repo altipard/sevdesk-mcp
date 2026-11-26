@@ -95,6 +95,8 @@ function markCut(data: Record<string, unknown>, cuts: readonly Cut[]): Record<st
   return marked;
 }
 
+const OVER_BUDGET_NOTE = `This answer is over ${MAX_TOOL_RESPONSE_CHARS} characters and could not be cut further; narrow the request.`;
+
 const CUT_SUMMARY = `Answer cut to fit ${MAX_TOOL_RESPONSE_CHARS} characters, see note.`;
 
 interface Rendered {
@@ -118,8 +120,11 @@ function render(
 /**
  * Cuts lists, largest first, until summary line plus JSON fit the budget.
  * Always cuts whole entries and re-serializes, so the JSON stays valid and
- * the text and structuredContent describe the same data. An answer with
- * nothing to cut is returned as it is.
+ * the text and structuredContent describe the same data.
+ *
+ * Known limit: the budget is not absolute. If no list is left to cut (the
+ * answer has none, or the rest is scalar fields and empty lists), the
+ * answer goes out over budget and its note says so.
  */
 function fitBudget(data: Record<string, unknown>, summary: string | undefined): Rendered {
   const whole = render(data, summary, false);
@@ -150,7 +155,9 @@ function fitBudget(data: Record<string, unknown>, summary: string | undefined): 
     cuts.push({ path, kept: low, total });
     current = withList(current, path, low);
   }
-  return cuts.length === 0 ? whole : render(markCut(current, cuts), summary, true);
+  const base = cuts.length === 0 ? data : markCut(current, cuts);
+  const note = typeof base.note === "string" && base.note !== "" ? `${base.note} ` : "";
+  return render({ ...base, note: `${note}${OVER_BUDGET_NOTE}` }, summary, cuts.length > 0);
 }
 
 /**

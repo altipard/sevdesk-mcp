@@ -91,8 +91,26 @@ describe("okResult size budget", () => {
     expect(textOf(result).length).toBeLessThanOrEqual(MAX_TOOL_RESPONSE_CHARS);
   });
 
-  it("returns an answer without lists as it is", () => {
-    const data = { blob: "z".repeat(MAX_TOOL_RESPONSE_CHARS + 10) };
-    expect(okResult(data).structuredContent).toBe(data);
+  it("says so when nothing is left to cut and the answer stays over budget", () => {
+    const data = { blob: "z".repeat(MAX_TOOL_RESPONSE_CHARS + 10), note: "Earlier." };
+    const result = okResult(data);
+    const json = JSON.parse(textOf(result)) as { blob: string; note: string; truncated?: boolean };
+    expect(json.blob).toBe(data.blob);
+    expect(json.note.startsWith("Earlier. This answer is over 100000 characters")).toBe(true);
+    expect(json.truncated).toBeUndefined();
+    expect(result.structuredContent).toEqual(json);
+  });
+
+  it("also says so when emptied lists are not enough", () => {
+    const result = okResult({ items: entries(3), blob: "z".repeat(MAX_TOOL_RESPONSE_CHARS) });
+    const json = JSON.parse(textOf(result)) as {
+      items: unknown[];
+      note: string;
+      truncated: boolean;
+    };
+    expect(json.items).toEqual([]);
+    expect(json.truncated).toBe(true);
+    expect(json.note).toContain("Answer cut");
+    expect(json.note).toContain("could not be cut further");
   });
 });
