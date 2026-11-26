@@ -515,8 +515,15 @@ describe("class X single use and idempotency", () => {
       name: "send_email",
       arguments: { invoiceId: 5, confirmation_token: second },
     });
-    expect(text(retried)).toContain("already ran for this target");
+    // Still blocked, but the message must not claim that it ran.
+    expect(text(retried)).toContain("may already have run for this target");
+    expect(text(retried)).toContain("unknown outcome");
+    expect(text(retried)).not.toContain("already ran");
     expect(executed).toEqual([]);
+    expect(h.audit.at(-1)).toMatchObject({
+      outcome: "denied",
+      reason: "duplicate_outcome_unknown",
+    });
   });
 
   it("fails closed when the nonce store is down", async () => {
