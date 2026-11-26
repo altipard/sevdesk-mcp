@@ -21,7 +21,10 @@
     "bookkeeping",
     "invoices",
     "germany",
-    "buchhaltung"
+    "buchhaltung",
+    "sevdesk-mcp",
+    "claude-desktop",
+    "cursor"
   ],
   "engines": {
     "node": ">=24"
