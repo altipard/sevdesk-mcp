@@ -55,19 +55,22 @@ describe("readKeychainToken", () => {
     expect(exec.calls[0]?.options).toMatchObject({ timeout: 50 });
   });
 
-  it("reports a missing entry", async () => {
-    for (const [platform, code] of [
-      ["darwin", 44],
-      ["linux", 1],
+  it("reports a missing entry, honestly for secret-tool", async () => {
+    for (const [platform, code, detail] of [
+      ["darwin", 44, "no entry"],
+      // secret-tool exits 1 for "no match" and for "no Secret Service" alike.
+      ["linux", 1, "no entry, or the Secret Service is not reachable"],
     ] as const) {
       const exec = fakeExecFile({ error: failure({ code }) });
       expect(await readKeychainToken({ platform, execFile: exec.fn })).toEqual({
         status: "missing",
+        detail,
       });
     }
     const empty = fakeExecFile({ stdout: "\n" });
     expect(await readKeychainToken({ platform: "linux", execFile: empty.fn })).toEqual({
       status: "missing",
+      detail: "empty entry",
     });
   });
 
@@ -86,6 +89,17 @@ describe("readKeychainToken", () => {
   it("reports failures with fixed text only", async () => {
     const cases: [Outcome, string][] = [
       [{ error: failure({ killed: true, signal: "SIGTERM" }) }, "timed out"],
+      // Node also kills the child when output exceeds maxBuffer; that is no timeout.
+      [
+        {
+          error: failure({
+            code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+            killed: true,
+            signal: "SIGTERM",
+          }),
+        },
+        "returned more output than a token",
+      ],
       [{ error: failure({ code: 51 }), stderr: TEST_TOKEN }, "lookup failed"],
       [{ error: failure({ code: 1 }) }, "lookup failed"], // 1 means "missing" only on Linux
       [{ throws: true }, "lookup failed"],
@@ -132,13 +146,21 @@ describe("resolveApiToken", () => {
     expect(env).toEqual({});
   });
 
-  it("returns no token, and a notice only for failures", async () => {
-    expect(await resolveApiToken({}, async () => ({ status: "missing" }))).toEqual({ env: {} });
+  it("returns no token, with a note on what the keychain lookup found", async () => {
+    expect(
+      await resolveApiToken({}, async () => ({ status: "missing", detail: "no entry" })),
+    ).toEqual({
+      env: {},
+      keychainNote: "no token in the keychain (service sevdesk-mcp, account api-token): no entry",
+    });
     expect(await resolveApiToken({}, async () => ({ status: "unavailable" }))).toEqual({
       env: {},
     });
     expect(
       await resolveApiToken({}, async () => ({ status: "failed", reason: "timed out" })),
-    ).toEqual({ env: {}, notice: "keychain lookup timed out" });
+    ).toEqual({
+      env: {},
+      keychainNote: "keychain lookup timed out (service sevdesk-mcp, account api-token)",
+    });
   });
 });

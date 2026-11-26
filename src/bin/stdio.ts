@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { type Config, ConfigError, loadConfig } from "../config.js";
-import { KEYCHAIN_ACCOUNT, KEYCHAIN_SERVICE, resolveApiToken } from "../keychain.js";
+import { resolveApiToken } from "../keychain.js";
 import { createLogger } from "../logger.js";
 import { validateToolNames } from "../policy/registry.js";
 import { createPolicyRuntime } from "../policy/runtime.js";
@@ -16,7 +16,6 @@ import { VERSION } from "../version.js";
 // Without SEVDESK_API_TOKEN the token comes from the system keychain, so it
 // does not have to sit in a client configuration file.
 const token = await resolveApiToken(process.env);
-if (token.notice) process.stderr.write(`sevdesk-mcp: ${token.notice}\n`);
 
 let config: Config;
 try {
@@ -25,12 +24,13 @@ try {
 } catch (error) {
   if (error instanceof ConfigError) {
     process.stderr.write(`sevdesk-mcp: ${error.message}\n`);
-    if (token.source === "keychain") {
-      process.stderr.write("sevdesk-mcp: the token was read from the keychain\n");
-    } else if (token.source === undefined) {
-      process.stderr.write(
-        `sevdesk-mcp: no token in the keychain either (service ${KEYCHAIN_SERVICE}, account ${KEYCHAIN_ACCOUNT})\n`,
-      );
+    // Keychain details only help when the token is the problem.
+    if (error.issues.some((issue) => issue.startsWith("SEVDESK_API_TOKEN:"))) {
+      if (token.source === "keychain") {
+        process.stderr.write("sevdesk-mcp: the token was read from the keychain\n");
+      } else if (token.keychainNote) {
+        process.stderr.write(`sevdesk-mcp: ${token.keychainNote}\n`);
+      }
     }
     process.exit(1);
   }
