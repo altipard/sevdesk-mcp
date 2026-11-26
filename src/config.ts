@@ -28,6 +28,42 @@ export class ConfigError extends Error {
 const blankToUndefined = (value: unknown): unknown =>
   typeof value === "string" && value.trim() === "" ? undefined : value;
 
+// sevdesk tokens are 32 hex characters. The wider set tolerates a format
+// change, but excludes quotes, backslashes and control characters so the
+// token reads the same in logs, JSON and headers and redaction can find it.
+const TOKEN_PATTERN = /^[A-Za-z0-9._~+/=-]+$/;
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+type BaseUrlCheck = { ok: true; url: string } | { ok: false; error: string };
+
+/**
+ * The token is sent to this URL, so plain http is only accepted for local
+ * mocks. Credentials, query and fragment are rejected: fetch refuses URLs
+ * with credentials and would print them in its error.
+ */
+export function checkBaseUrl(value: string): BaseUrlCheck {
+  let url: URL;
+  try {
+    url = new URL(value.trim());
+  } catch {
+    return { ok: false, error: "must be an absolute http(s) URL" };
+  }
+  if (url.username !== "" || url.password !== "") {
+    return { ok: false, error: "must not contain credentials" };
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    return { ok: false, error: "must be an absolute http(s) URL" };
+  }
+  if (url.protocol === "http:" && !LOOPBACK_HOSTS.has(url.hostname)) {
+    return { ok: false, error: "must use https (http is only allowed for localhost)" };
+  }
+  if (url.search !== "" || url.hash !== "" || value.includes("?") || value.includes("#")) {
+    return { ok: false, error: "must not contain a query or fragment" };
+  }
+  return { ok: true, url: `${url.origin}${url.pathname}`.replace(/\/+$/, "") };
+}
+
 // Every message is fixed text: zod must never echo the input, because for
 // SEVDESK_API_TOKEN the input is the secret.
 const envSchema = z.object({
@@ -36,7 +72,7 @@ const envSchema = z.object({
     z
       .string({ error: "is required" })
       .trim()
-      .regex(/^\S+$/, { error: "must not contain whitespace" }),
+      .regex(TOKEN_PATTERN, { error: "must contain only letters, digits and . _ ~ + / = -" }),
   ),
   SEVDESK_MODE: z.preprocess(
     blankToUndefined,
@@ -45,9 +81,14 @@ const envSchema = z.object({
   SEVDESK_BASE_URL: z.preprocess(
     blankToUndefined,
     z
-      .url({ protocol: /^https?$/, error: "must be an http(s) URL" })
+      .string({ error: "must be a string" })
       .default(DEFAULT_BASE_URL)
-      .transform((url) => url.replace(/\/+$/, "")),
+      .transform((value, ctx) => {
+        const checked = checkBaseUrl(value);
+        if (checked.ok) return checked.url;
+        ctx.addIssue({ code: "custom", message: checked.error });
+        return z.NEVER;
+      }),
   ),
   LOG_LEVEL: z.preprocess(
     blankToUndefined,

@@ -69,7 +69,7 @@ describe("loadConfig", () => {
     expect(error.issues).toEqual([
       "SEVDESK_API_TOKEN: is required",
       "SEVDESK_MODE: must be one of: read, write",
-      "SEVDESK_BASE_URL: must be an http(s) URL",
+      "SEVDESK_BASE_URL: must be an absolute http(s) URL",
       "LOG_LEVEL: must be one of: debug, info, warn, error",
     ]);
   });
@@ -77,7 +77,9 @@ describe("loadConfig", () => {
   it("rejects a malformed token without echoing it", () => {
     const malformed = `${TEST_TOKEN} leaked-part`;
     const error = configError({ SEVDESK_API_TOKEN: malformed, SEVDESK_MODE: "nope" });
-    expect(error.issues).toContain("SEVDESK_API_TOKEN: must not contain whitespace");
+    expect(error.issues).toContain(
+      "SEVDESK_API_TOKEN: must contain only letters, digits and . _ ~ + / = -",
+    );
     const text = errorRepresentations(error);
     expect(text).not.toContain(TEST_TOKEN);
     expect(text).not.toContain("leaked-part");
@@ -87,5 +89,55 @@ describe("loadConfig", () => {
   it("does not echo the token when other variables are invalid", () => {
     const error = configError({ SEVDESK_API_TOKEN: TEST_TOKEN, SEVDESK_BASE_URL: "not a url" });
     expect(errorRepresentations(error)).not.toContain(TEST_TOKEN);
+  });
+
+  it.each([
+    ['"quote', `${TEST_TOKEN}"`],
+    ["backslash", `${TEST_TOKEN}\\`],
+    ["control character", `${TEST_TOKEN}\u0001`],
+  ])("rejects a token with a %s", (_label, token) => {
+    const error = configError({ SEVDESK_API_TOKEN: token });
+    expect(error.issues).toEqual([
+      "SEVDESK_API_TOKEN: must contain only letters, digits and . _ ~ + / = -",
+    ]);
+  });
+});
+
+describe("SEVDESK_BASE_URL", () => {
+  const baseUrl = (value: string) =>
+    loadConfig({ SEVDESK_API_TOKEN: TEST_TOKEN, SEVDESK_BASE_URL: value }).baseUrl;
+
+  it.each([
+    ["https://my.sevdesk.de/api/v1/", "https://my.sevdesk.de/api/v1"],
+    ["http://localhost:4010/api/v1", "http://localhost:4010/api/v1"],
+    ["http://127.0.0.1/api/v1", "http://127.0.0.1/api/v1"],
+    ["http://[::1]:8080/api/v1", "http://[::1]:8080/api/v1"],
+  ])("accepts %s", (value, expected) => {
+    expect(baseUrl(value)).toBe(expected);
+  });
+
+  it.each([
+    ["http://sevdesk.example/api/v1", "must use https (http is only allowed for localhost)"],
+    ["http://127.0.0.2/api/v1", "must use https (http is only allowed for localhost)"],
+    ["https://my.sevdesk.de/api/v1?x=1", "must not contain a query or fragment"],
+    ["https://my.sevdesk.de/api/v1#frag", "must not contain a query or fragment"],
+    ["https://my.sevdesk.de/api/v1?", "must not contain a query or fragment"],
+    ["ftp://my.sevdesk.de/api/v1", "must be an absolute http(s) URL"],
+    ["/api/v1", "must be an absolute http(s) URL"],
+  ])("rejects %s", (value, message) => {
+    const error = configError({ SEVDESK_API_TOKEN: TEST_TOKEN, SEVDESK_BASE_URL: value });
+    expect(error.issues).toEqual([`SEVDESK_BASE_URL: ${message}`]);
+  });
+
+  it.each([
+    "https://user:s3cr3t-pw@my.sevdesk.de/api/v1",
+    "http://user:s3cr3t-pw@localhost/api/v1",
+    "https://s3cr3t-pw@my.sevdesk.de/api/v1",
+  ])("rejects credentials without echoing them (%s)", (value) => {
+    const error = configError({ SEVDESK_API_TOKEN: TEST_TOKEN, SEVDESK_BASE_URL: value });
+    expect(error.issues).toEqual(["SEVDESK_BASE_URL: must not contain credentials"]);
+    const text = errorRepresentations(error);
+    expect(text).not.toContain("s3cr3t-pw");
+    expect(text).not.toContain(TEST_TOKEN);
   });
 });
