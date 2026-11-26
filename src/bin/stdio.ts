@@ -2,8 +2,11 @@
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { type Config, ConfigError, loadConfig } from "../config.js";
 import { createLogger } from "../logger.js";
+import { validateToolNames } from "../policy/registry.js";
+import { createPolicyRuntime } from "../policy/runtime.js";
 import { createServer } from "../server.js";
 import { createSevdeskClient } from "../sevdesk/client.js";
+import { TOOL_NAMES } from "../tools/index.js";
 import { VERSION } from "../version.js";
 
 // stdout carries the MCP protocol. Everything else, including startup
@@ -12,6 +15,7 @@ import { VERSION } from "../version.js";
 let config: Config;
 try {
   config = loadConfig(process.env);
+  validateToolNames(config, TOOL_NAMES);
 } catch (error) {
   if (error instanceof ConfigError) {
     process.stderr.write(`sevdesk-mcp: ${error.message}\n`);
@@ -20,14 +24,19 @@ try {
   throw error;
 }
 
-const logger = createLogger({ level: config.logLevel, redact: [config.sevdeskApiToken] });
+const secrets = [config.sevdeskApiToken, ...(config.confirmSecret ? [config.confirmSecret] : [])];
+const logger = createLogger({ level: config.logLevel, redact: secrets });
 const sevdesk = createSevdeskClient({
   baseUrl: config.baseUrl,
   token: config.sevdeskApiToken,
   logger,
 });
+// Once per process: without SEVDESK_CONFIRM_SECRET the HMAC key is random
+// and confirmation tokens end with the process; the nonce store is shared
+// by every server instance serveStdio builds.
+const runtime = createPolicyRuntime(config, { transport: "stdio" });
 
-const handle = serveStdio(() => createServer(config, { logger, sevdesk }), {
+const handle = serveStdio(() => createServer(config, { logger, sevdesk, runtime }), {
   onerror: (error) => logger.error("stdio transport error", { error }),
 });
 
