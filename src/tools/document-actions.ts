@@ -48,13 +48,15 @@ const TARGET_STATUS: Readonly<Record<Resettable, Record<Target, number>>> = {
 };
 
 /**
- * Statuses the spec allows each reset from: to draft only from open (use
- * resetToOpen first for anything paid), to open only from a higher status.
+ * Statuses the spec allows each reset from: invoices and credit notes go
+ * to draft only from open (resetToOpen first for anything paid), vouchers
+ * from any higher status; to open only from a higher status.
  */
 const RESET_FROM: Readonly<Record<Resettable, Record<Target, readonly number[]>>> = {
   invoice: { draft: [200], open: [750, 1000] },
   credit_note: { draft: [200], open: [750, 1000] },
-  voucher: { draft: [100], open: [150, 750, 1000] },
+  // The spec only says "from higher to lower" for vouchers.
+  voucher: { draft: [100, 150, 750, 1000], open: [150, 750, 1000] },
 };
 
 /** Why a reset cannot run, or undefined. Checked in the preview and again before the reset. */
@@ -68,13 +70,16 @@ function resetProblem(
   if (facts.enshrined) {
     return `The ${label} is enshrined (festgeschrieben); sevdesk does not reset enshrined documents. Nothing was changed.`;
   }
-  if (type === "invoice" && target === "draft" && invoiceType === "WKR") {
-    return `The ${label} is a recurring invoice (WKR); sevdesk does not reset those to draft.`;
+  if (type === "invoice" && invoiceType === "WKR") {
+    return `The ${label} is a recurring invoice (WKR); sevdesk does not reset those to ${target}.`;
   }
   const allowed = RESET_FROM[type][target];
   if (facts.status !== null && allowed.includes(facts.status)) return undefined;
   const hint =
-    target === "draft" && facts.status !== null && facts.status > TARGET_STATUS[type].open
+    target === "draft" &&
+    type !== "voucher" &&
+    facts.status !== null &&
+    facts.status > TARGET_STATUS[type].open
       ? " Reset it to open first, then to draft."
       : "";
   return (
@@ -123,8 +128,9 @@ export const resetDocumentStatus = defineTool({
   description:
     "Resets an invoice, credit note or voucher to draft (resetToDraft) or to open " +
     "(resetToOpen). Linked payments and bank transactions are unlinked; for vouchers, asset " +
-    "depreciation is reset. To draft only from open (reset a paid document to open first), " +
-    "to open only from partially paid or paid. Enshrined documents are refused before " +
+    "depreciation is reset. Invoices and credit notes go to draft only from open (reset a " +
+    "paid one to open first), vouchers from any later status; to open only from partially " +
+    "paid or paid (vouchers also from transferred). Recurring invoices (WKR) cannot be reset. Enshrined documents are refused before " +
     "anything is sent. The first call returns a preview with number, status before and " +
     "after and the warnings, plus a confirmation_token; repeat the call with that token to " +
     "execute." +
@@ -278,6 +284,7 @@ export const tagDocument = defineTool({
   }),
   outputSchema: tagOutput,
   annotations: CREATE_ANNOTATIONS,
+  targetId: (args) => `${args.documentType}:${args.documentId}`,
   async handler(args, call) {
     const facts = await readDocument(call, args.documentType, args.documentId);
     const known = await existingTags(call, args.tagName);

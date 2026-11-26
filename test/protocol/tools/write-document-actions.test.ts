@@ -184,8 +184,33 @@ describe("reset_document_status (W+)", () => {
       documentId: 1001,
       target: "draft",
     });
-    expect(textOf(recurring)).toContain("recurring invoice (WKR)");
+    expect(textOf(recurring)).toContain(
+      "recurring invoice (WKR); sevdesk does not reset those to draft",
+    );
+    const recurringOpen = await c.call("reset_document_status", {
+      documentType: "invoice",
+      documentId: 1001,
+      target: "open",
+    });
+    expect(textOf(recurringOpen)).toContain(
+      "recurring invoice (WKR); sevdesk does not reset those to open",
+    );
     expect(writes()).toEqual([]);
+  });
+
+  it("resets a paid voucher straight to draft, as the spec allows", async () => {
+    api.server.use(
+      ...reads({ voucher: voucher({ status: "1000", paidAmount: "50" }) }),
+      http.put(sevdeskUrl("/Voucher/8001/resetToDraft"), () =>
+        HttpResponse.json({ objects: { id: "8001", status: "50" } }),
+      ),
+    );
+    const c = await connectWrites({ config: { mode: "write" } });
+    const args = { documentType: "voucher", documentId: 8001, target: "draft" };
+    const { preview } = await previewOf(c, "reset_document_status", args);
+    expect((preview.warnings as string[])[0]).toContain("(paid so far: 50)");
+    const { result } = await confirm(c, "reset_document_status", args);
+    expect(structured(result)).toMatchObject({ statusBefore: 1000, statusAfter: 50 });
   });
 
   it("refuses at execution when the document was enshrined after the preview", async () => {
@@ -295,7 +320,12 @@ describe("tag_document (W)", () => {
     expect(textOf(result).split("\n")[0]).toBe(
       'Tagged order AN-1001 (ID 7001) with "Q1 geprueft" (new tag).',
     );
-    expect(c.audit().at(-1)).toMatchObject({ tool: "tag_document", class: "W", outcome: "ok" });
+    expect(c.audit().at(-1)).toMatchObject({
+      tool: "tag_document",
+      class: "W",
+      targetId: "order:7001",
+      outcome: "ok",
+    });
   });
 
   it("maps each document type to its sevdesk object name", async () => {

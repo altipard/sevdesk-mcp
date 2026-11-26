@@ -29,6 +29,7 @@ import {
   money,
   oneLineText,
   PAYMENT_TYPES,
+  type PaymentType,
   paymentAmountInput,
   paymentTypeMismatch,
   readContact,
@@ -50,8 +51,15 @@ import {
 // ---------------------------------------------------------------------------
 // File upload checks (all before anything is sent)
 
-/** Largest file accepted, decoded. */
-export const MAX_VOUCHER_FILE_BYTES = 10 * 1024 * 1024;
+/**
+ * Largest file accepted, decoded. The file travels as base64 inside the
+ * JSON-RPC message (4/3 of its size plus the JSON envelope). The SDK's HTTP
+ * transport refuses bodies over 4 MiB and an oversized stdio message ends
+ * the whole session, so 2.5 MiB (about 3.4 MiB as base64) keeps every
+ * transport safely below its limit. Raise it together with the transports.
+ */
+export const MAX_VOUCHER_FILE_BYTES = 2.5 * 1024 * 1024;
+const MAX_FILE_MIB = MAX_VOUCHER_FILE_BYTES / 1024 / 1024;
 /** Base64 length of the largest file, with padding. */
 const MAX_BASE64_LENGTH = Math.ceil(MAX_VOUCHER_FILE_BYTES / 3) * 4;
 
@@ -80,12 +88,26 @@ const fileInput = z
       .describe("Original file name, e.g. rechnung-4711.pdf; the extension must fit mimeType."),
     mimeType: z.enum(MIME_TYPES).describe("application/pdf, image/png or image/jpeg."),
   })
-  .describe(
-    `Receipt file to attach: PDF, PNG or JPEG up to ${MAX_VOUCHER_FILE_BYTES / 1024 / 1024} MiB.`,
-  );
+  .describe(`Receipt file to attach: PDF, PNG or JPEG up to ${MAX_FILE_MIB} MiB.`);
 type FileInput = z.infer<typeof fileInput>;
 
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
+const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/**
+ * Whether the bits a padded group leaves unused are zero. Buffer.from
+ * ignores them, so "QR==" and "QQ==" would decode alike; only the
+ * canonical form is accepted. Checked on the string, without re-encoding.
+ */
+function canonicalPadding(content: string): boolean {
+  const padding = content.endsWith("==") ? 2 : content.endsWith("=") ? 1 : 0;
+  if (padding === 0) return true;
+  const last = BASE64_ALPHABET.indexOf(content.charAt(content.length - padding - 1));
+  return (last & (padding === 2 ? 0x0f : 0x03)) === 0;
+}
+
+/** PDF readers accept the header anywhere in the first 1024 bytes. */
+const PDF_HEADER_WINDOW = 1024;
 
 /**
  * The decoded file, or an input error: strict base64 (Buffer.from skips
@@ -100,20 +122,23 @@ export function decodeVoucherFile(file: FileInput): Buffer {
         "multiple of 4 characters, without data: prefix or line breaks). Nothing was sent.",
     );
   }
-  const bytes = Buffer.from(content, "base64");
-  // Re-encoding catches non-canonical padding bits and other ambiguous input.
-  if (bytes.toString("base64") !== content) {
+  if (!canonicalPadding(content)) {
     throw badInput("file.content is not canonical base64. Nothing was sent.");
   }
+  const bytes = Buffer.from(content, "base64");
   if (bytes.length === 0) throw badInput("file.content is empty. Nothing was sent.");
   if (bytes.length > MAX_VOUCHER_FILE_BYTES) {
     throw badInput(
-      `The file has ${bytes.length} bytes; at most ${MAX_VOUCHER_FILE_BYTES} (10 MiB) are ` +
+      `The file has ${bytes.length} bytes; at most ${MAX_VOUCHER_FILE_BYTES} (${MAX_FILE_MIB} MiB) are ` +
         "accepted. Nothing was sent.",
     );
   }
   const type = FILE_TYPES[mimeType];
-  if (!type.magic.some((magic) => magic.every((byte, i) => bytes[i] === byte))) {
+  const matches =
+    mimeType === "application/pdf"
+      ? bytes.subarray(0, PDF_HEADER_WINDOW).includes(Buffer.from(type.magic[0]))
+      : type.magic.some((magic) => magic.every((byte, i) => bytes[i] === byte));
+  if (!matches) {
     throw badInput(
       `The file content is not a ${mimeType} file (its first bytes do not match). Only PDF, ` +
         "PNG and JPEG are accepted. Nothing was sent.",
@@ -233,7 +258,7 @@ export const createVoucher = defineTool({
   title: "Create a sevdesk voucher",
   description:
     "Creates a voucher (Beleg) as draft (status 50) in sevdesk, optionally with the receipt " +
-    "file attached (PDF, PNG or JPEG up to 10 MiB, given as base64). creditDebit D is an " +
+    `file attached (PDF, PNG or JPEG up to ${MAX_FILE_MIB} MiB, given as base64). creditDebit D is an ` +
     "expense (incoming invoice, receipt), C an income. Each position has a booking account " +
     "(accountDatevId), a tax rate and an amount; tax rule, accounts and rates are checked " +
     "against sevdesk's documented rules and the account's tax guidance (get_tax_guidance) " +
@@ -287,12 +312,15 @@ export const createVoucher = defineTool({
     if (args.supplierId !== undefined && args.supplierName !== undefined) {
       throw badInput("Give supplierId or supplierName, not both.");
     }
-    if (args.deliveryDate !== undefined && args.deliveryDate > args.voucherDate) {
-      throw badInput("deliveryDate must not be after voucherDate.");
-    }
     const fileBytes = args.file ? decodeVoucherFile(args.file) : undefined;
 
     const warnings: string[] = [];
+    if (args.deliveryDate !== undefined && args.deliveryDate > args.voucherDate) {
+      warnings.push(
+        `deliveryDate ${args.deliveryDate} is after voucherDate ${args.voucherDate}; check that ` +
+          "both dates are right.",
+      );
+    }
     let supplierName: string | null = args.supplierName ?? null;
     if (args.supplierId !== undefined) {
       supplierName = contactName(await readContact(call, args.supplierId));
@@ -311,7 +339,8 @@ export const createVoucher = defineTool({
       const form = new FormData();
       form.append(
         "file",
-        new Blob([new Uint8Array(fileBytes)], { type: args.file.mimeType }),
+        // A view on the decoded bytes, no copy.
+        new Blob([fileBytes as Uint8Array<ArrayBuffer>], { type: args.file.mimeType }),
         args.file.filename,
       );
       let uploaded: unknown;
@@ -433,6 +462,21 @@ export const createVoucher = defineTool({
 /** Statuses sevdesk books payments on: unpaid, transferred and partially paid. */
 const BOOKABLE = [100, 150, 750];
 
+/** Types that settle the voucher whatever is left open (cash discount, bank charges, other). */
+const SETTLING: readonly PaymentType[] = ["CB", "MTC", "O"];
+/** Types meant for paying more than is open. */
+const OVERPAYING: readonly PaymentType[] = ["O", "OF"];
+
+/** Open amount after the booking: 0 for settling types, else open minus the amount. */
+function openAfter(type: PaymentType, paid: number, open: number | null): number | null {
+  if (open === null) return null;
+  return SETTLING.includes(type) ? 0 : Math.max(0, cents(open - paid));
+}
+
+const enshrinedText = (id: number) =>
+  `Voucher ${id} is enshrined (festgeschrieben); sevdesk does not book payments on enshrined ` +
+  "vouchers. Nothing was booked.";
+
 const bookVoucherOutput = z.object({
   voucherId: z.number().int(),
   voucherNumber: z.string().nullable().describe("Description of the voucher, as entered."),
@@ -444,7 +488,7 @@ const bookVoucherOutput = z.object({
   openAfterExpected: z
     .number()
     .nullable()
-    .describe("Open amount before minus the booking, at least 0."),
+    .describe("Open amount before minus the booking, at least 0; 0 for CB, MTC and O (settled)."),
   overpayment: z.number().describe("Amount above the open amount, 0 if none."),
   logId: z.number().int().nullable().describe("ID of sevdesk's booking log entry."),
 });
@@ -481,11 +525,13 @@ export const bookVoucherPayment = defineTool({
       .describe("Bank transaction to link (search_transactions); required for online accounts."),
   }),
   annotations: { ...STATUS_CHANGE_ANNOTATIONS, idempotentHint: false },
+  targetId: (args) => `voucher:${args.voucherId}`,
   summary: (args) =>
     `Book a payment of ${args.amount} (${args.paymentType}) on voucher ${args.voucherId} to ` +
     `check account ${args.checkAccountId}.`,
   async preview(args, call) {
     const voucher = await readDocument(call, "voucher", args.voucherId);
+    if (voucher.enshrined) throw badInput(enshrinedText(args.voucherId));
     const open = voucher.openAmount;
     const warnings: string[] = [];
     if (voucher.status === null || !BOOKABLE.includes(voucher.status)) {
@@ -494,15 +540,15 @@ export const bookVoucherPayment = defineTool({
           "partially paid vouchers, so the booking will be refused.",
       );
     }
-    if (voucher.enshrined) {
-      warnings.push("The voucher is enshrined; sevdesk will refuse to change it.");
-    }
     const overpayment = open === null ? 0 : Math.max(0, cents(args.amount - open));
-    if (overpayment > 0 && args.paymentType !== "OF" && args.paymentType !== "O") {
+    if (overpayment > 0 && !OVERPAYING.includes(args.paymentType)) {
       warnings.push(
-        `Overpayment: ${args.amount} is ${overpayment} more than the open amount of ${open}.`,
+        `Overpayment: ${args.amount} is ${overpayment} more than the open amount of ${open}. ` +
+          "Without type O or OF the booking will be refused at execution.",
       );
     }
+    const after = openAfter(args.paymentType, args.amount, open);
+    const settled = SETTLING.includes(args.paymentType);
     const mismatch = paymentTypeMismatch(args.paymentType, args.amount, open);
     if (mismatch) warnings.push(mismatch);
     let checkAccount: { id: number; name: string | null } = { id: args.checkAccountId, name: null };
@@ -523,7 +569,7 @@ export const bookVoucherPayment = defineTool({
         `Book ${money(args.amount, voucher.currency)} (${args.paymentType}) dated ${args.date} on ` +
         `${documentLine(voucher)} to check account ${args.checkAccountId}` +
         `${checkAccount.name ? ` (${oneLineText(checkAccount.name, 100)})` : ""}; open ` +
-        `${open ?? "unknown"} -> ${open === null ? "unknown" : Math.max(0, cents(open - args.amount))}.` +
+        `${open ?? "unknown"} -> ${after ?? "unknown"}${settled ? " (settled)" : ""}.` +
         `${warnings.length > 0 ? ` Warnings: ${warnings.join(" ")}` : ""}`,
       voucher,
       amount: args.amount,
@@ -534,7 +580,8 @@ export const bookVoucherPayment = defineTool({
         checkAccountTransactionId: args.checkAccountTransactionId,
       }),
       openBefore: open,
-      openAfter: open === null ? null : Math.max(0, cents(open - args.amount)),
+      openAfter: after,
+      settled,
       overpayment,
       warnings,
     };
@@ -549,7 +596,22 @@ export const bookVoucherPayment = defineTool({
           "new preview.",
       );
     }
+    if (voucher.enshrined) {
+      throw badInput(
+        `${enshrinedText(args.voucherId)} Call the tool again without confirmation_token for a new preview.`,
+      );
+    }
     const open = voucher.openAmount;
+    // The open amount may have dropped since the preview (another payment);
+    // an overpayment sevdesk can only book as O or OF is refused here.
+    const overpayment = open === null ? 0 : Math.max(0, cents(args.amount - open));
+    if (overpayment > 0 && !OVERPAYING.includes(args.paymentType)) {
+      throw badInput(
+        `Voucher ${args.voucherId} has ${open} open now; ${args.amount} would overpay it by ` +
+          `${overpayment}, which only type O or OF can book. Nothing was booked; call the tool ` +
+          "again without confirmation_token for a new preview.",
+      );
+    }
     const { sevdesk } = call;
     const body = await sevdesk.call(
       sevdesk.api.PUT("/Voucher/{voucherId}/bookAmount", {
@@ -567,7 +629,6 @@ export const bookVoucherPayment = defineTool({
     );
     // The spec shows the log entry bare; sevdesk usually wraps it in `objects`.
     const log = objectsOf(body)[0] ?? asRecord(body);
-    const overpayment = open === null ? 0 : Math.max(0, cents(args.amount - open));
     const output = shapedOutput(
       bookVoucherOutput,
       {
@@ -578,7 +639,7 @@ export const bookVoucherPayment = defineTool({
         paymentType: args.paymentType,
         checkAccountId: args.checkAccountId,
         openBefore: open,
-        openAfterExpected: open === null ? null : Math.max(0, cents(open - args.amount)),
+        openAfterExpected: openAfter(args.paymentType, args.amount, open),
         overpayment,
         logId: integer(log.id),
       },

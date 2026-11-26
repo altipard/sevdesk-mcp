@@ -266,7 +266,11 @@ describe("create_voucher (W)", () => {
       "not valid base64",
     ],
     ["non-canonical padding bits", { content: "JVBERi1=" }, "not canonical base64"],
-    ["a file over 10 MiB", { content: tooBig.toString("base64") }, "at most 10485760"],
+    [
+      "a file over the limit",
+      { content: tooBig.toString("base64") },
+      `at most ${MAX_VOUCHER_FILE_BYTES} (2.5 MiB)`,
+    ],
     ["a path in the file name", { filename: "../etc/rechnung.pdf" }, "plain file name"],
   ];
 
@@ -279,7 +283,59 @@ describe("create_voucher (W)", () => {
     expect(api.requests).toHaveLength(0);
   });
 
-  it("refuses base64 longer than any 10 MiB file in the schema", async () => {
+  it("keeps a file at the limit, as base64 in a JSON-RPC message, below 4 MiB", () => {
+    const content = Buffer.alloc(MAX_VOUCHER_FILE_BYTES).toString("base64");
+    const message = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "create_voucher", arguments: { ...base, file: { ...pdfFile, content } } },
+    });
+    expect(message.length).toBeLessThan(4 * 1024 * 1024 - 256 * 1024);
+  });
+
+  it("accepts a file of exactly the limit", async () => {
+    const atLimit = Buffer.alloc(MAX_VOUCHER_FILE_BYTES, 0x20);
+    PDF_BYTES.copy(atLimit);
+    api.server.use(readSupplier, guidance(), uploadHandler([]), saved());
+    const c = await connectWrites({ config: { mode: "write" } });
+    const result = await c.call("create_voucher", {
+      ...base,
+      file: { ...pdfFile, content: atLimit.toString("base64") },
+    });
+    expect(result.isError, textOf(result)).toBeFalsy();
+  });
+
+  it("finds the PDF header within the first 1024 bytes, not further", async () => {
+    const received: Received = [];
+    api.server.use(readSupplier, guidance(), uploadHandler(received), saved());
+    const c = await connectWrites({ config: { mode: "write" } });
+    const late = (offset: number) =>
+      Buffer.concat([Buffer.alloc(offset, 0x0a), PDF_BYTES]).toString("base64");
+    const near = await c.call("create_voucher", {
+      ...base,
+      file: { ...pdfFile, content: late(1000) },
+    });
+    expect(near.isError, textOf(near)).toBeFalsy();
+    const far = await c.call("create_voucher", {
+      ...base,
+      file: { ...pdfFile, content: late(1024) },
+    });
+    expect(textOf(far)).toContain("is not a application/pdf file");
+    expect(received).toHaveLength(1);
+  });
+
+  it("accepts canonical padding of both lengths", async () => {
+    api.server.use(readSupplier, guidance(), uploadHandler([]), saved());
+    const c = await connectWrites({ config: { mode: "write" } });
+    for (const extra of ["A", "AB"]) {
+      const content = Buffer.concat([PDF_BYTES, Buffer.from(extra)]).toString("base64");
+      const result = await c.call("create_voucher", { ...base, file: { ...pdfFile, content } });
+      expect(result.isError, `${content}: ${textOf(result)}`).toBeFalsy();
+    }
+  });
+
+  it("refuses base64 longer than any file within the limit in the schema", async () => {
     const c = await connectWrites({ config: { mode: "write" } });
     const content = "A".repeat(Math.ceil(MAX_VOUCHER_FILE_BYTES / 3) * 4 + 4);
     const result = await c.call("create_voucher", { ...base, file: { ...pdfFile, content } });
@@ -323,7 +379,6 @@ describe("create_voucher (W)", () => {
       [{ taxRule: 21 }, "must be a voucher tax rule"],
       [{ supplierName: "Zweiter Name" }, "not both"],
       [{ positions: [{ accountDatevId: 6815, taxRate: 19, amount: 10.005 }] }, "two decimal"],
-      [{ deliveryDate: "2026-03-05" }, "deliveryDate must not be after voucherDate"],
     ];
     for (const [change, message] of cases) {
       const result = await c.call("create_voucher", { ...base, ...change });
@@ -371,6 +426,19 @@ describe("create_voucher (W)", () => {
     const result = await c.call("create_voucher", base);
     expect(result.isError, textOf(result)).toBeFalsy();
     expect(structured(result)).toMatchObject({ taxRule: { checkedAgainst: "guidance" } });
+  });
+
+  it("only warns when deliveryDate is after voucherDate", async () => {
+    api.server.use(readSupplier, guidance(), saved({ document: null }));
+    const c = await connectWrites({ config: { mode: "write" } });
+    const result = await c.call("create_voucher", { ...base, deliveryDate: "2026-03-05" });
+    expect(result.isError, textOf(result)).toBeFalsy();
+    expect(structured(result).warnings).toEqual([
+      "deliveryDate 2026-03-05 is after voucherDate 2026-03-01; check that both dates are right.",
+    ]);
+    expect(await bodyOf(api, "voucherFactorySaveVoucher")).toMatchObject({
+      voucher: { deliveryDate: "05.03.2026" },
+    });
   });
 
   it("refuses an unknown supplier before uploading anything", async () => {
@@ -562,29 +630,109 @@ describe("book_voucher_payment (W+)", () => {
     });
   });
 
-  it("warns about overpayment, a type that does not fit, a draft and an enshrined voucher", async () => {
+  it("warns about overpayment, a type that does not fit and a draft", async () => {
     api.server.use(readVoucher(unpaid), readSupplier, account);
     const c = await connectWrites({ config: { mode: "write" } });
     const over = await previewOf(c, "book_voucher_payment", { ...args, amount: 55 });
     expect(over.preview.approval).toContain(
-      "Warnings: Overpayment: 55 is 15 more than the open amount of 40. FULL_PAYMENT expects",
+      "Warnings: Overpayment: 55 is 15 more than the open amount of 40. Without type O or OF",
     );
     expect(over.preview.warnings).toEqual([
-      "Overpayment: 55 is 15 more than the open amount of 40.",
+      "Overpayment: 55 is 15 more than the open amount of 40. Without type O or OF the " +
+        "booking will be refused at execution.",
       "FULL_PAYMENT expects the open amount (40), not 55; use N for a partial payment, CB, " +
         "MTC or O for a reduced amount, OF for reminder fees.",
     ]);
     const partial = await previewOf(c, "book_voucher_payment", { ...args, paymentType: "N" });
     expect((partial.preview.warnings as string[]).join(" ")).toContain("N books a partial payment");
-    api.server.use(readVoucher(voucher({ status: "50", enshrined: "2026-03-03T10:00:00+01:00" })));
+    api.server.use(readVoucher(voucher({ status: "50" })));
     const draft = await previewOf(c, "book_voucher_payment", args);
-    expect(draft.preview.warnings).toEqual(
-      expect.arrayContaining([
-        expect.stringContaining("is draft (50)"),
-        "The voucher is enshrined; sevdesk will refuse to change it.",
-      ]),
+    expect((draft.preview.warnings as string[]).join(" ")).toContain("is draft (50)");
+    expect(writes()).toEqual([]);
+  });
+
+  it("shows CB, MTC and O as settled with nothing left open", async () => {
+    api.server.use(readVoucher(unpaid), readSupplier, account);
+    const c = await connectWrites({ config: { mode: "write" } });
+    for (const paymentType of ["CB", "MTC", "O"]) {
+      const { preview } = await previewOf(c, "book_voucher_payment", {
+        ...args,
+        amount: 38,
+        paymentType,
+      });
+      expect(preview, paymentType).toMatchObject({ openBefore: 40, openAfter: 0, settled: true });
+      expect(preview.approval as string, paymentType).toContain("open 40 -> 0 (settled).");
+    }
+    const partial = await previewOf(c, "book_voucher_payment", {
+      ...args,
+      amount: 38,
+      paymentType: "N",
+    });
+    expect(partial.preview).toMatchObject({ openAfter: 2, settled: false });
+  });
+
+  it("refuses an enshrined voucher in the preview and at execution", async () => {
+    const enshrined = voucher({
+      sumGross: "50",
+      paidAmount: "10",
+      enshrined: "2026-03-03T10:00:00+01:00",
+    });
+    api.server.use(readVoucher(enshrined), readSupplier, account, booked);
+    const c = await connectWrites({ config: { mode: "write" } });
+    const result = await c.call("book_voucher_payment", args);
+    expect(textOf(result)).toBe(
+      "Voucher 8001 is enshrined (festgeschrieben); sevdesk does not book payments on " +
+        "enshrined vouchers. Nothing was booked.",
+    );
+    expect(result.structuredContent).toBeUndefined();
+
+    let reads = 0;
+    api.server.use(
+      http.get(sevdeskUrl("/Voucher/8001"), () => {
+        reads++;
+        return HttpResponse.json(list([reads === 1 ? unpaid : enshrined]));
+      }),
+    );
+    const { result: executed } = await confirm(c, "book_voucher_payment", args);
+    expect(textOf(executed)).toContain("is enshrined (festgeschrieben)");
+    expect(textOf(executed)).toContain("new preview");
+    expect(writes()).toEqual([]);
+  });
+
+  it("refuses at execution an overpayment that arose after the preview", async () => {
+    let reads = 0;
+    api.server.use(
+      http.get(sevdeskUrl("/Voucher/8001"), () => {
+        reads++;
+        return HttpResponse.json(
+          list([
+            reads === 1 ? unpaid : voucher({ sumGross: "50", paidAmount: "30", status: "750" }),
+          ]),
+        );
+      }),
+      readSupplier,
+      account,
+      booked,
+    );
+    const c = await connectWrites({ config: { mode: "write" } });
+    const { result } = await confirm(c, "book_voucher_payment", args);
+    expect(textOf(result)).toBe(
+      "Voucher 8001 has 20 open now; 40 would overpay it by 20, which only type O or OF can " +
+        "book. Nothing was booked; call the tool again without confirmation_token for a new preview.",
     );
     expect(writes()).toEqual([]);
+  });
+
+  it("books an overpayment as OF and records the voucher as audit target", async () => {
+    api.server.use(readVoucher(unpaid), readSupplier, account, booked);
+    const c = await connectWrites({ config: { mode: "write" } });
+    const { result } = await confirm(c, "book_voucher_payment", {
+      ...args,
+      amount: 45,
+      paymentType: "OF",
+    });
+    expect(structured(result)).toMatchObject({ overpayment: 5, openAfterExpected: 0 });
+    expect(c.audit().at(-1)).toMatchObject({ outcome: "ok", targetId: "voucher:8001" });
   });
 
   it("requires paymentType and date and whole cents, and refuses CF", async () => {
