@@ -319,6 +319,14 @@ const INVOICE_TYPE_CODES = Object.keys(INVOICE_TYPE) as [string, ...string[]];
  */
 export const DEFAULT_RECEIVABLE_TYPES = ["RE", "TR", "AR", "ER"] as const;
 
+/**
+ * Time for all pages of one list_open_receivables call. Kept below the 60 s
+ * deadline of a single sevdesk call and the 60 s default request timeout of
+ * MCP clients, so a partial answer still arrives. Checked before each page:
+ * a page already requested is waited for, bounded by the client deadline.
+ */
+export const RECEIVABLES_DEADLINE_MS = 45_000;
+
 function addTo(entry: Totals, invoice: { openAmount: number | null; overdue: boolean }): void {
   entry.count++;
   entry.openAmount = cents(entry.openAmount + (invoice.openAmount ?? 0));
@@ -336,14 +344,24 @@ const emptyTotals = (currency: string | null): Totals => ({
   overdueAmount: 0,
 });
 
+interface StatusScan {
+  invoices: InvoiceSummary[];
+  /** Stopped at MAX_RECEIVABLES_SCANNED. */
+  truncated: boolean;
+  /** Stopped at the deadline. */
+  timedOut: boolean;
+}
+
 async function scanStatus(
   call: ToolCall,
   status: 200 | 750,
   contactId: number | undefined,
-): Promise<{ invoices: InvoiceSummary[]; truncated: boolean }> {
+  deadline: number,
+): Promise<StatusScan> {
   const { sevdesk } = call;
   const invoices: InvoiceSummary[] = [];
   for (let offset = 0; offset < MAX_RECEIVABLES_SCANNED; offset += SCAN_PAGE) {
+    if (Date.now() >= deadline) return { invoices, truncated: false, timedOut: true };
     const body = await sevdesk.call(
       sevdesk.api.GET("/Invoice", {
         params: {
@@ -358,9 +376,9 @@ async function scanStatus(
     );
     const page = objectsOf(body).map(mapInvoiceSummary);
     invoices.push(...page);
-    if (page.length < SCAN_PAGE) return { invoices, truncated: false };
+    if (page.length < SCAN_PAGE) return { invoices, truncated: false, timedOut: false };
   }
-  return { invoices, truncated: true };
+  return { invoices, truncated: true, timedOut: false };
 }
 
 export const listOpenReceivables = defineTool({
@@ -371,7 +389,8 @@ export const listOpenReceivables = defineTool({
     "amount, due date and days overdue, sorted by due date, plus totals per currency and per " +
     "invoice type. Reminders (MA) and cancellations (SR) are left out unless listed in " +
     "invoiceTypes, because they would count amounts twice, and so are recurring-invoice " +
-    "templates (WKR), whose invoices appear as RE. " +
+    "templates (WKR), whose invoices appear as RE. Stops after " +
+    `${RECEIVABLES_DEADLINE_MS / 1000} s and marks the answer as incomplete. ` +
     "Use it for dunning and cash-flow " +
     "questions; use search_invoices for any other invoice search." +
     FOREIGN_DATA_NOTE,
@@ -399,7 +418,9 @@ export const listOpenReceivables = defineTool({
       .array(typeTotalsSchema)
       .describe("The same totals split by invoice type and currency."),
     page: pageSchema,
-    truncated: z.boolean(),
+    truncated: z
+      .boolean()
+      .describe("Not every open invoice was checked (scan or time limit); totals may be low."),
     note: z.string().optional(),
   }),
   annotations: READ_ANNOTATIONS,
@@ -411,9 +432,12 @@ export const listOpenReceivables = defineTool({
     // sevdesk sent without a type, as receivables like any other.
     const untypedIncluded = args.invoiceTypes === undefined;
     const types = new Set<string>(args.invoiceTypes ?? DEFAULT_RECEIVABLE_TYPES);
-    const open = await scanStatus(call, 200, args.contactId);
-    const partial = await scanStatus(call, 750, args.contactId);
-    const truncated = open.truncated || partial.truncated;
+    const deadline = Date.now() + RECEIVABLES_DEADLINE_MS;
+    const open = await scanStatus(call, 200, args.contactId, deadline);
+    const partial = await scanStatus(call, 750, args.contactId, deadline);
+    const capped = open.truncated || partial.truncated;
+    const timedOut = open.timedOut || partial.timedOut;
+    const truncated = capped || timedOut;
 
     const all = [...open.invoices, ...partial.invoices]
       .filter((invoice) => (invoice.openAmount ?? 0) > 0)
@@ -451,6 +475,15 @@ export const listOpenReceivables = defineTool({
     const sums = totalList
       .map((t) => `${t.openAmount} ${/^[A-Z]{3}$/.test(t.currency ?? "") ? t.currency : ""}`.trim())
       .join(", ");
+    const notes = [
+      capped &&
+        `Checked only the first ${MAX_RECEIVABLES_SCANNED} invoices per status; ` +
+          "totals may be incomplete. Narrow by contactId.",
+      timedOut &&
+        `Stopped after ${RECEIVABLES_DEADLINE_MS / 1000} s with ` +
+          `${open.invoices.length + partial.invoices.length} invoices checked; ` +
+          "receivables and totals are incomplete. Narrow by contactId.",
+    ].filter((note): note is string => typeof note === "string");
     return present(
       {
         asOf,
@@ -463,14 +496,12 @@ export const listOpenReceivables = defineTool({
         ),
         page,
         truncated,
-        ...(truncated && {
-          note:
-            `Checked only the first ${MAX_RECEIVABLES_SCANNED} invoices per status; ` +
-            "totals may be incomplete. Narrow by contactId.",
-        }),
+        ...(notes.length > 0 && { note: notes.join(" ") }),
       },
       {
-        summary: `${pageSummary(page, "open receivables")}${sums ? ` Open in total: ${sums}.` : ""}`,
+        summary: `${pageSummary(page, "open receivables")}${
+          sums ? ` Open in ${truncated ? "what was checked" : "total"}: ${sums}.` : ""
+        }${truncated ? " Incomplete, see note." : ""}`,
       },
     );
   },

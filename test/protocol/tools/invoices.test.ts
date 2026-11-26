@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { unixSeconds } from "../../../src/tools/format.js";
 import { invoice, invoicePosition, list } from "../../fixtures/sevdesk.js";
 import {
@@ -387,6 +387,54 @@ describe("list_open_receivables", () => {
     );
     expect(templates.receivables.map((r) => r.id)).toEqual([2]);
     expect(templates.totals).toEqual([expect.objectContaining({ count: 1, openAmount: 60 })]);
+  });
+
+  it("stops at the time limit and returns what it has, marked incomplete", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      api.server.use(
+        http.get(sevdeskUrl("/Invoice"), ({ request }) => {
+          const params = new URL(request.url).searchParams;
+          const offset = Number(params.get("offset"));
+          // Each page takes 20 s, so the third one starts past the limit.
+          vi.setSystemTime(Date.now() + 20_000);
+          return HttpResponse.json(
+            list(
+              Array.from({ length: 100 }, (_, i) =>
+                invoice({ id: String(offset + i + 1), invoiceDate: "2020-01-01T00:00:00+01:00" }),
+              ),
+            ),
+          );
+        }),
+      );
+      const c = await connect();
+      const result = await c.call("list_open_receivables", { limit: 1 });
+      expect(result.isError).toBeFalsy();
+      const data = structured<{
+        receivables: Array<{ id: number }>;
+        totals: Array<Record<string, unknown>>;
+        truncated: boolean;
+        note?: string;
+        page: Record<string, unknown>;
+      }>(result);
+      // 45 s limit: pages at 0 s and 20 s run, the check at 40 s still
+      // passes, the one at 60 s stops, and status 750 is never asked.
+      expect(api.requests.map((r) => queryOf(r).offset)).toEqual(["0", "100", "200"]);
+      expect(api.requests.every((r) => queryOf(r).status === "200")).toBe(true);
+      expect(data.truncated).toBe(true);
+      expect(data.note).toBe(
+        "Stopped after 45 s with 300 invoices checked; receivables and totals are incomplete. " +
+          "Narrow by contactId.",
+      );
+      expect(data.page).toMatchObject({ count: 1, total: 300, hasMore: true });
+      expect(data.totals).toEqual([expect.objectContaining({ count: 300 })]);
+      expect(textOf(result).split("\n")[0]).toBe(
+        "1 of 300 open receivables (offset 0, more available). " +
+          "Open in what was checked: 35700 EUR. Incomplete, see note.",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("pages through sevdesk and stops at the scan limit with a note", async () => {
