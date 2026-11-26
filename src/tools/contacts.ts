@@ -114,6 +114,30 @@ const searchOutput = z.object({
 });
 type SearchOutput = z.infer<typeof searchOutput>;
 
+/**
+ * Page over the matches of a scan that stopped early. total is unknown:
+ * contacts beyond the scan may match too. hasMore stays true while a page
+ * returns matches or more reachable matches follow, so the list never
+ * looks complete; the first empty page after them ends paging, because a
+ * higher offset cannot reach contacts the scan never saw.
+ */
+function truncatedPage(
+  offset: number,
+  limit: number,
+  count: number,
+  moreReachable: boolean,
+): SearchOutput["page"] {
+  return { ...pageOf(offset, limit, count, null), hasMore: moreReachable || count > 0 };
+}
+
+/** scan.note text for a scan that stopped early. */
+function beyondScanNote(checked: number, what: string, narrower: string): string {
+  return (
+    `Checked the first ${checked} ${what} only; more matching contacts may exist beyond them, ` +
+    `so total is unknown and paging ends after the matches found. ${narrower}`
+  );
+}
+
 async function scanByName(
   { sevdesk }: ToolCall,
   needle: string,
@@ -248,7 +272,14 @@ async function searchByEmail(
         matchedEmail: scan.byContact.get(contactId) as string,
       });
     }
-    page = pageOf(args.offset, args.limit, contacts.length, ids.length);
+    page = scan.truncated
+      ? truncatedPage(
+          args.offset,
+          args.limit,
+          contacts.length,
+          args.offset + contacts.length < ids.length,
+        )
+      : pageOf(args.offset, args.limit, contacts.length, ids.length);
   } else {
     // Whether a match is a person shows only on the contact itself: walk the
     // matches in order, skip persons, stop when the page is full or the
@@ -277,14 +308,17 @@ async function searchByEmail(
     fetchCapped = index < ids.length && fetches >= MAX_EMAIL_CONTACT_FETCHES;
     page = {
       ...pageOf(args.offset, args.limit, contacts.length, null),
-      hasMore: index < ids.length && !fetchCapped,
+      hasMore: !fetchCapped && (index < ids.length || (scan.truncated && contacts.length > 0)),
     };
   }
 
   const notes = [
     scan.truncated &&
-      `Checked the first ${scan.checked} e-mail addresses only; later ones may match too. ` +
-        "Use a more specific query or search by name or customer number.",
+      beyondScanNote(
+        scan.checked,
+        "e-mail addresses",
+        "Search more specifically: a longer part of the e-mail address, a name or customerNumber.",
+      ),
     fetchCapped &&
       `Stopped after looking up ${MAX_EMAIL_CONTACT_FETCHES} contacts; further matches cannot be ` +
         "paged to with includePersons=false. Narrow the query or set includePersons=true.",
@@ -386,12 +420,23 @@ export const searchContacts = defineTool({
     }
     const matches = [...scan.matches, ...extra];
     const contacts = matches.slice(args.offset, args.offset + args.limit);
-    const page = pageOf(args.offset, args.limit, contacts.length, matches.length);
+    const page = scan.truncated
+      ? truncatedPage(
+          args.offset,
+          args.limit,
+          contacts.length,
+          args.offset + contacts.length < matches.length,
+        )
+      : pageOf(args.offset, args.limit, contacts.length, matches.length);
     const failure = lookup !== undefined && "failed" in lookup ? lookup.failed : undefined;
     const notes = [
       scan.truncated &&
-        `Checked the first ${scan.checked} contacts only; later ones may match too. ` +
-          "Use customerNumber or a more specific query.",
+        beyondScanNote(
+          scan.checked,
+          "contacts",
+          "Search more specifically: a longer part of the name, an e-mail address " +
+            "(query with @) or customerNumber.",
+        ),
       found !== undefined &&
         `sevdesk's name filter found ${extra.length} more organisations beyond them` +
           `${found.full ? ` (first ${MAX_NAME_FILTER_RESULTS} results only)` : ""}; ` +
