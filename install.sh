@@ -218,6 +218,25 @@ detect_platform() {
     if [ "$OS" = darwin ] && [ "$ARCH" = x64 ]; then
         if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ]; then ARCH=arm64; fi
     fi
+    if [ "$OS" = linux ] && is_musl; then
+        fail "this system uses musl libc (e.g. Alpine), the release binaries need glibc. Use the npm package instead: npx -y @altipard/sevdesk-mcp. Nothing was installed."
+    fi
+}
+
+# The Linux binaries link against glibc and do not start on musl systems.
+is_musl() {
+    if [ -f /etc/alpine-release ]; then return 0; fi
+    case "$(ldd --version 2>&1 || true)" in
+        *musl*) return 0 ;;
+        *GNU* | *GLIBC* | *glibc*) return 1 ;;
+    esac
+    # No usable ldd: a musl loader without a glibc loader.
+    for loader in /lib/ld-musl-*.so.1; do
+        if [ -e "$loader" ] && [ ! -e /lib64/ld-linux-x86-64.so.2 ] && [ ! -e /lib/ld-linux-aarch64.so.1 ]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 fetch() { # url file
@@ -288,6 +307,9 @@ choose_dest() {
 prepare_dest() {
     mkdir -p "$DEST" 2>/dev/null || fail "cannot create $DEST; set INSTALL_DIR to a writable directory"
     [ -w "$DEST" ] || fail "no write access to $DEST; set INSTALL_DIR to a writable directory"
+    if [ -d "$DEST/$BIN_NAME" ]; then
+        fail "$DEST/$BIN_NAME is a directory; remove it or set INSTALL_DIR. Nothing was installed."
+    fi
 }
 
 verify_checksum() {
@@ -305,14 +327,42 @@ verify_checksum() {
         fail "checksum mismatch for $asset; the download is corrupt or has been tampered with. Nothing was installed."
 }
 
+# Prints the version a sevdesk-mcp binary reports in its MCP initialize answer, or nothing.
+# It runs with a dummy token and an unreachable base URL, so it neither asks the keychain nor
+# reaches sevdesk, and it is stopped after 10 seconds.
+binary_version() { # binary
+    out="$tmp/initialize.out"
+    : >"$out"
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"sevdesk-mcp-installer","version":"0"}}}' |
+        env -i PATH=/usr/bin:/bin SEVDESK_API_TOKEN=00000000000000000000000000000000 \
+            SEVDESK_BASE_URL=http://127.0.0.1:9/api/v1 LOG_LEVEL=error "$1" >"$out" 2>/dev/null &
+    pid=$!
+    (sleep 10 && kill "$pid") >/dev/null 2>&1 &
+    watchdog=$!
+    wait "$pid" 2>/dev/null || true
+    kill "$watchdog" 2>/dev/null || true
+    sed -n 's/.*"serverInfo":{[^}]*"version":"\([0-9A-Za-z.+-]*\)".*/\1/p' "$out" | head -n 1
+}
+
+# Sets BIN_PATH and PREVIOUS (version of the replaced binary, empty if there was none).
 install_binary() { # downloaded-file
-    stage="$DEST/.$BIN_NAME-install.$$"
+    target="$DEST/$BIN_NAME"
+    # A random name in the target directory: same file system, so the rename below is atomic
+    # and a running server keeps its binary; nobody can pre-create the name.
+    stage=$(mktemp "$DEST/.$BIN_NAME.XXXXXX") || fail "cannot create a temporary file in $DEST"
     cp "$1" "$stage" || fail "cannot write to $DEST"
     chmod 755 "$stage"
-    # Same file system as the target, so the rename is atomic: a running server keeps its binary.
-    mv -f "$stage" "$DEST/$BIN_NAME"
+    reported=$(binary_version "$stage")
+    [ "$reported" = "$VERSION" ] ||
+        fail "the downloaded binary does not run on this system (it reported '${reported:-nothing}', expected $VERSION). Nothing was installed."
+    PREVIOUS=''
+    if [ -e "$target" ]; then
+        PREVIOUS=$(binary_version "$target")
+        PREVIOUS=${PREVIOUS:-unknown version}
+    fi
+    mv -f "$stage" "$target" || fail "cannot replace $target"
     stage=''
-    BIN_PATH="$DEST/$BIN_NAME"
+    BIN_PATH=$target
 }
 
 # --- interactive setup ------------------------------------------------------------------------
@@ -483,10 +533,26 @@ with open(out, "w", encoding="utf-8") as f:
         print_snippet "$file" "$key" ''
         return 0
     fi
-    # Write in place so permissions and ownership of an existing file stay.
-    cat "$out" >"$file" || { say "Cannot write $file."; return 0; }
-    say "Updated $file"
-    if [ -n "$backup" ]; then say "${DIM}backup: $backup${RST}"; fi
+    # Write next to the file and rename: the configuration is never half-written. The copy
+    # keeps the mode of an existing file.
+    newfile=''
+    if newfile=$(mktemp "$(dirname "$file")/.$(basename "$file").XXXXXX") &&
+        { [ -z "$backup" ] || cp -p "$file" "$newfile"; } &&
+        cat "$out" >"$newfile" &&
+        mv -f "$newfile" "$file"; then
+        say "Updated $file"
+        if [ -n "$backup" ]; then say "${DIM}backup: $backup${RST}"; fi
+        return 0
+    fi
+    if [ -n "$newfile" ]; then rm -f "$newfile"; fi
+    if [ -z "$backup" ]; then
+        say "Writing $file failed."
+    elif cp -p "$backup" "$file"; then
+        say "Writing $file failed; restored it from $backup."
+    else
+        say "Writing $file failed and restoring it failed too; the original is at $backup."
+    fi
+    print_snippet "$file" "$key" ''
 }
 
 server_present() { # file key
@@ -657,7 +723,12 @@ main() {
     install_binary "$tmp/$asset"
 
     blank
-    say "${BOLD}sevdesk-mcp${RST} ${ACC}$VERSION${RST} installed to ${BOLD}$BIN_PATH${RST}"
+    if [ -n "$PREVIOUS" ]; then
+        say "Replaced sevdesk-mcp $PREVIOUS with ${ACC}$VERSION${RST} at ${BOLD}$BIN_PATH${RST}"
+    else
+        say "${BOLD}sevdesk-mcp${RST} ${ACC}$VERSION${RST} installed to ${BOLD}$BIN_PATH${RST}"
+    fi
+    say "${DIM}Build provenance: gh attestation verify $BIN_PATH --repo $REPO${RST}"
     case ":${PATH:-}:" in
         *":$DEST:"*) ;;
         *)
