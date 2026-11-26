@@ -1,0 +1,47 @@
+# Local development for the HTTP transport.
+#
+#   docker compose up -d redis
+#   REDIS_URL=redis://localhost:6379 npm run start:http   (with the variables
+#   from .env.example set in your shell)
+#
+# or everything in containers:
+#
+#   docker compose --profile app up --build
+#
+# Ports are bound to localhost only.
+services:
+  redis:
+    image: redis:8.2.3-alpine@sha256:08ad0b1d280850169a790dba1393ff7a90aef951fc19632cf4d3ce4f78e679ba
+    # Nonces only need to outlive their TTL; no persistence for local use.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mcp:
+    profiles: ["app"]
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3000:3000"
+    # Taken from your shell; missing values make the server stop with a
+    # clear configuration error.
+    environment:
+      PORT: "3000"
+      SEVDESK_API_TOKEN: ${SEVDESK_API_TOKEN:-}
+      SEVDESK_CONFIRM_SECRET: ${SEVDESK_CONFIRM_SECRET:-}
+      SEVDESK_MODE: ${SEVDESK_MODE:-read}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      MCP_RESOURCE_URL: ${MCP_RESOURCE_URL:-http://localhost:3000/mcp}
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-localhost}
+      OAUTH_ISSUER: ${OAUTH_ISSUER:-}
+      OAUTH_JWKS_URL: ${OAUTH_JWKS_URL:-}
+      OAUTH_ALGORITHMS: ${OAUTH_ALGORITHMS:-RS256}
+      OAUTH_ALLOW_INSECURE_HTTP: ${OAUTH_ALLOW_INSECURE_HTTP:-false}
+      REDIS_URL: redis://redis:6379

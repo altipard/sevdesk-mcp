@@ -1,0 +1,21 @@
+# Secrets never enter the build context.
+.env
+.env.*
+!.env.example
+.envrc
+
+.git
+.github
+node_modules
+dist
+out
+coverage
+src/generated
+spikes
+docs
+test
+assets
+*.log
+.DS_Store
+Dockerfile
+compose.yaml
