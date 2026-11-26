@@ -3,9 +3,9 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import type { Config } from "../../src/config.js";
+import { type Config, ConfigError } from "../../src/config.js";
 import { createAuditLog } from "../../src/policy/audit.js";
-import type { NonceStore } from "../../src/policy/nonce-store.js";
+import { InMemoryNonceStore, type NonceStore } from "../../src/policy/nonce-store.js";
 import { defineTool, registerTools, type ToolDefinition } from "../../src/policy/registry.js";
 import {
   createPolicyRuntime,
@@ -494,8 +494,22 @@ describe("HTTP policy", () => {
     extra: { sub: "alice" },
   };
 
+  it("requires an explicit nonce store", () => {
+    expect(() => createPolicyRuntime(config, { transport: "http", secret: SECRET })).toThrow(
+      ConfigError,
+    );
+    expect(() => createPolicyRuntime(config, { transport: "http", secret: SECRET })).toThrow(
+      "HTTP transport needs a shared NonceStore",
+    );
+    expect(() => createPolicyRuntime(config, { transport: "stdio", secret: SECRET })).not.toThrow();
+  });
+
   it("binds tokens to the subject", () => {
-    const runtime = createPolicyRuntime(config, { transport: "http", secret: SECRET });
+    const runtime = createPolicyRuntime(config, {
+      transport: "http",
+      secret: SECRET,
+      nonces: new InMemoryNonceStore(),
+    });
     const policy = requestPolicy(config, runtime, authInfo);
     expect(policy.subject).toBe("sub:alice");
     expect(policy.rights).toBe("write");
@@ -518,6 +532,7 @@ describe("HTTP policy", () => {
     const runtime = createPolicyRuntime(config, {
       transport: "http",
       secret: SECRET,
+      nonces: new InMemoryNonceStore(),
       audit: createAuditLog({ write: (line) => auditLines.push(line) }),
     });
     const build = () => {

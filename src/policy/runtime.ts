@@ -1,5 +1,5 @@
 import type { AuthInfo } from "@modelcontextprotocol/server";
-import { type Config, confirmSecretFor } from "../config.js";
+import { type Config, ConfigError, confirmSecretFor } from "../config.js";
 import { type AuditLog, createAuditLog } from "./audit.js";
 import { type ConfirmationSigner, createConfirmationSigner } from "./confirm.js";
 import { InMemoryNonceStore, type NonceStore } from "./nonce-store.js";
@@ -29,7 +29,18 @@ export interface PolicyRuntimeOptions {
   now?: () => number;
 }
 
+/**
+ * HTTP needs an explicit NonceStore: with SEVDESK_CONFIRM_SECRET shared,
+ * tokens stay valid across restarts and instances, but an in-memory store
+ * forgets its nonces, so a token could be replayed against another instance
+ * or after a restart. The in-memory default is for stdio and tests only.
+ */
 export function createPolicyRuntime(config: Config, options: PolicyRuntimeOptions): PolicyRuntime {
+  if (options.transport === "http" && options.nonces === undefined) {
+    throw new ConfigError([
+      "HTTP transport needs a shared NonceStore; the in-memory store is only for stdio",
+    ]);
+  }
   const secret = options.secret ?? confirmSecretFor(config, options.transport);
   const now = options.now ?? Date.now;
   return {
