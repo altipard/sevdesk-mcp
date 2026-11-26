@@ -32,7 +32,19 @@ export interface DecodedFile {
  * with mimetype/base64Encoded. Both are accepted; content that is not
  * base64 is taken as raw bytes.
  */
-export function decodeFile(body: unknown, fallbackMime: string): DecodedFile {
+export interface DecodeOptions {
+  /** The file must be a PDF: declared type application/pdf (or none) and a %PDF- header. */
+  readonly requirePdf?: boolean;
+}
+
+const PDF_MIME = "application/pdf";
+const PDF_MAGIC = Buffer.from("%PDF-", "latin1");
+
+export function decodeFile(
+  body: unknown,
+  fallbackMime: string,
+  options: DecodeOptions = {},
+): DecodedFile {
   const outer = asRecord(body);
   const inner = asRecord(outer.objects);
   const source: Raw = typeof inner.content === "string" ? inner : outer;
@@ -58,9 +70,23 @@ export function decodeFile(body: unknown, fallbackMime: string): DecodedFile {
     );
   }
   const declared = text(source.mimeType ?? source.mimetype);
+  if (options.requirePdf) {
+    // Handed to the client as application/pdf, so it has to be one: an HTML
+    // error page or anything else is refused rather than relabelled.
+    if (declared !== null && declared.toLowerCase() !== PDF_MIME) {
+      throw new SevdeskError("http_error", "sevdesk sent a file that is not a PDF.");
+    }
+    if (!bytes.subarray(0, PDF_MAGIC.length).equals(PDF_MAGIC)) {
+      throw new SevdeskError("http_error", "sevdesk sent a file without a PDF header.");
+    }
+  }
   return {
     filename: text(source.filename),
-    mimeType: declared !== null && MIME_TYPE.test(declared) ? declared : fallbackMime,
+    mimeType: options.requirePdf
+      ? PDF_MIME
+      : declared !== null && MIME_TYPE.test(declared)
+        ? declared
+        : fallbackMime,
     base64: bytes.toString("base64"),
     sizeBytes: bytes.byteLength,
   };
@@ -119,6 +145,7 @@ export const getDocumentPdf = defineTool({
     const file = decodeFile(
       await sevdesk.call(request as Promise<{ data: unknown; response: Response }>),
       "application/pdf",
+      { requirePdf: true },
     );
     const resourceUri = `sevdesk://${documentType}/${documentId}/pdf`;
     return present(

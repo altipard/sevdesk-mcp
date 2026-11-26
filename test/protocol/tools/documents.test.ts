@@ -103,6 +103,30 @@ describe("get_document_pdf", () => {
     ).toContain("without file content");
   });
 
+  it("refuses anything that is not a PDF", async () => {
+    const html = Buffer.from("<html>error</html>").toString("base64");
+    api.server.use(
+      http.get(sevdeskUrl("/Invoice/1/getPdf"), () =>
+        HttpResponse.json(pdfDocument({ mimeType: "text/html" })),
+      ),
+      http.get(sevdeskUrl("/Invoice/2/getPdf"), () =>
+        HttpResponse.json(pdfDocument({ content: html })),
+      ),
+      http.get(sevdeskUrl("/Invoice/3/getPdf"), () =>
+        HttpResponse.json(pdfDocument({ mimeType: undefined, filename: undefined })),
+      ),
+    );
+    const c = await connect();
+    const call = (documentId: number) =>
+      c.call("get_document_pdf", { documentType: "invoice", documentId });
+    expect(textOf(await call(1))).toBe("sevdesk sent a file that is not a PDF.");
+    expect(textOf(await call(2))).toBe("sevdesk sent a file without a PDF header.");
+    expect(structured(await call(3))).toMatchObject({
+      mimeType: "application/pdf",
+      filename: null,
+    });
+  });
+
   it("reports 401, 404 and 429 as tool errors", async () => {
     await expectHttpErrors(api, "get", "/Order/4/getPdf", "get_document_pdf", {
       documentType: "order",
