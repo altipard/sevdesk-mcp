@@ -380,7 +380,7 @@ export const listOpenReceivables = defineTool({
       .array(z.enum(INVOICE_TYPE_CODES))
       .min(1)
       .max(INVOICE_TYPE_CODES.length)
-      .default([...DEFAULT_RECEIVABLE_TYPES])
+      .optional()
       .describe(
         "Invoice types to include (RE invoice, WKR recurring, TR partial, AR advance, ER final, " +
           "MA reminder, SR cancellation). Default: RE, WKR, TR, AR, ER.",
@@ -401,12 +401,12 @@ export const listOpenReceivables = defineTool({
   annotations: READ_ANNOTATIONS,
   async handler(args, call) {
     const asOf = todayIso();
-    const types = new Set<string>(args.invoiceTypes);
-    // Invoices sevdesk sent without a type are receivables like any other
-    // under the default filter; an explicit type list stays exact.
-    const untypedIncluded =
-      types.size === DEFAULT_RECEIVABLE_TYPES.length &&
-      DEFAULT_RECEIVABLE_TYPES.every((type) => types.has(type));
+    // The default is applied here, not in the schema, so the standard filter
+    // is the absence of the input: even all five default codes passed
+    // explicitly stay exact. Only the standard filter takes in invoices
+    // sevdesk sent without a type, as receivables like any other.
+    const untypedIncluded = args.invoiceTypes === undefined;
+    const types = new Set<string>(args.invoiceTypes ?? DEFAULT_RECEIVABLE_TYPES);
     const open = await scanStatus(call, 200, args.contactId);
     const partial = await scanStatus(call, 750, args.contactId);
     const truncated = open.truncated || partial.truncated;

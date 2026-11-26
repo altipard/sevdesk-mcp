@@ -347,6 +347,16 @@ describe("list_open_receivables", () => {
     );
     expect(onlyInvoices.receivables.map((r) => r.id)).toEqual([1]);
 
+    // Even all five default codes, passed explicitly, are an explicit filter.
+    const explicitDefaults = structured<Out>(
+      await c.call("list_open_receivables", { invoiceTypes: ["RE", "WKR", "TR", "AR", "ER"] }),
+    );
+    expect(explicitDefaults.receivables.map((r) => r.id).sort()).toEqual([1, 4]);
+    expect(explicitDefaults.totals).toEqual([
+      expect.objectContaining({ count: 2, openAmount: 149 }),
+    ]);
+    expect(explicitDefaults.totalsByType.map((t) => t.invoiceType)).toEqual(["AR", "RE"]);
+
     for (const invoiceTypes of [[], ["XX"]]) {
       expect((await c.call("list_open_receivables", { invoiceTypes })).isError).toBe(true);
     }
