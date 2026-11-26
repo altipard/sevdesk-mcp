@@ -206,19 +206,32 @@ export const getInvoice = defineTool({
   name: "get_invoice",
   title: "Get a sevdesk invoice",
   description:
-    "Returns one invoice by its sevdesk ID with all positions (up to 100), amounts, dates and " +
-    "status. Find the ID with search_invoices. Use get_document_pdf for the rendered PDF." +
+    `Returns one invoice by its sevdesk ID with up to ${MAX_POSITIONS} positions, amounts, ` +
+    "dates and status. If positionsTruncated is true, call again with positionsOffset = " +
+    "nextPositionsOffset for the rest. Find the ID with search_invoices. Use get_document_pdf " +
+    "for the rendered PDF." +
     FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "getInvoiceById",
-  inputSchema: z.object({ invoiceId: entityId.describe("sevdesk ID of the invoice.") }),
+  inputSchema: z.object({
+    invoiceId: entityId.describe("sevdesk ID of the invoice."),
+    positionsOffset: z
+      .number()
+      .int()
+      .min(0)
+      .max(100_000)
+      .default(0)
+      .describe("Positions to skip, for invoices with more than 100 positions."),
+  }),
   outputSchema: z.object({
     invoice: invoiceDetailSchema,
     positions: z.array(positionSchema),
-    positionsTruncated: z.boolean(),
+    positionsOffset: z.number().int(),
+    positionsTruncated: z.boolean().describe("More positions may follow."),
+    nextPositionsOffset: z.number().int().optional(),
   }),
   annotations: READ_ANNOTATIONS,
-  async handler({ invoiceId }, { sevdesk }) {
+  async handler({ invoiceId, positionsOffset }, { sevdesk }) {
     const body = await sevdesk.call(
       sevdesk.api.GET("/Invoice/{invoiceId}", { params: { path: { invoiceId } } }),
     );
@@ -226,7 +239,10 @@ export const getInvoice = defineTool({
     if (raw === undefined) throw notFound("invoice", invoiceId);
     const positionsBody = await sevdesk.call(
       sevdesk.api.GET("/Invoice/{invoiceId}/getPositions", {
-        params: { path: { invoiceId }, query: { limit: MAX_POSITIONS } },
+        params: {
+          path: { invoiceId },
+          query: { limit: MAX_POSITIONS, ...(positionsOffset > 0 && { offset: positionsOffset }) },
+        },
       }),
     );
     const positions = objectsOf(positionsBody).map(mapPosition);
@@ -247,7 +263,13 @@ export const getInvoice = defineTool({
     };
     const truncated = positions.length >= MAX_POSITIONS;
     return present(
-      { invoice, positions, positionsTruncated: truncated },
+      {
+        invoice,
+        positions,
+        positionsOffset,
+        positionsTruncated: truncated,
+        ...(truncated && { nextPositionsOffset: positionsOffset + positions.length }),
+      },
       {
         summary:
           `Invoice ${invoice.id} (${invoice.statusName ?? "unknown status"}), ` +

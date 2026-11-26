@@ -182,6 +182,7 @@ describe("get_invoice", () => {
       discount: null,
     });
     expect(data.positionsTruncated).toBe(false);
+    expect(data).not.toHaveProperty("nextPositionsOffset");
     expect(textOf(result).split("\n")[0]).toBe("Invoice 1001 (open), 2 positions.");
   });
 
@@ -196,8 +197,16 @@ describe("get_invoice", () => {
     );
     const c = await connect();
     const result = await c.call("get_invoice", { invoiceId: 1001 });
-    expect(structured<{ positionsTruncated: boolean }>(result).positionsTruncated).toBe(true);
+    expect(structured(result)).toMatchObject({
+      positionsOffset: 0,
+      positionsTruncated: true,
+      nextPositionsOffset: 100,
+    });
     expect(textOf(result).split("\n")[0]).toBe("Invoice 1001 (open), 100+ positions.");
+
+    const next = structured(await c.call("get_invoice", { invoiceId: 1001, positionsOffset: 100 }));
+    expect(queryOf(api.requests.at(-1))).toEqual({ limit: "100", offset: "100" });
+    expect(next).toMatchObject({ positionsOffset: 100, nextPositionsOffset: 200 });
   });
 
   it("treats an empty answer as not found", async () => {
