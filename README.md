@@ -46,12 +46,24 @@ with compact answers, plus a guarded fallback for everything else.
 You need a sevdesk API token (32 hex characters; sevdesk issues one per administrator).
 Pick one of the following.
 
-**Installer** (macOS and Linux, x64 and arm64): downloads the release binary for your
-platform, checks it against the release's `SHA256SUMS` and installs it to `~/.local/bin`.
+**Installer** (macOS and Linux with glibc, x64 and arm64):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.sh | sh
 ```
+
+It downloads the release binary for your platform, verifies it against the release's
+`SHA256SUMS` (nothing is installed on a mismatch) and installs it to `~/.local/bin`. In a
+terminal it then offers a guided setup, asking before every step:
+
+1. store the API token in the system keychain,
+2. pick the mode for the client entries (`read`, `write` or `full`, default `read`),
+3. register the server with Claude Desktop, Claude Code, Cursor and VS Code.
+
+The token never goes into a client configuration file. Existing client configs are backed
+up before they are changed and are left alone if they are not valid JSON; changing them
+needs `jq` or `python3`, otherwise the installer prints the snippet to add by hand.
+Without a terminal it installs only and prints the next steps.
 
 **npx** (any platform with Node.js 24 or newer), nothing to install up front:
 
@@ -64,21 +76,33 @@ npx -y @altipard/sevdesk-mcp
 
 <br>
 
-**Installer options**, set as environment variables for `sh`:
+**Options**, passed after `sh -s --`:
+
+| Option | Meaning |
+| --- | --- |
+| `--dry-run` | Show platform, release and target without downloading or changing anything. |
+| `--no-setup` | Install only, skip the keychain and MCP client setup. |
+| `-h`, `--help` | Show the help. |
+
+**Environment variables**, set for `sh`:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `INSTALL_DIR` | `~/.local/bin` | Target directory for the `sevdesk-mcp` binary. |
+| `INSTALL_DIR` | `~/.local/bin` | Target directory, absolute path, created if missing, must be writable. |
 | `SEVDESK_MCP_VERSION` | `latest` | Release to install, for example `0.2.0` (tags have no `v` prefix). |
 | `NO_COLOR` | | Set to any value to disable colored output. |
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.sh \
-  | INSTALL_DIR="$HOME/bin" SEVDESK_MCP_VERSION=0.2.0 sh
+  | INSTALL_DIR="$HOME/bin" SEVDESK_MCP_VERSION=0.2.0 sh -s -- --no-setup
 ```
 
-**Manual download.** Every release carries `sevdesk-mcp-<os>-<arch>` for `darwin-arm64`,
-`darwin-x64`, `linux-x64` and `linux-arm64`, plus `SHA256SUMS`:
+The installer needs `curl` and `sha256sum` or `shasum`. Release binaries exist for
+`darwin-arm64`, `darwin-x64`, `linux-x64` and `linux-arm64`; under Rosetta it picks the
+native arm64 binary. The Linux binaries are built against glibc, so on musl systems such as
+Alpine use npx instead.
+
+**Manual download.** Every release carries `sevdesk-mcp-<os>-<arch>` plus `SHA256SUMS`:
 
 ```sh
 base=https://github.com/altipard/sevdesk-mcp/releases/latest/download
@@ -103,31 +127,33 @@ node dist/bin/stdio.js
 
 ### Keep the token in the keychain
 
-The server reads the token from `SEVDESK_API_TOKEN`. Rather than pasting it into a client
-config file, store it in the system keychain under service `sevdesk-mcp`, account
-`api-token`, and let the client fetch it at start.
+If `SEVDESK_API_TOKEN` is unset, the server reads the token from the system keychain at
+start: service `sevdesk-mcp`, account `api-token`. That way no client configuration holds
+the token. The installer's setup stores it there; to do it by hand:
 
 macOS (prompts for the token, so it does not land in your shell history):
 
 ```sh
-security add-generic-password -s sevdesk-mcp -a api-token -w
+security add-generic-password -U -s sevdesk-mcp -a api-token -w
 ```
 
-Linux with a Secret Service keyring (GNOME Keyring, KWallet):
+Linux with a Secret Service keyring (GNOME Keyring, KWallet) and `secret-tool`
+(`libsecret-tools` on Debian and Ubuntu):
 
 ```sh
 secret-tool store --label=sevdesk-mcp service sevdesk-mcp account api-token
 ```
 
-The client snippets below start the server through `sh -c` and read the token from the
-macOS keychain. On Linux replace the `security …` call with
-`secret-tool lookup service sevdesk-mcp account api-token`.
+`SEVDESK_API_TOKEN` always wins over the keychain. On systems without a keychain, set it in
+the client's `env` block.
 
 ## Connect your MCP client
 
-All clients start the server as a local process over stdio. The snippets assume the
-installer's default path `~/.local/bin/sevdesk-mcp`. To use npx instead, replace
-`"$HOME/.local/bin/sevdesk-mcp"` with `npx -y @altipard/sevdesk-mcp`.
+All clients start the server as a local process over stdio. The installer's setup writes
+these entries for you; the snippets below are for doing it by hand. Replace
+`/Users/you/.local/bin/sevdesk-mcp` with the absolute path of your binary (`echo
+~/.local/bin/sevdesk-mcp`). To use npx instead, set `"command": "npx"` and
+`"args": ["-y", "@altipard/sevdesk-mcp"]`.
 
 <details>
 <summary>Claude Desktop</summary>
@@ -140,11 +166,8 @@ Settings > Developer > Edit Config opens `claude_desktop_config.json`:
 {
   "mcpServers": {
     "sevdesk": {
-      "command": "sh",
-      "args": [
-        "-c",
-        "SEVDESK_API_TOKEN=\"$(security find-generic-password -s sevdesk-mcp -a api-token -w)\" exec \"$HOME/.local/bin/sevdesk-mcp\""
-      ]
+      "command": "/Users/you/.local/bin/sevdesk-mcp",
+      "env": { "SEVDESK_MODE": "read" }
     }
   }
 }
@@ -160,10 +183,10 @@ Restart Claude Desktop afterwards.
 <br>
 
 ```sh
-claude mcp add sevdesk -- sh -c 'SEVDESK_API_TOKEN="$(security find-generic-password -s sevdesk-mcp -a api-token -w)" exec "$HOME/.local/bin/sevdesk-mcp"'
+claude mcp add --scope user sevdesk --env SEVDESK_MODE=read -- ~/.local/bin/sevdesk-mcp
 ```
 
-Add `--scope user` before `--` to make it available in every project.
+Leave out `--scope user` to register it for the current project only.
 
 </details>
 
@@ -178,11 +201,8 @@ Add `--scope user` before `--` to make it available in every project.
 {
   "mcpServers": {
     "sevdesk": {
-      "command": "sh",
-      "args": [
-        "-c",
-        "SEVDESK_API_TOKEN=\"$(security find-generic-password -s sevdesk-mcp -a api-token -w)\" exec \"$HOME/.local/bin/sevdesk-mcp\""
-      ]
+      "command": "/Users/you/.local/bin/sevdesk-mcp",
+      "env": { "SEVDESK_MODE": "read" }
     }
   }
 }
@@ -195,19 +215,19 @@ Add `--scope user` before `--` to make it available in every project.
 
 <br>
 
-`.vscode/mcp.json` in your workspace, or the user configuration via the command
-"MCP: Open User Configuration":
+```sh
+code --add-mcp '{"name":"sevdesk","type":"stdio","command":"/Users/you/.local/bin/sevdesk-mcp","env":{"SEVDESK_MODE":"read"}}'
+```
+
+Or in `.vscode/mcp.json` in a workspace:
 
 ```json
 {
   "servers": {
     "sevdesk": {
       "type": "stdio",
-      "command": "sh",
-      "args": [
-        "-c",
-        "SEVDESK_API_TOKEN=\"$(security find-generic-password -s sevdesk-mcp -a api-token -w)\" exec \"$HOME/.local/bin/sevdesk-mcp\""
-      ]
+      "command": "/Users/you/.local/bin/sevdesk-mcp",
+      "env": { "SEVDESK_MODE": "read" }
     }
   }
 }
@@ -223,9 +243,8 @@ Without a keychain, VS Code can prompt for the token once and store it securely:
   "servers": {
     "sevdesk": {
       "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@altipard/sevdesk-mcp"],
-      "env": { "SEVDESK_API_TOKEN": "${input:sevdesk-token}" }
+      "command": "/Users/you/.local/bin/sevdesk-mcp",
+      "env": { "SEVDESK_MODE": "read", "SEVDESK_API_TOKEN": "${input:sevdesk-token}" }
     }
   }
 }
@@ -233,8 +252,8 @@ Without a keychain, VS Code can prompt for the token once and store it securely:
 
 </details>
 
-Other settings from [Configuration](#configuration) go into the same `sh -c` line, for
-example `SEVDESK_DENIED_TOOLS=get_report`, or into an `env` block.
+Other settings from [Configuration](#configuration), for example
+`SEVDESK_DENIED_TOOLS=get_report`, go into the same `env` block.
 
 > [!TIP]
 > Ask the assistant to call `get_account_info` first. It checks the connection and tells
@@ -309,7 +328,7 @@ Empty values count as unset.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SEVDESK_API_TOKEN` | required | sevdesk API token. |
+| `SEVDESK_API_TOKEN` | keychain | sevdesk API token. Unset: read from the keychain (service `sevdesk-mcp`, account `api-token`); required if there is none. |
 | `SEVDESK_MODE` | `read` | `read`, `write` or `full`. |
 | `SEVDESK_ALLOWED_TOOLS` | all tools | Comma-separated whitelist of tool names. Only narrows. |
 | `SEVDESK_DENIED_TOOLS` | none | Comma-separated tool names that are never registered. |
@@ -335,9 +354,14 @@ feedback are welcome.
 npm ci
 npm run gen     # apply the spec overlay and generate API types
 npm run check   # gen, lint, typecheck, build, tests
+npm run build:bin   # standalone binary for this machine in out/bin/ (needs bun)
+npm run smoke:bin   # start that binary and check initialize and tools/list, offline
 ```
 
-`npm run check` is what CI runs. Node.js 24 (see `.nvmrc`) is the only tool needed.
+Node.js 24 (see `.nvmrc`) is all `npm run check` needs; `build:bin` compiles with
+[bun](https://bun.sh) and `build:bin:all` builds every release target. CI runs
+`npm run check`, checks the installer under a strict POSIX shell and builds and smoke-tests
+the binary.
 
 <details>
 <summary>live smoke test, spec overlay</summary>
@@ -366,7 +390,12 @@ matches nothing, so an upstream spec change cannot silently drop a correction.
 
 </details>
 
-Commits follow [Conventional Commits](https://www.conventionalcommits.org).
+**Releases.** Commits follow [Conventional Commits](https://www.conventionalcommits.org).
+Every push to `main` runs the release workflow: commitizen derives the next version from
+the commits since the last tag (`fix` → patch, `feat` → minor, breaking change → major;
+other types release nothing). The version lives only in the tag, without a `v` prefix
+(for example `0.2.0`), and is stamped into the build. A release publishes the four binaries
+with `SHA256SUMS` on GitHub and the npm package with provenance.
 
 ## License
 
