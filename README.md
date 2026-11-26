@@ -292,7 +292,7 @@ structured JSON. `get_document_pdf` and `get_report` return the file as an embed
 resource. Which tools are registered depends on the mode (see
 [Security model](#security-model)): `read` offers only the read tools.
 
-**Read tools** (class `R`, available in every mode):
+**Read tools** (available in every mode):
 
 | Tool | What it does |
 | --- | --- |
@@ -399,9 +399,9 @@ strict and every relaxation is an explicit setting.
 > **What holds against a manipulated model.** A confirmation token proves that a preview
 > was fetched for exactly these arguments, not that a human read it: a model following
 > injected instructions can make both calls itself. Elicitation only helps where the
-> client actually asks a human, and an operator release in `SEVDESK_ENABLE_TOOLS` skips
-> that question. The hard limits are the mode and, over HTTP, the token's scopes. Give
-> the server no more than the work needs.
+> client actually asks a human; on clients that cannot ask, the operator release in
+> `SEVDESK_ENABLE_TOOLS` stands in and no human sees the action. The hard limits are the
+> mode and, over HTTP, the token's scopes. Give the server no more than the work needs.
 
 ## Remote (HTTP)
 
@@ -455,20 +455,8 @@ docker compose --profile app up --build
 ```
 
 Missing or invalid variables stop the server at startup with a configuration error that
-names them. Besides the [common variables](#configuration) the HTTP server reads:
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `PORT` | `3000` | Port to bind. |
-| `MCP_RESOURCE_URL` | required | Public URL of the MCP endpoint as clients reach it, and the audience (`aud`) tokens must carry. https; http only for localhost. No query; the path must not be `/healthz` or under `/.well-known/`. |
-| `MCP_ALLOWED_HOSTS` | host of `MCP_RESOURCE_URL` | Comma-separated host names allowed in `Host` and `Origin`, for example behind a reverse proxy. |
-| `OAUTH_ISSUER` | required | Expected `iss` claim, compared as an exact string. https. |
-| `OAUTH_JWKS_URL` | required | Public keys of the authorization server. https. |
-| `OAUTH_ALGORITHMS` | `RS256` | Comma-separated JWS algorithms, asymmetric only (RS, PS, ES and EdDSA families). |
-| `OAUTH_ALLOW_INSECURE_HTTP` | `false` | `true` accepts plain http for `OAUTH_ISSUER` and `OAUTH_JWKS_URL`. Local development only. |
-| `REDIS_URL` | required | `redis://` or `rediss://` URL of the store for confirmation nonces and once-per-target locks. Can carry a password; treat it as a secret. |
-| `SEVDESK_API_TOKEN` | required | As for stdio, but from the environment only. |
-| `SEVDESK_CONFIRM_SECRET` | required | As for stdio, but required: all instances and restarts must accept each other's tokens. |
+names them. The HTTP server reads the [common variables](#configuration) plus
+[its own](#http-transport-only).
 
 ### Redis
 
@@ -510,8 +498,8 @@ at least 20 on Kubernetes.
 ## Configuration
 
 All configuration comes from environment variables; see [`.env.example`](.env.example).
-Empty values count as unset. The variables below apply to both transports; the HTTP
-server needs [a few more](#run-it).
+Empty values count as unset. The first table applies to both transports, the second only
+to the [HTTP transport](#remote-http).
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -527,6 +515,22 @@ server needs [a few more](#run-it).
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. JSON lines on stderr (stdio) or stdout (HTTP); audit events are written at every level. |
 | `SEVDESK_LIVE_TEST_TOKEN` | unset | Live smoke only: token of a sevdesk test account; unset skips the smoke. |
 | `SEVDESK_LIVE_BASE_URL` | `SEVDESK_BASE_URL` default | Live smoke only: https on sevdesk.de or a subdomain. |
+
+### HTTP transport only
+
+Not read by the stdio server. The HTTP server also needs `SEVDESK_API_TOKEN` (from the
+environment, no keychain) and `SEVDESK_CONFIRM_SECRET`.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PORT` | `3000` | Port to bind. |
+| `MCP_RESOURCE_URL` | required | Public URL of the MCP endpoint as clients reach it, and the audience (`aud`) tokens must carry. https; http only for localhost. No query; the path must not be `/healthz` or under `/.well-known/`. |
+| `MCP_ALLOWED_HOSTS` | host of `MCP_RESOURCE_URL` | Comma-separated host names allowed in `Host` and `Origin`, for example behind a reverse proxy. |
+| `OAUTH_ISSUER` | required | Expected `iss` claim, compared as an exact string. https. |
+| `OAUTH_JWKS_URL` | required | Public keys of the authorization server. https. |
+| `OAUTH_ALGORITHMS` | `RS256` | Comma-separated JWS algorithms, asymmetric only (RS, PS, ES and EdDSA families). |
+| `OAUTH_ALLOW_INSECURE_HTTP` | `false` | `true` accepts plain http for `OAUTH_ISSUER` and `OAUTH_JWKS_URL`. Local development only. |
+| `REDIS_URL` | required | `redis://` or `rediss://` URL of the store for confirmation nonces and once-per-target locks. Can carry a password; treat it as a secret. |
 
 ## Status
 
