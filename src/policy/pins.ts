@@ -45,14 +45,34 @@ export function pinQueryParam(name: string, value: unknown): PinnedParam | undef
 interface BodyPin {
   /** Field path inside the JSON body. */
   readonly path: readonly string[];
-  /** Allowed values (compared as numbers); without it the field must be absent or null. */
+  /** Allowed values (compared as numbers); without allow/allowText the field must be absent or null. */
   readonly allow?: readonly number[];
+  /** Allowed string values, compared exactly. */
+  readonly allowText?: readonly string[];
+  /** Why other values are refused, appended to the error. */
+  readonly reason?: string;
 }
 
-const draftOnly = (prefix: readonly string[], draft: number, extra: readonly string[] = []) => [
+// payDate would record a payment on a draft: payments run through the
+// confirmed bookAmount operations instead.
+const draftOnly = (
+  prefix: readonly string[],
+  draft: number,
+  extra: readonly BodyPin[] = [],
+): BodyPin[] => [
   { path: [...prefix, "status"], allow: [draft] },
-  ...["sendDate", "sendType", "enshrined", ...extra].map((field) => ({ path: [...prefix, field] })),
+  ...["sendDate", "sendType", "enshrined", "payDate"].map((field) => ({
+    path: [...prefix, field],
+  })),
+  ...extra,
 ];
+
+/**
+ * Invoice types a draft operation may create. SR (cancellation) and MA
+ * (dunning) have their own flows (cancelInvoice, reminders) with their own
+ * class; creating them as a plain draft would skip those rules.
+ */
+export const DRAFT_INVOICE_TYPES = ["RE", "WKR", "TR", "AR", "ER"] as const;
 
 /**
  * Body fields of W operations that would reach W+ (or X) effects without a
@@ -61,7 +81,13 @@ const draftOnly = (prefix: readonly string[], draft: number, extra: readonly str
  * change drafts; status changes run through their own confirmed operations.
  */
 export const BODY_PINS: Readonly<Partial<Record<OperationId, readonly BodyPin[]>>> = {
-  createInvoiceByFactory: draftOnly(["invoice"], 100),
+  createInvoiceByFactory: draftOnly(["invoice"], 100, [
+    {
+      path: ["invoice", "invoiceType"],
+      allowText: DRAFT_INVOICE_TYPES,
+      reason: "Cancellation (SR) and dunning (MA) invoices run through their own operations.",
+    },
+  ]),
   createcreditNote: draftOnly(["creditNote"], 100),
   createOrder: draftOnly(["order"], 100),
   updateOrder: draftOnly([], 100),
@@ -86,6 +112,13 @@ export function checkBodyPins(operationId: OperationId, body: unknown): void {
     const value = fieldAt(body, pin.path);
     if (value === undefined || value === null) continue;
     const field = pin.path.join(".");
+    if (pin.allowText !== undefined) {
+      if (typeof value === "string" && pin.allowText.includes(value)) continue;
+      throw new PinViolation(
+        `${operationId}: ${field} may only be ${pin.allowText.join(", ")} on this server.` +
+          (pin.reason ? ` ${pin.reason}` : ""),
+      );
+    }
     if (pin.allow === undefined) {
       throw new PinViolation(
         `${operationId}: ${field} must not be set on this server. ` +

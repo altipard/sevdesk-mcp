@@ -184,6 +184,30 @@ describe("body pins", () => {
     expect(() => checkBodyPins("getInvoices", { anything: 1 })).not.toThrow();
   });
 
+  it("limit invoice types of drafts and refuse a pay date on drafts", () => {
+    for (const type of ["RE", "WKR", "TR", "AR", "ER"]) {
+      expect(() =>
+        checkBodyPins("createInvoiceByFactory", { invoice: { invoiceType: type } }),
+      ).not.toThrow();
+    }
+    for (const type of ["SR", "MA", "re", "", 1]) {
+      expect(() =>
+        checkBodyPins("createInvoiceByFactory", { invoice: { invoiceType: type } }),
+      ).toThrow("invoice.invoiceType may only be RE, WKR, TR, AR, ER on this server");
+    }
+    for (const [id, body] of [
+      ["createInvoiceByFactory", { invoice: { payDate: "2026-11-26" } }],
+      ["voucherFactorySaveVoucher", { voucher: { payDate: 1764115200 } }],
+      ["createcreditNote", { creditNote: { payDate: "26.11.2026" } }],
+      ["updateOrder", { payDate: "2026-11-26" }],
+    ] as const) {
+      expect(() => checkBodyPins(id, body), id).toThrow("payDate must not be set");
+    }
+    expect(() =>
+      checkBodyPins("voucherFactorySaveVoucher", { voucher: { status: 50, payDate: null } }),
+    ).not.toThrow();
+  });
+
   it.each([
     [
       "createInvoiceByFactory",
