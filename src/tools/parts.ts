@@ -42,7 +42,8 @@ export const searchParts = defineTool({
   description:
     "Lists parts (Artikel: products and services) with prices, tax rate and stock, filtered " +
     "by part number or name as sevdesk matches them. Use it to look up prices or the part " +
-    "behind an invoice position (partId)." +
+    "behind an invoice position (partId). Prices are in the account's default currency; " +
+    "sevdesk sends no currency per part." +
     FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "getParts",
@@ -80,6 +81,9 @@ export const searchParts = defineTool({
       ...statusOf(raw.status, PART_STATUS),
     }));
     const page = pageOf(args.offset, args.limit, parts.length, totalOf(body));
-    return present({ parts, page }, { summary: pageSummary(page, "parts") });
+    return present(
+      { parts, page },
+      { summary: `${pageSummary(page, "parts")} Prices in the account's default currency.` },
+    );
   },
 });

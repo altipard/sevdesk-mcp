@@ -137,8 +137,10 @@ describe("search_parts", () => {
   it("filters by number and name and maps prices", async () => {
     api.server.use(http.get(sevdeskUrl("/Part"), () => HttpResponse.json(list([part()], 1))));
     const c = await connect();
-    const data = structured<{ parts: unknown[] }>(
-      await c.call("search_parts", { partNumber: "ART-001", name: "Beratung" }),
+    const result = await c.call("search_parts", { partNumber: "ART-001", name: "Beratung" });
+    const data = structured<{ parts: unknown[] }>(result);
+    expect(textOf(result).split("\n")[0]).toBe(
+      "1 of 1 parts (offset 0). Prices in the account's default currency.",
     );
     expect(queryOf(api.requests[0])).toEqual({
       partNumber: "ART-001",
