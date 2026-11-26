@@ -644,6 +644,32 @@ describe("timeouts and deadline", () => {
     );
   });
 
+  it("drops a response whose declared size exceeds the byte limit, without retrying", async () => {
+    let calls = 0;
+    server.use(
+      http.get(url("/Contact"), () => {
+        calls++;
+        return HttpResponse.json({ objects: [{ name: "x".repeat(2000) }] });
+      }),
+    );
+    const { client, sleeps } = setup({ maxResponseBytes: 1000 });
+
+    const error = await captureError(client.call(client.api.GET("/Contact")));
+
+    expect(error.kind).toBe("response_too_large");
+    expect(error.message).toBe(
+      "sevdesk sent more than 1000 bytes; the response was dropped. Narrow the request.",
+    );
+    expect(calls).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  it("accepts a response within the byte limit", async () => {
+    server.use(http.get(url("/Tag"), () => HttpResponse.json({ objects: [] })));
+    const { client } = setup({ maxResponseBytes: 1000 });
+    await expect(client.call(client.api.GET("/Tag"))).resolves.toEqual({ objects: [] });
+  });
+
   it("passes a 204 through without a body", async () => {
     server.use(http.delete(url("/Contact/:id"), () => new HttpResponse(null, { status: 204 })));
     const { client } = setup();

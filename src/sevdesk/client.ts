@@ -22,6 +22,8 @@ export interface SevdeskClientOptions {
   timeoutMs?: number;
   /** Upper bound for one call including all retries and waits. */
   deadlineMs?: number;
+  /** Upper bound for one response body; larger answers are dropped while streaming. */
+  maxResponseBytes?: number;
   retry?: Partial<RetryOptions>;
   logger?: Logger;
   /** Injected in tests so retries do not wait in real time. */
@@ -50,6 +52,7 @@ type ApiResult<T> =
 
 export const DEFAULT_TIMEOUT_MS = 30_000;
 export const DEFAULT_DEADLINE_MS = 60_000;
+export const DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_RETRY: RetryOptions = { maxRetries: 3, baseDelayMs: 500, maxDelayMs: 10_000 };
 
 const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -97,6 +100,7 @@ function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 
 interface FetchPolicy {
   baseUrl: string;
+  maxResponseBytes: number;
   /**
    * The request may have a side effect even if it is a GET (single-attempt
    * client). Failures then carry the "outcome unknown" warning.
@@ -120,17 +124,55 @@ const NULL_BODY_STATUS = new Set([204, 205, 304]);
  * timeout and retry handling as stalled headers instead of surfacing later
  * as a raw DOMException in openapi-fetch.
  */
-async function readFully(response: Response, signal: AbortSignal): Promise<Response> {
+async function readFully(
+  response: Response,
+  signal: AbortSignal,
+  maxBytes: number,
+): Promise<Response> {
   const init = {
     status: response.status,
     statusText: response.statusText,
     headers: response.headers,
   };
-  if (NULL_BODY_STATUS.has(response.status)) {
+  if (NULL_BODY_STATUS.has(response.status) || response.body === null) {
     await response.body?.cancel();
     return new Response(null, init);
   }
-  return new Response(await untilAborted(response.arrayBuffer(), signal), init);
+  const tooLarge = () =>
+    new SevdeskError(
+      "response_too_large",
+      `sevdesk sent more than ${maxBytes} bytes; the response was dropped. Narrow the request.`,
+      { status: response.status },
+    );
+  // Stop before buffering, not after: a declared or streamed size over the
+  // limit ends the read and frees the connection.
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await response.body.cancel();
+    throw tooLarge();
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await untilAborted(reader.read(), signal);
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) throw tooLarge();
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new Response(body, init);
 }
 
 /**
@@ -170,9 +212,12 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
 
       try {
         const raw = await untilAborted(fetch(new Request(request, { signal })), signal);
-        response = await readFully(raw, signal);
+        response = await readFully(raw, signal, policy.maxResponseBytes);
       } catch (error) {
         if (request.signal.aborted) throw error;
+        // Too large is a verdict on the answer, not a transport failure:
+        // retrying would only download it again.
+        if (error instanceof SevdeskError) throw error;
         const kind = timeout.aborted ? "timeout" : "network";
         const delay = backoffDelay(attempt, policy.retry);
         const deadlineHit = canRetry && !fitsDeadline(delay);
@@ -252,6 +297,7 @@ export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClien
   const redact: Redactor = createRedactor([options.token]);
   const policy: FetchPolicy = {
     baseUrl: options.baseUrl,
+    maxResponseBytes: options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
     sideEffects: false,
     timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     deadlineMs: options.deadlineMs ?? DEFAULT_DEADLINE_MS,

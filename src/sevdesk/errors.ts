@@ -12,7 +12,9 @@ export type SevdeskErrorKind =
   | "timeout"
   | "network"
   /** Refused locally by a policy pin; nothing was sent. */
-  | "policy";
+  | "policy"
+  /** The response body exceeded the client's byte limit and was dropped. */
+  | "response_too_large";
 
 export interface SevdeskErrorDetails {
   status?: number;
