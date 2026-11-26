@@ -232,6 +232,88 @@ describe("search_contacts", () => {
     expect(String(data.scan?.note)).toContain("Stopped after looking up 100 contacts");
   });
 
+  describe("includePersons=false beyond the look-up budget", () => {
+    // 130 matching organisations, all found by the e-mail scan (no scan cut-off).
+    const matches = Array.from({ length: 130 }, (_, i) => i);
+    function mockOrganisations() {
+      api.server.use(
+        http.get(sevdeskUrl("/CommunicationWay"), ({ request }) => {
+          const offset = Number(new URL(request.url).searchParams.get("offset"));
+          return HttpResponse.json(
+            list(
+              matches
+                .slice(offset, offset + 100)
+                .map((i) =>
+                  communicationWay({ id: String(i + 1), contact: { id: String(5000 + i) } }),
+                ),
+            ),
+          );
+        }),
+        http.get(sevdeskUrl("/Contact/:id"), ({ params }) =>
+          HttpResponse.json(list([contact({ id: String(params.id) })])),
+        ),
+      );
+    }
+
+    it("says it cannot page further instead of promising more", async () => {
+      mockOrganisations();
+      const c = await connect();
+      const data = structured<Search>(
+        await c.call("search_contacts", {
+          query: "@muster",
+          includePersons: false,
+          offset: 100,
+          limit: 25,
+        }),
+      );
+      expect(data.contacts).toEqual([]);
+      expect(data.page).toMatchObject({ offset: 100, count: 0, total: null, hasMore: false });
+      expect(data.scan).toMatchObject({ truncated: true });
+      expect(String(data.scan?.note)).toContain("Stopped after looking up 100 contacts");
+      expect(String(data.scan?.note)).toContain("cannot be paged to");
+      expect(String(data.scan?.note)).toContain("Narrow the query");
+    });
+
+    it("returns the reachable part of a page that straddles the budget", async () => {
+      mockOrganisations();
+      const c = await connect();
+      const data = structured<Search>(
+        await c.call("search_contacts", {
+          query: "@muster",
+          includePersons: false,
+          offset: 90,
+          limit: 25,
+        }),
+      );
+      expect(data.contacts).toHaveLength(10);
+      expect(data.page).toMatchObject({ count: 10, hasMore: false });
+      expect(data.scan).toMatchObject({ truncated: true });
+    });
+
+    it("still reports more when the next page is within the budget", async () => {
+      mockOrganisations();
+      const c = await connect();
+      const data = structured<Search>(
+        await c.call("search_contacts", { query: "@muster", includePersons: false, limit: 25 }),
+      );
+      expect(data.contacts).toHaveLength(25);
+      expect(data.page).toMatchObject({ hasMore: true });
+      expect(data.scan).toMatchObject({ truncated: false });
+    });
+
+    it("offers no next page when the page fills on the last allowed look-up", async () => {
+      mockOrganisations();
+      const c = await connect();
+      const data = structured<Search>(
+        await c.call("search_contacts", { query: "@muster", includePersons: false, limit: 100 }),
+      );
+      // 100 look-ups fill the page; 30 matches remain but cannot be reached.
+      expect(data.contacts).toHaveLength(100);
+      expect(data.page).toMatchObject({ hasMore: false });
+      expect(data.scan).toMatchObject({ truncated: true });
+    });
+  });
+
   it("rejects query and customerNumber together, and short queries", async () => {
     const c = await connect();
     const both = await c.call("search_contacts", { query: "ab", customerNumber: "1" });

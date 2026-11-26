@@ -207,10 +207,7 @@ async function searchByEmail(
     let eligible = 0;
     let index = 0;
     for (; index < ids.length && contacts.length < args.limit; index++) {
-      if (fetches >= MAX_EMAIL_CONTACT_FETCHES) {
-        fetchCapped = true;
-        break;
-      }
+      if (fetches >= MAX_EMAIL_CONTACT_FETCHES) break;
       const contactId = ids[index] as number;
       fetches++;
       const raw = await contactOrMissing(call, contactId);
@@ -225,9 +222,13 @@ async function searchByEmail(
         contacts.push({ ...summary, matchedEmail: scan.byContact.get(contactId) as string });
       }
     }
+    // Every call walks the matches from the start with the same fetch
+    // budget, so a later offset reaches nothing this walk did not: once the
+    // budget is spent, matches left over cannot be paged to.
+    fetchCapped = index < ids.length && fetches >= MAX_EMAIL_CONTACT_FETCHES;
     page = {
       ...pageOf(args.offset, args.limit, contacts.length, null),
-      hasMore: index < ids.length,
+      hasMore: index < ids.length && !fetchCapped,
     };
   }
 
@@ -236,7 +237,8 @@ async function searchByEmail(
       `Checked the first ${scan.checked} e-mail addresses only; later ones may match too. ` +
         "Use a more specific query or search by name or customer number.",
     fetchCapped &&
-      `Stopped after looking up ${MAX_EMAIL_CONTACT_FETCHES} contacts; raise offset for more.`,
+      `Stopped after looking up ${MAX_EMAIL_CONTACT_FETCHES} contacts; further matches cannot be ` +
+        "paged to with includePersons=false. Narrow the query or set includePersons=true.",
     missing > 0 && `${missing} matching contacts no longer exist in sevdesk and were skipped.`,
   ].filter((note): note is string => typeof note === "string");
   return {
