@@ -62,9 +62,17 @@ describe("buildRequest", () => {
   it("caps limit at the maximum and reports it", () => {
     const capped = build("getInvoices", { limit: 500 });
     expect(capped.path).toBe(`/Invoice?limit=${MAX_LIMIT}`);
-    expect(capped.appliedDefaults).toEqual({ limit: MAX_LIMIT });
+    expect(capped.appliedDefaults).toEqual({});
+    expect(capped.clampedParams).toEqual({
+      limit: {
+        requested: 500,
+        applied: MAX_LIMIT,
+        note: `limit is at most ${MAX_LIMIT} on this server; page with offset for more.`,
+      },
+    });
     const exact = build("getInvoices", { limit: MAX_LIMIT });
     expect(exact.appliedDefaults).toEqual({});
+    expect(exact.clampedParams).toEqual({});
     expect(build("getInvoicePositionsById", { invoiceId: 1, limit: "1000" }).params.limit).toBe(
       MAX_LIMIT,
     );

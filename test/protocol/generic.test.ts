@@ -147,6 +147,24 @@ describe("sevdesk_api_request requests", () => {
     expect(c.audit()).toEqual([]);
   });
 
+  it("reports a lowered limit as clampedParams, not as a default", async () => {
+    api.use(http.get(`${MOCK_BASE_URL}/Invoice`, () => HttpResponse.json({ objects: [] })));
+    const c = await open();
+    const result = await call(c, { operationId: "getInvoices", params: { limit: 1000 } });
+    expect(body(result)).toEqual({
+      operationId: "getInvoices",
+      clampedParams: {
+        limit: {
+          requested: 1000,
+          applied: 100,
+          note: "limit is at most 100 on this server; page with offset for more.",
+        },
+      },
+      data: { objects: [] },
+    });
+    expect(seen.map((r) => r.url)).toEqual([`${MOCK_BASE_URL}/Invoice?limit=100`]);
+  });
+
   it("rejects injection attempts before any request", async () => {
     const c = await open();
     for (const params of [

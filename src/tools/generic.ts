@@ -100,13 +100,22 @@ export interface BuiltRequest {
   /** Encoded path plus query, relative to the base URL. */
   readonly path: string;
   readonly targetId: string | undefined;
+  /** Values filled in because the caller left them out (default limit). */
   readonly appliedDefaults: Readonly<Record<string, unknown>>;
+  /** Values the caller set but the server lowered, with the reason. */
+  readonly clampedParams: Readonly<Record<string, ClampedParam>>;
   /**
    * Parameters in canonical form (numbers and booleans typed, "042" -> 42),
    * as sent. Confirmation tokens and idempotency keys are derived from these,
    * so different spellings of the same ID cannot dodge them.
    */
   readonly params: Readonly<Record<string, unknown>>;
+}
+
+export interface ClampedParam {
+  readonly requested: unknown;
+  readonly applied: unknown;
+  readonly note: string;
 }
 
 const fail = (message: string): never => {
@@ -255,6 +264,7 @@ export function buildRequest(
 
   const values: Record<string, unknown> = {};
   const appliedDefaults: Record<string, unknown> = {};
+  const clampedParams: Record<string, ClampedParam> = {};
   for (const spec of operation.params) {
     let value = params[spec.name];
     if (spec.in === "query") {
@@ -274,8 +284,12 @@ export function buildRequest(
         appliedDefaults.limit = DEFAULT_LIMIT;
       } else if (Number(value) > MAX_LIMIT) {
         // Larger pages would only be cut by the size bound afterwards.
+        clampedParams.limit = {
+          requested: value,
+          applied: MAX_LIMIT,
+          note: `limit is at most ${MAX_LIMIT} on this server; page with offset for more.`,
+        };
         value = MAX_LIMIT;
-        appliedDefaults.limit = MAX_LIMIT;
       }
     }
     if (value === undefined || value === null) {
@@ -327,6 +341,7 @@ export function buildRequest(
     path: relative,
     targetId,
     appliedDefaults,
+    clampedParams,
     params: values,
   };
 }
@@ -502,6 +517,9 @@ export function registerGenericTool(env: RegistrationEnv): RegisteredTool | unde
             operationId,
             ...(Object.keys(built.appliedDefaults).length > 0 && {
               appliedDefaults: built.appliedDefaults,
+            }),
+            ...(Object.keys(built.clampedParams).length > 0 && {
+              clampedParams: built.clampedParams,
             }),
             ...shapeResponse(data),
           };
