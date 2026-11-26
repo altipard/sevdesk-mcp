@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { Logger } from "../logger.js";
 import type { StrictToolAnnotations, ToolCall } from "../policy/registry.js";
 import { SevdeskError } from "../sevdesk/errors.js";
 import {
@@ -654,4 +655,226 @@ export function invoiceLabel(invoice: InvoiceState): string {
 export function money(value: number | null, currency: string | null): string {
   if (value === null) return "unknown amount";
   return /^[A-Z]{3}$/.test(currency ?? "") ? `${value} ${currency}` : String(value);
+}
+
+// ---------------------------------------------------------------------------
+// Status changes and irreversible actions (shared by the voucher and
+// document tools; invoice-actions.ts keeps its own copies for now)
+
+/** Changes a status; the same call twice leaves the same state. */
+export const STATUS_CHANGE_ANNOTATIONS: StrictToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: true,
+  openWorldHint: true,
+};
+
+/** Cannot be undone; a second run is refused, not repeated. */
+export const IRREVERSIBLE_ANNOTATIONS: StrictToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: true,
+};
+
+/**
+ * The handler result checked against its schema. The action has already
+ * happened at this point, so a mismatch is logged and the result returned
+ * anyway: an error here would invite a second booking.
+ */
+export function shapedOutput<S extends z.ZodType>(
+  schema: S,
+  value: z.infer<S>,
+  logger: Logger,
+  tool: string,
+): z.infer<S> {
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) logger.error("tool output does not match its schema", { tool });
+  return parsed.success ? parsed.data : value;
+}
+
+/** One line of free text for an approval question; line breaks could fake extra lines. */
+export function oneLineText(value: string | null, max = 200): string {
+  const flat = (value ?? "").replace(/\s+/g, " ").trim();
+  if (flat.length <= max) return flat;
+  return max <= 0 ? "" : `${flat.slice(0, max - 1)}…`;
+}
+
+// ---------------------------------------------------------------------------
+// Payments (bookAmount)
+
+/** Booking types sevdesk accepts; CF (currency fluctuation) is no longer supported. */
+export const PAYMENT_TYPES = ["FULL_PAYMENT", "N", "CB", "O", "OF", "MTC"] as const;
+export type PaymentType = (typeof PAYMENT_TYPES)[number];
+
+/** Whether the amount has at most two decimals (whole cents). */
+export const wholeCents = (value: number) => Math.abs(value * 100 - Math.round(value * 100)) < 1e-6;
+
+/** Payment amount input: positive, at most two decimals. */
+export const paymentAmountInput = z
+  .number()
+  .positive()
+  .max(1_000_000_000)
+  .refine(wholeCents, { error: "must have at most two decimal places" });
+
+/**
+ * Hint when the chosen type does not fit the amount and the open amount.
+ * Only a warning: which type is right is the bookkeeper's decision.
+ */
+export function paymentTypeMismatch(
+  type: PaymentType,
+  paid: number,
+  open: number | null,
+): string | undefined {
+  if (open === null) return undefined;
+  const diff = cents(paid - open);
+  if (type === "FULL_PAYMENT" && diff !== 0) {
+    return `FULL_PAYMENT expects the open amount (${open}), not ${paid}; use N for a partial payment, CB, MTC or O for a reduced amount, OF for reminder fees.`;
+  }
+  if (type === "N" && diff >= 0) {
+    return `N books a partial payment, but ${paid} covers the open amount of ${open}; FULL_PAYMENT may fit better.`;
+  }
+  if ((type === "CB" || type === "MTC") && diff >= 0) {
+    return `${type} is for a payment below the open amount (${open}), not ${paid}.`;
+  }
+  if (type === "OF" && diff <= 0) {
+    return `OF is for a payment above the open amount (${open}) because of reminder fees, not ${paid}.`;
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Voucher tax rules and booking accounts (from the "Tax Rules" section of the spec)
+
+/** Expense tax rules (sevdesk-Update 2.0) for debit vouchers. */
+export const EXPENSE_TAX_RULES: Readonly<Record<number, TaxRuleInfo>> = {
+  8: { name: "Innergemeinschaftliche Erwerbe", rates: [0, 7, 19] },
+  9: { name: "Vorsteuerabziehbare Aufwendungen", rates: [0, 7, 19] },
+  10: { name: "Nicht vorsteuerabziehbare Aufwendungen", rates: [0] },
+  12: { name: "Reverse Charge gem. §13b Abs. 2 UStG mit Vorsteuerabzug", rates: [0] },
+  13: { name: "Reverse Charge gem. §13b UStG ohne Vorsteuerabzug", rates: [0] },
+  14: { name: "Reverse Charge gem. §13b Abs. 1 EU Umsätze", rates: [0] },
+};
+
+/** Revenue tax rules a credit voucher may use; 18-21 are documented as not for vouchers. */
+export const VOUCHER_REVENUE_TAX_RULES: Readonly<Record<number, TaxRuleInfo>> = Object.fromEntries(
+  [1, 2, 3, 4, 5, 11, 17].map((id) => [id, REVENUE_TAX_RULES[id] as TaxRuleInfo]),
+);
+
+export const VOUCHER_TAX_RULE_IDS = [
+  ...Object.keys(EXPENSE_TAX_RULES),
+  ...Object.keys(VOUCHER_REVENUE_TAX_RULES),
+]
+  .map(Number)
+  .sort((a, b) => a - b);
+
+export interface VoucherTaxPosition {
+  readonly accountDatevId: number;
+  readonly taxRate: number;
+}
+
+/**
+ * Checks tax rule, booking accounts and rates of a voucher before anything
+ * is sent: first against the documented rules for debit (expense) or
+ * credit (revenue) vouchers, then per position against the account's
+ * ReceiptGuidance entry (account allowed, tax rule allowed with it, rate
+ * allowed with that rule). If the guidance cannot be read, the documented
+ * rules alone decide and a warning says that the accounts are unchecked.
+ */
+export async function checkVoucherTax(
+  { sevdesk }: ToolCall,
+  creditDebit: "C" | "D",
+  taxRule: number,
+  positions: readonly VoucherTaxPosition[],
+  warnings: string[],
+): Promise<TaxCheck> {
+  const kind = creditDebit === "D" ? "expense" : "revenue";
+  const table = creditDebit === "D" ? EXPENSE_TAX_RULES : VOUCHER_REVENUE_TAX_RULES;
+  const rule = table[taxRule];
+  if (rule === undefined) {
+    throw badInput(
+      `Tax rule ${taxRule} is not a ${kind} tax rule sevdesk documents for vouchers ` +
+        `(creditDebit ${creditDebit}). Allowed: ${Object.keys(table).join(", ")}.`,
+    );
+  }
+  const used = [...new Set(positions.map((p) => p.taxRate))].sort((a, b) => a - b);
+  const documented = rule.rates;
+  if (documented !== null) {
+    const wrong = used.filter((rate) => !documented.includes(rate));
+    if (wrong.length > 0) {
+      throw badInput(
+        `Tax rule ${taxRule} (${rule.name}) allows tax rates ${ratesText(documented)} in ` +
+          `positions, not ${ratesText(wrong)}.`,
+      );
+    }
+  }
+  const fallback = (why: string): TaxCheck => {
+    warnings.push(
+      `${why}; tax rule and rates were checked against the documented sevdesk rules only, ` +
+        "the booking accounts were not checked.",
+    );
+    return { id: taxRule, name: rule.name, checkedAgainst: "documented_rules" };
+  };
+
+  let body: unknown;
+  try {
+    body = await sevdesk.call(
+      creditDebit === "D"
+        ? sevdesk.api.GET("/ReceiptGuidance/forExpense")
+        : sevdesk.api.GET("/ReceiptGuidance/forRevenue"),
+    );
+  } catch (error) {
+    if (error instanceof SevdeskError && error.kind !== "policy") {
+      return fallback(`sevdesk's tax guidance could not be read (${error.kind})`);
+    }
+    throw error;
+  }
+  // Account -> rule ID -> rates sevdesk allows; null where a rate name is unknown.
+  const accounts = new Map<number, Map<number, Set<number> | null>>();
+  for (const entry of objectsOf(body)) {
+    const accountId = integer(entry.accountDatevId);
+    if (accountId === null) continue;
+    const rules = accounts.get(accountId) ?? new Map<number, Set<number> | null>();
+    for (const raw of Array.isArray(entry.allowedTaxRules) ? entry.allowedTaxRules : []) {
+      const ruleEntry = asRecord(raw);
+      const id = integer(ruleEntry.id);
+      if (id === null) continue;
+      const rates = new Set<number>();
+      let readable = true;
+      for (const name of Array.isArray(ruleEntry.taxRates) ? ruleEntry.taxRates : []) {
+        const rate = typeof name === "string" ? GUIDANCE_RATES[name] : undefined;
+        if (rate === undefined) readable = false;
+        else rates.add(rate);
+      }
+      rules.set(id, readable ? rates : null);
+    }
+    accounts.set(accountId, rules);
+  }
+  if (accounts.size === 0) return fallback(`sevdesk's tax guidance listed no ${kind} accounts`);
+
+  for (const [index, position] of positions.entries()) {
+    const label = `Position ${index + 1}`;
+    const rules = accounts.get(position.accountDatevId);
+    if (rules === undefined) {
+      throw badInput(
+        `${label}: account ${position.accountDatevId} is not an allowed ${kind} account in ` +
+          `this sevdesk account's tax guidance (see get_tax_guidance with scope ${kind}).`,
+      );
+    }
+    if (!rules.has(taxRule)) {
+      const allowed = [...rules.keys()].sort((a, b) => a - b);
+      throw badInput(
+        `${label}: sevdesk does not allow tax rule ${taxRule} (${rule.name}) with account ` +
+          `${position.accountDatevId}. Allowed with it: ${allowed.length > 0 ? allowed.join(", ") : "none"}.`,
+      );
+    }
+    const rates = rules.get(taxRule);
+    if (rates !== null && rates !== undefined && rates.size > 0 && !rates.has(position.taxRate)) {
+      throw badInput(
+        `${label}: sevdesk allows tax rates ${ratesText([...rates].sort((a, b) => a - b))} with ` +
+          `tax rule ${taxRule} and account ${position.accountDatevId}, not ${position.taxRate} %.`,
+      );
+    }
+  }
+  return { id: taxRule, name: rule.name, checkedAgainst: "guidance" };
 }
