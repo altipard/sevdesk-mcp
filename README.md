@@ -43,7 +43,7 @@ with compact answers, plus a guarded fallback for everything else.
 
 ## Install
 
-You need a sevdesk API token (in sevdesk under Settings > Users, 32 hex characters).
+You need a sevdesk API token (32 hex characters; sevdesk issues one per administrator).
 Pick one of the following.
 
 **Installer** (macOS and Linux, x64 and arm64): downloads the release binary for your
@@ -74,7 +74,7 @@ npx -y @altipard/sevdesk-mcp
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.sh \
-  | INSTALL_DIR=/usr/local/bin SEVDESK_MCP_VERSION=0.2.0 sh
+  | INSTALL_DIR="$HOME/bin" SEVDESK_MCP_VERSION=0.2.0 sh
 ```
 
 **Manual download.** Every release carries `sevdesk-mcp-<os>-<arch>` for `darwin-arm64`,
@@ -319,12 +319,14 @@ Empty values count as unset.
 | `SEVDESK_CONFIRM_TTL_SECONDS` | `300` | Lifetime of a confirmation token, 30 to 3600 seconds. |
 | `SEVDESK_BASE_URL` | `https://my.sevdesk.de/api/v1` | API base URL. https only, http only for localhost. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Logs go to stderr as JSON lines. |
+| `SEVDESK_LIVE_TEST_TOKEN` | unset | Live smoke only: token of a sevdesk test account; unset skips the smoke. |
+| `SEVDESK_LIVE_BASE_URL` | `SEVDESK_BASE_URL` default | Live smoke only: https on sevdesk.de or a subdomain. |
 
 ## Status
 
 Early release. The read tools, the policy layer and the fallback are covered by unit and
-protocol tests against a mocked sevdesk API, and a read-only smoke test runs them against
-a real sevdesk test account. Write tools and the HTTP transport are next. Issues and
+protocol tests against a mocked sevdesk API; a manual, read-only smoke test can run them
+against a real sevdesk test account. Write tools and the HTTP transport are next. Issues and
 feedback are welcome.
 
 ## Development
