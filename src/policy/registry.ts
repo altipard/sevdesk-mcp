@@ -8,7 +8,13 @@ import { CONFIRMATION_TOKEN_DESCRIPTION, runGuarded, type ToolOutput } from "./g
 import type { OperationId } from "./operations.js";
 import { allows, type Rights } from "./rights.js";
 import type { RequestPolicy } from "./runtime.js";
-import { createScopeGate, scopeProblems, toolScope } from "./scope.js";
+import {
+  type ClientScope,
+  createScopeGate,
+  previewScope,
+  scopeProblems,
+  toolScope,
+} from "./scope.js";
 
 export interface ToolDeps {
   readonly config: Config;
@@ -171,6 +177,37 @@ const stringId = (value: string | number | undefined) =>
   value === undefined ? undefined : String(value);
 
 /**
+ * The configuration as tools see it: without the API token and the
+ * confirmation secret. Only the client and the policy runtime need them,
+ * and both are built before any tool runs.
+ */
+export function configForTools(config: Config): Config {
+  const copy: Config = { ...config, sevdeskApiToken: "" };
+  delete copy.confirmSecret;
+  return Object.freeze(copy);
+}
+
+/** `client` restricted to `scope`, with denials audited for this policy. */
+export function scopedClient(
+  client: SevdeskClient,
+  scope: ClientScope,
+  policy: RequestPolicy,
+  logger: Logger,
+): SevdeskClient {
+  return restrictClient(
+    client,
+    createScopeGate({
+      scope,
+      rights: policy.rights,
+      baseUrl: policy.config.baseUrl,
+      subject: policy.subject,
+      audit: policy.runtime.audit,
+      logger,
+    }),
+  );
+}
+
+/**
  * The one way tools get onto the server. Tools above the effective rights
  * or excluded by the lists are not registered at all; every registered tool
  * runs through the guard, which re-checks rights at call time.
@@ -180,6 +217,7 @@ export function registerTools(
   definitions: readonly ToolDefinition[],
 ): string[] {
   const { server, policy, deps } = env;
+  const config = configForTools(deps.config);
   const registered: string[] = [];
   for (const definition of definitions) {
     if (!isToolEnabled(policy.config, policy.rights, definition)) continue;
@@ -190,18 +228,10 @@ export function registerTools(
       throw new ToolDefinitionError(`tool ${definition.name}: ${problems.join("; ")}`);
     }
     // The handler only ever sees this client: requests outside the tool's
-    // declared operations and class are refused and audited.
-    const sevdesk = restrictClient(
-      deps.sevdesk,
-      createScopeGate({
-        scope: toolScope(definition),
-        rights: policy.rights,
-        baseUrl: policy.config.baseUrl,
-        subject: policy.subject,
-        audit: policy.runtime.audit,
-        logger: deps.logger,
-      }),
-    );
+    // declared operations and class are refused and audited. A preview runs
+    // before the confirmation and therefore only reads.
+    const sevdesk = scopedClient(deps.sevdesk, toolScope(definition), policy, deps.logger);
+    const previewClient = scopedClient(deps.sevdesk, previewScope(definition), policy, deps.logger);
     const confirm = needsConfirmation(definition.class);
     const inputSchema = confirm
       ? definition.inputSchema.extend({
@@ -225,7 +255,8 @@ export function registerTools(
       async (input: Record<string, unknown>, ctx: ServerContext) => {
         const { confirmation_token: token, ...rest } = input;
         const args = (confirm ? rest : input) as z.infer<typeof definition.inputSchema>;
-        const call: ToolCall = { ...deps, sevdesk, ctx };
+        const call: ToolCall = { ...deps, config, sevdesk, ctx };
+        const previewCall: ToolCall = { ...call, sevdesk: previewClient };
         return runGuarded({ policy, server, logger: deps.logger }, ctx, {
           key: definition.name,
           tool: definition.name,
@@ -237,7 +268,8 @@ export function registerTools(
           explicitlyAllowed: isExplicitlyEnabled(policy.config, definition.name),
           summary: definition.summary?.(args) ?? `Run ${definition.name}.`,
           preview:
-            definition.preview && (() => definition.preview?.(args, call) ?? Promise.resolve({})),
+            definition.preview &&
+            (() => definition.preview?.(args, previewCall) ?? Promise.resolve({})),
           execute: () => definition.handler(args, call),
         });
       },

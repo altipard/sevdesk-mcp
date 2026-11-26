@@ -1,4 +1,5 @@
 import type { Logger } from "../logger.js";
+import type { RequestGate } from "../sevdesk/client.js";
 import { SevdeskError } from "../sevdesk/errors.js";
 import type { AuditLog } from "./audit.js";
 import { classOf, OPERATION_CLASSES, type OperationClass } from "./classification.js";
@@ -15,8 +16,12 @@ import { allows, type Rights } from "./rights.js";
 export interface ClientScope {
   /** Tool name, for messages and audit events. */
   readonly tool: string;
-  /** Declared class of the tool: no operation above it is sent. */
+  /** Declared class of the tool, recorded in audit events. */
   readonly class: OperationClass;
+  /** Highest class sent; the tool's class unless narrowed (previews: R). */
+  readonly ceiling?: OperationClass | undefined;
+  /** Set for the client of a confirmation preview, which only reads. */
+  readonly stage?: "preview" | undefined;
   /** Operations the tool declared; everything else is refused. */
   readonly operations: ReadonlySet<OperationId>;
 }
@@ -98,7 +103,7 @@ export function checkRequest(
     operationId,
     class: operationClass,
   });
-  if (!classWithin(operationClass, scope.class)) return denied("class_exceeded");
+  if (!classWithin(operationClass, scope.ceiling ?? scope.class)) return denied("class_exceeded");
   if (!allows(rights, operationClass)) return denied("rights_exceeded");
   if (!scope.operations.has(operationId)) return denied("not_declared");
   return { ok: true, operationId, class: operationClass };
@@ -117,12 +122,18 @@ export function denialMessage(
     outside_base_url: "it does not go to the configured sevdesk API",
     unmapped: "it does not match any operation of the sevdesk API spec",
     unclassified: "the operation is not classified",
-    class_exceeded: `the tool is declared as class ${scope.class}`,
+    class_exceeded:
+      scope.stage === "preview"
+        ? "a preview only reads (class R) before the confirmation"
+        : `the tool is declared as class ${scope.ceiling ?? scope.class}`,
     rights_exceeded: "the effective rights (SEVDESK_MODE and token scopes) do not allow it",
     not_declared: "the operation is not declared for this tool",
   };
-  return `${scope.tool} may not call ${operation}: ${why[decision.reason]}. Nothing was sent to sevdesk.`;
+  return `${caller(scope)} may not call ${operation}: ${why[decision.reason]}. Nothing was sent to sevdesk.`;
 }
+
+const caller = (scope: ClientScope) =>
+  scope.stage === "preview" ? `${scope.tool} (preview)` : scope.tool;
 
 export interface GateEnv {
   readonly scope: ClientScope;
@@ -138,29 +149,44 @@ export interface GateEnv {
  * an audit entry, for every request outside the scope. Runs before the
  * request is sent; a failing audit sink still denies.
  */
-export function createScopeGate(env: GateEnv): (request: Request) => void {
-  return (request) => {
-    const decision = checkRequest(env.scope, env.rights, env.baseUrl, request.method, request.url);
-    if (decision.ok) return;
+export function createScopeGate(env: GateEnv): RequestGate {
+  const deny = (method: string, reason: string, operationId: OperationId | undefined): void => {
     env.logger.warn("sevdesk request outside the tool scope", {
       tool: env.scope.tool,
-      method: request.method,
-      operationId: decision.operationId,
-      reason: decision.reason,
+      stage: env.scope.stage,
+      method,
+      operationId,
+      reason,
     });
     try {
       env.audit.record({
         subject: env.subject,
         tool: env.scope.tool,
-        operationId: decision.operationId,
+        operationId,
         class: env.scope.class,
         outcome: "denied",
-        reason: `client_scope:${decision.reason}`,
+        reason: `client_scope:${env.scope.stage === "preview" ? "preview:" : ""}${reason}`,
       });
     } catch (error) {
       env.logger.error("audit sink failed", { tool: env.scope.tool, outcome: "denied", error });
     }
-    throw new SevdeskError("policy", denialMessage(env.scope, request.method, decision));
+  };
+  return {
+    check(request) {
+      const decision = checkRequest(
+        env.scope,
+        env.rights,
+        env.baseUrl,
+        request.method,
+        request.url,
+      );
+      if (decision.ok) return;
+      deny(request.method, decision.reason, decision.operationId);
+      throw new SevdeskError("policy", denialMessage(env.scope, request.method, decision));
+    },
+    callRefused(method, option) {
+      deny(method, `call_override:${option}`, undefined);
+    },
   };
 }
 
@@ -178,6 +204,21 @@ export function toolScope(tool: {
       ...(tool.operationId ? [tool.operationId] : []),
       ...(tool.operations ?? []),
     ]),
+  };
+}
+
+/**
+ * Scope of a W+/X tool's confirmation preview: only the class-R operations
+ * of its declaration. Nothing is written before the confirmation, not even
+ * the tool's own operation.
+ */
+export function previewScope(tool: Parameters<typeof toolScope>[0]): ClientScope {
+  const full = toolScope(tool);
+  return {
+    ...full,
+    ceiling: "R",
+    stage: "preview",
+    operations: new Set([...full.operations].filter((id) => classOf(id) === "R")),
   };
 }
 

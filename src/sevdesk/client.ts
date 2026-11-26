@@ -111,11 +111,16 @@ function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
-/**
- * Check run on every outgoing request before anything is sent. Throws to
- * refuse it (a SevdeskError of kind "policy").
- */
-export type RequestGate = (request: Request) => void;
+/** Checks of a restricted client. */
+export interface RequestGate {
+  /**
+   * Runs on every outgoing request before anything is sent. Throws to
+   * refuse it (a SevdeskError of kind "policy").
+   */
+  check(request: Request): void;
+  /** Told when a call is refused before a request exists (per-call overrides). */
+  callRefused(method: string, option: string): void;
+}
 
 interface FetchPolicy {
   baseUrl: string;
@@ -218,7 +223,7 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
   return async (original) => {
     // The scope of a restricted client comes first: a request outside it
     // is refused before pins, retries or the network see it.
-    for (const gate of policy.gates) gate(original);
+    for (const gate of policy.gates) gate.check(original);
     // Pins (preventSendBy, enshrine flags) hold for every caller of the
     // client, not only for the fallback that checks them up front.
     let request: Request;
@@ -354,11 +359,12 @@ const CALL_METHODS = ["GET", "PUT", "POST", "DELETE", "OPTIONS", "HEAD", "PATCH"
  * The call options as a plain copy, read once, so a getter cannot show one
  * value here and another to openapi-fetch.
  */
-function refuseOverrides(init: unknown): unknown {
+function refuseOverrides(gates: readonly RequestGate[], method: string, init: unknown): unknown {
   if (typeof init !== "object" || init === null) return init;
   const copy: Record<string, unknown> = { ...init };
   for (const option of FORBIDDEN_CALL_OPTIONS) {
     if (copy[option] !== undefined) {
+      for (const gate of gates) gate.callRefused(method.toUpperCase(), option);
       throw new SevdeskError(
         "policy",
         `The per-call option "${option}" is not allowed on the sevdesk client. Nothing was sent.`,
@@ -369,13 +375,13 @@ function refuseOverrides(init: unknown): unknown {
 }
 
 /** The openapi-fetch client with per-call fetch/Request overrides refused. */
-function sealApi(api: SevdeskApi): SevdeskApi {
+function sealApi(api: SevdeskApi, gates: readonly RequestGate[]): SevdeskApi {
   const sealed: Record<string, unknown> = {
     request: (method: string, url: string, init?: unknown) => {
       return (api.request as (m: string, u: string, i?: unknown) => unknown)(
         method,
         url,
-        refuseOverrides(init),
+        refuseOverrides(gates, String(method), init),
       );
     },
     use: api.use.bind(api),
@@ -384,7 +390,7 @@ function sealApi(api: SevdeskApi): SevdeskApi {
   for (const name of CALL_METHODS) {
     const call = api[name] as (url: string, init?: unknown) => unknown;
     sealed[name] = (url: string, init?: unknown) => {
-      return call(url, refuseOverrides(init));
+      return call(url, refuseOverrides(gates, name, init));
     };
   }
   return Object.freeze(sealed) as unknown as SevdeskApi;
@@ -438,6 +444,7 @@ export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClien
         },
         fetch: createPolicyFetch(fetchPolicy),
       }),
+      fetchPolicy.gates,
     );
 
   async function call<T>(request: Promise<ApiResult<T>>): Promise<T> {

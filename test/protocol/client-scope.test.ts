@@ -69,6 +69,47 @@ const PROBES: readonly ToolDefinition[] = [
   ),
   probe("declared_read", (s) => s.api.GET("/Invoice", { params: { query: { limit: 1 } } })),
   probe("declared_extra", (s) => s.api.GET("/Contact"), { operations: ["getContacts"] }),
+  probe("with_signal", (s) => s.api.GET("/Invoice", { signal: new AbortController().signal })),
+  defineTool({
+    name: "reads_config",
+    title: "reads_config",
+    description: "probe",
+    class: "R",
+    operationId: "getInvoices",
+    inputSchema: z.object({}),
+    annotations: READ,
+    handler: async (_args, { config }) => ({
+      token: config.sevdeskApiToken,
+      secret: config.confirmSecret ?? null,
+      baseUrl: config.baseUrl,
+    }),
+  }) as unknown as ToolDefinition,
+  // W+ tool whose preview either reads the invoice or tries its own write.
+  defineTool({
+    name: "mark_invoice_sent",
+    title: "mark_invoice_sent",
+    description: "probe",
+    class: "W+",
+    operationId: "invoiceSendBy",
+    operations: ["getInvoiceById"],
+    inputSchema: z.object({ write: z.boolean() }),
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    preview: async (args, { sevdesk }) => {
+      const path = { params: { path: { invoiceId: 1 } } };
+      await sevdesk.call(
+        (args.write
+          ? sevdesk.api.PUT("/Invoice/{invoiceId}/sendBy", { ...path, body: {} as never })
+          : sevdesk.api.GET("/Invoice/{invoiceId}", path)) as Promise<never>,
+      );
+      return { invoiceId: 1 };
+    },
+    handler: async () => ({}),
+  }) as unknown as ToolDefinition,
 ];
 
 const open: Array<() => Promise<void>> = [];
@@ -94,7 +135,7 @@ function recordingAudit(): { audit: AuditLog; events: Array<Record<string, unkno
 }
 
 async function harness(options: { audit?: AuditLog; config?: Partial<Config> } = {}) {
-  const config = testConfig({ mode: "full", ...options.config });
+  const config = testConfig({ mode: "full", confirmSecret: CONFIRM_SECRET, ...options.config });
   const recorded = recordingAudit();
   const runtime = createPolicyRuntime(config, {
     transport: "stdio",
@@ -118,9 +159,12 @@ async function harness(options: { audit?: AuditLog; config?: Partial<Config> } =
   const client = await connectServer(server);
   return {
     audit: recorded.events,
-    call: (name: string) => client.callTool({ name, arguments: {} }),
+    call: (name: string, args: Record<string, unknown> = {}) =>
+      client.callTool({ name, arguments: args }),
   };
 }
+
+const CONFIRM_SECRET = "c".repeat(40);
 
 describe("client scope of curated tools", () => {
   it.each([
@@ -183,12 +227,64 @@ describe("client scope of curated tools", () => {
       expect(result.isError).toBe(true);
       expect(textOf(result)).toContain("is not allowed on the sevdesk client");
       expect(api.requests).toEqual([]);
+      const option = tool === "fetch_override" ? "fetch" : "Request";
+      expect(h.audit).toEqual([
+        expect.objectContaining({
+          tool,
+          class: "R",
+          outcome: "denied",
+          reason: `client_scope:call_override:${option}`,
+        }),
+      ]);
     },
   );
+
+  it("refuses a preview that calls the tool's own write operation", async () => {
+    api.server.use(http.all(sevdeskUrl("/*"), () => HttpResponse.json({ objects: [] })));
+    const h = await harness();
+    const result = await h.call("mark_invoice_sent", { write: true });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toBe(
+      "mark_invoice_sent (preview) may not call sevdesk operation invoiceSendBy (class W+): " +
+        "a preview only reads (class R) before the confirmation. Nothing was sent to sevdesk.",
+    );
+    expect(api.requests).toEqual([]);
+    expect(h.audit).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          tool: "mark_invoice_sent",
+          operationId: "invoiceSendBy",
+          class: "W+",
+          outcome: "denied",
+          reason: "client_scope:preview:class_exceeded",
+        }),
+      ]),
+    );
+  });
+
+  it("lets a preview read the declared R operations", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Invoice/1"), () => HttpResponse.json({ objects: [{ id: "1" }] })),
+    );
+    const h = await harness();
+    const result = await h.call("mark_invoice_sent", { write: false });
+    expect(result.isError, textOf(result)).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({ status: "confirmation_required" });
+    expect(api.requests.map((r) => new URL(r.url).pathname)).toEqual(["/api/v1/Invoice/1"]);
+  });
+
+  it("shows tools the configuration without the token and the confirmation secret", async () => {
+    const h = await harness();
+    const result = await h.call("reads_config");
+    expect(result.structuredContent).toEqual({ token: "", secret: null, baseUrl: MOCK_BASE_URL });
+    expect(JSON.stringify(result)).not.toContain(TEST_TOKEN);
+    expect(JSON.stringify(result)).not.toContain(CONFIRM_SECRET);
+  });
 
   it.each([
     ["declared_read", "/Invoice"],
     ["declared_extra", "/Contact"],
+    ["with_signal", "/Invoice"],
   ])("lets %s through to sevdesk", async (tool, path) => {
     api.server.use(http.get(sevdeskUrl(path), () => HttpResponse.json({ objects: [] })));
     const h = await harness();
