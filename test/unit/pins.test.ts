@@ -103,6 +103,23 @@ describe("enforceRequestPins", () => {
     expect(new URL(upperBase.url).searchParams.get("preventSendBy")).toBe("true");
   });
 
+  it("refuses getPdf paths that match no operation", async () => {
+    for (const path of [
+      "/Invoice/1/getPdf;x=1",
+      "/Invoice/1/getPdf%00",
+      "/Invoice/1/getPdf.json",
+      "/invoice/1/GETPDFX",
+      "/Something/getpdf",
+    ]) {
+      await expect(enforceRequestPins(req(path), MOCK_BASE_URL), path).rejects.toThrow(
+        PinViolation,
+      );
+    }
+    // Paths outside the base URL are not sevdesk's business here.
+    const outside = new Request("https://sevdesk.mock/other/getPdf");
+    expect(await enforceRequestPins(outside, MOCK_BASE_URL)).toBe(outside);
+  });
+
   it("passes requests without pins through untouched", async () => {
     const original = req("/Contact?limit=1");
     expect(await enforceRequestPins(original, MOCK_BASE_URL)).toBe(original);

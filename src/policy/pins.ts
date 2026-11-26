@@ -202,7 +202,17 @@ export async function enforceRequestPins(request: Request, baseUrl: string): Pro
   const path = normalizePath(url.pathname);
   if (!path.toLowerCase().startsWith(`${basePath}/`)) return request;
   const operationId = matchOperation(request.method, path.slice(basePath.length));
-  if (operationId === undefined) return request;
+  if (operationId === undefined) {
+    // A getPdf path that no route recognises (";x=1", "%00", a stray
+    // suffix) could still reach sevdesk's PDF handler without the
+    // preventSendBy pin, so it is refused rather than passed through.
+    if (/getpdf/i.test(path) || /getpdf/i.test(url.pathname)) {
+      throw new PinViolation(
+        "This getPdf path does not match a known sevdesk operation and is refused.",
+      );
+    }
+    return request;
+  }
 
   if (BODY_PINS[operationId] !== undefined && request.body !== null) {
     const type = request.headers.get("content-type") ?? "";
