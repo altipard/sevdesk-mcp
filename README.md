@@ -165,9 +165,12 @@ these entries for you; the snippets below are for doing it by hand. Replace
 `"args": ["-y", "@altipard/sevdesk-mcp"]`. GUI clients often start without your shell's
 `PATH`, so give the full path to `npx` (`which npx`) or, better, use the binary.
 
-**Windows** has no release binary and no keychain lookup: use npx through `cmd`, for
-example `"command": "cmd", "args": ["/c", "npx", "-y", "@altipard/sevdesk-mcp"]`, and
-supply the token as above. Claude Desktop reads `%APPDATA%\Claude\claude_desktop_config.json`,
+**Windows** (untested) has no release binary and no keychain lookup: use npx through
+`cmd`, for example `"command": "cmd", "args": ["/c", "npx", "-y", "@altipard/sevdesk-mcp"]`,
+and supply the token as above. Claude Desktop has no token reference, so on Windows the
+token sits in plain text in its user configuration file. Cursor's `${env:…}` can stay empty
+when Cursor is started from the GUI rather than a shell that has the variable. Claude
+Desktop reads `%APPDATA%\Claude\claude_desktop_config.json`,
 the VS Code user configuration lives in `%APPDATA%\Code\User\mcp.json`, and Cursor uses
 `%USERPROFILE%\.cursor\mcp.json`.
 
@@ -339,9 +342,10 @@ strict and every relaxation is an explicit setting.
 - **Confirmation tokens.** `W` changes run directly, within the mode and allowlist.
   `W+` and `X` actions run in two steps: the first call returns a
   preview and a signed confirmation token bound to exactly that action, the second call
-  with the token executes it. Tokens expire (`SEVDESK_CONFIRM_TTL_SECONDS`).
-- **Irreversible actions** additionally need a single-use token, run at most once per
-  target within 24 hours in the same server process, and require human approval: the client asks the user (MCP elicitation), or, for
+  with the token executes it. Every token is valid exactly once and expires
+  (`SEVDESK_CONFIRM_TTL_SECONDS`).
+- **Irreversible actions** additionally run at most once per target within 24 hours in the
+  same server process, and require human approval: the client asks the user (MCP elicitation), or, for
   clients that cannot ask, the operator's explicit listing in `SEVDESK_ENABLE_TOOLS` or
   `SEVDESK_API_ALLOW` counts as the release.
 - **Audit log.** Every write attempt is logged to stderr as a JSON line, whatever
@@ -405,6 +409,7 @@ the binary.
 ```sh
 read -rs SEVDESK_LIVE_TEST_TOKEN && export SEVDESK_LIVE_TEST_TOKEN   # paste, Enter
 npm run test:live
+unset SEVDESK_LIVE_TEST_TOKEN
 ```
 
 It always runs in `read` mode, aborts if any non-read tool is registered, and prints only
