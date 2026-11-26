@@ -1,0 +1,12 @@
+# Rules for README.md. Exceptions, each deliberate:
+# MD013: badge and logo HTML and table rows cannot be wrapped; prose is
+#        wrapped by hand around 90 columns.
+# MD033: the centered header (logo, title, badges) and collapsible
+#        <details> sections need HTML, GitHub renders nothing else for them.
+# MD041: the file starts with the centered logo; the title follows as an
+#        HTML <h1> so it can be centered too.
+default: true
+MD013: false
+MD033:
+  allowed_elements: [p, img, h1, b, br, a, details, summary]
+MD041: false
