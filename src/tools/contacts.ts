@@ -32,6 +32,11 @@ export const MAX_CONTACTS_SCANNED = 500;
 const SCAN_PAGE = 100;
 /** Contacts taken from sevdesk's own name filter when the scan stopped early. */
 export const MAX_NAME_FILTER_RESULTS = 100;
+/**
+ * Upper bound for the name filter request. It only adds to a scan that
+ * already ran, so it gets less time than a normal call and no retries.
+ */
+export const NAME_LOOKUP_TIMEOUT_MS = 10_000;
 
 // ---------------------------------------------------------------------------
 // Mapping
@@ -109,6 +114,30 @@ const searchOutput = z.object({
 });
 type SearchOutput = z.infer<typeof searchOutput>;
 
+/**
+ * Page over the matches of a scan that stopped early. total is unknown:
+ * contacts beyond the scan may match too. hasMore stays true while a page
+ * returns matches or more reachable matches follow, so the list never
+ * looks complete; the first empty page after them ends paging, because a
+ * higher offset cannot reach contacts the scan never saw.
+ */
+function truncatedPage(
+  offset: number,
+  limit: number,
+  count: number,
+  moreReachable: boolean,
+): SearchOutput["page"] {
+  return { ...pageOf(offset, limit, count, null), hasMore: moreReachable || count > 0 };
+}
+
+/** scan.note text for a scan that stopped early. */
+function beyondScanNote(checked: number, what: string, narrower: string): string {
+  return (
+    `Checked the first ${checked} ${what} only; more matching contacts may exist beyond them, ` +
+    `so total is unknown and paging ends after the matches found. ${narrower}`
+  );
+}
+
 async function scanByName(
   { sevdesk }: ToolCall,
   needle: string,
@@ -134,8 +163,9 @@ async function scanByName(
  * declares it after a live test showed sevdesk honours it for organisation
  * names. Every hit is matched locally again, so a server that ignores the
  * parameter adds no false matches. The lookup is optional: any sevdesk
- * error (sevdesk answers some invalid input with 500) yields `failed`, so
- * the caller falls back to the scan; only a local policy refusal is thrown.
+ * error (sevdesk answers some invalid input with 500) or running out of
+ * time yields `failed`, so the caller falls back to the scan; only a local
+ * policy refusal is thrown.
  */
 async function lookupByName(
   { sevdesk }: ToolCall,
@@ -146,12 +176,20 @@ async function lookupByName(
   let body: unknown;
   try {
     body = await sevdesk.call(
-      sevdesk.api.GET("/Contact", {
+      // One attempt within its own time limit: retries and the client's
+      // longer timeout would let an optional request hold up the answer.
+      sevdesk.apiSingleAttempt.GET("/Contact", {
         params: { query: { depth, name: query, limit: MAX_NAME_FILTER_RESULTS, offset: 0 } },
+        signal: AbortSignal.timeout(NAME_LOOKUP_TIMEOUT_MS),
       }),
     );
   } catch (error) {
     if (error instanceof SevdeskError && error.kind !== "policy") return { failed: error };
+    // The client maps the abort to a timeout; this keeps the fallback if
+    // the abort ever surfaces unmapped.
+    if (error instanceof Error && error.name === "TimeoutError") {
+      return { failed: new SevdeskError("timeout", "sevdesk's name filter did not answer.") };
+    }
     throw error;
   }
   const page = objectsOf(body);
@@ -234,7 +272,16 @@ async function searchByEmail(
         matchedEmail: scan.byContact.get(contactId) as string,
       });
     }
-    page = pageOf(args.offset, args.limit, contacts.length, ids.length);
+    // Counted by the end of the slice, not by the contacts returned: those
+    // that no longer exist are missing from the page, and offset + count
+    // would offer the same slice again.
+    const moreAfterSlice = args.offset + args.limit < ids.length;
+    page = scan.truncated
+      ? truncatedPage(args.offset, args.limit, contacts.length, moreAfterSlice)
+      : {
+          ...pageOf(args.offset, args.limit, contacts.length, ids.length),
+          hasMore: moreAfterSlice,
+        };
   } else {
     // Whether a match is a person shows only on the contact itself: walk the
     // matches in order, skip persons, stop when the page is full or the
@@ -263,14 +310,17 @@ async function searchByEmail(
     fetchCapped = index < ids.length && fetches >= MAX_EMAIL_CONTACT_FETCHES;
     page = {
       ...pageOf(args.offset, args.limit, contacts.length, null),
-      hasMore: index < ids.length && !fetchCapped,
+      hasMore: !fetchCapped && (index < ids.length || (scan.truncated && contacts.length > 0)),
     };
   }
 
   const notes = [
     scan.truncated &&
-      `Checked the first ${scan.checked} e-mail addresses only; later ones may match too. ` +
-        "Use a more specific query or search by name or customer number.",
+      beyondScanNote(
+        scan.checked,
+        "e-mail addresses",
+        "Search more specifically: a longer part of the e-mail address, a name or customerNumber.",
+      ),
     fetchCapped &&
       `Stopped after looking up ${MAX_EMAIL_CONTACT_FETCHES} contacts; further matches cannot be ` +
         "paged to with includePersons=false. Narrow the query or set includePersons=true.",
@@ -372,12 +422,23 @@ export const searchContacts = defineTool({
     }
     const matches = [...scan.matches, ...extra];
     const contacts = matches.slice(args.offset, args.offset + args.limit);
-    const page = pageOf(args.offset, args.limit, contacts.length, matches.length);
+    const page = scan.truncated
+      ? truncatedPage(
+          args.offset,
+          args.limit,
+          contacts.length,
+          args.offset + contacts.length < matches.length,
+        )
+      : pageOf(args.offset, args.limit, contacts.length, matches.length);
     const failure = lookup !== undefined && "failed" in lookup ? lookup.failed : undefined;
     const notes = [
       scan.truncated &&
-        `Checked the first ${scan.checked} contacts only; later ones may match too. ` +
-          "Use customerNumber or a more specific query.",
+        beyondScanNote(
+          scan.checked,
+          "contacts",
+          "Search more specifically: a longer part of the name, an e-mail address " +
+            "(query with @) or customerNumber.",
+        ),
       found !== undefined &&
         `sevdesk's name filter found ${extra.length} more organisations beyond them` +
           `${found.full ? ` (first ${MAX_NAME_FILTER_RESULTS} results only)` : ""}; ` +
@@ -385,9 +446,19 @@ export const searchContacts = defineTool({
           "are not searched.",
       // Kind and status only: sevdesk's error text stays out of the answer.
       failure !== undefined &&
-        `sevdesk's name filter failed (${failure.kind}${
-          failure.status !== undefined ? ` ${failure.status}` : ""
-        }), so only the scan was used.`,
+        (failure.kind === "timeout"
+          ? `sevdesk's name filter did not answer within ${NAME_LOOKUP_TIMEOUT_MS / 1000} s, ` +
+            "so only the scan was used."
+          : `sevdesk's name filter failed (${failure.kind}${
+              failure.status !== undefined ? ` ${failure.status}` : ""
+            }), so only the scan was used.`),
+      // Each call runs the lookup again, and its extra hits follow the
+      // scan's: if it answered for an earlier page but not this one (or the
+      // other way round), the merged list differs between the calls.
+      failure !== undefined &&
+        args.offset > 0 &&
+        "Earlier pages may have included its results, so matches can have shifted or be " +
+          "missing between pages; repeat the search from offset 0 for a consistent list.",
     ].filter((note): note is string => typeof note === "string");
     const output: SearchOutput = {
       contacts,

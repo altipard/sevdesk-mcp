@@ -3,7 +3,7 @@ import type { RequestGate } from "../sevdesk/client.js";
 import { SevdeskError } from "../sevdesk/errors.js";
 import type { AuditLog } from "./audit.js";
 import { classOf, OPERATION_CLASSES, type OperationClass } from "./classification.js";
-import type { OperationId } from "./operations.js";
+import { OPERATIONS, type OperationId } from "./operations.js";
 import { matchOperation, normalizePath } from "./pins.js";
 import { allows, type Rights } from "./rights.js";
 
@@ -109,6 +109,54 @@ export function checkRequest(
   return { ok: true, operationId, class: operationClass };
 }
 
+interface QueryNames {
+  /** Names sent as they are, including literal ones like "contact[id]". */
+  readonly exact: ReadonlySet<string>;
+  /** Object parameters, sent as name[key]… (sevQuery[filter][contact][id]). */
+  readonly objects: ReadonlySet<string>;
+}
+
+const queryNames = new Map<OperationId, QueryNames>();
+
+function queryNamesOf(operationId: OperationId): QueryNames {
+  let names = queryNames.get(operationId);
+  if (names === undefined) {
+    const params = OPERATIONS[operationId].params.filter((param) => param.in === "query");
+    names = {
+      exact: new Set(params.map((param) => param.name)),
+      objects: new Set(params.filter((param) => param.type === "object").map((p) => p.name)),
+    };
+    queryNames.set(operationId, names);
+  }
+  return names;
+}
+
+const OBJECT_KEY = /^([^[\]]+)((?:\[[^[\]]*\])+)$/;
+
+/**
+ * The first query key `url` carries that the operation does not declare,
+ * or undefined. Keys are compared exactly, as sevdesk reads them: a
+ * method override (method, _method), a differently cased or bracketed
+ * variant of a declared name or any other extra key could change what
+ * sevdesk does without the scope seeing it. Object parameters are only
+ * checked by their root name; the table has no schema for what is nested.
+ */
+export function undeclaredQueryKey(operationId: OperationId, url: string): string | undefined {
+  const names = queryNamesOf(operationId);
+  for (const key of new URL(url).searchParams.keys()) {
+    if (names.exact.has(key)) continue;
+    const root = OBJECT_KEY.exec(key)?.[1];
+    if (root !== undefined && names.objects.has(root)) continue;
+    return key;
+  }
+  return undefined;
+}
+
+/** A query key as it may appear in messages and audit reasons. */
+export function shownQueryKey(key: string): string {
+  return key.slice(0, 60).replace(/[^\x20-\x7e]/g, "?");
+}
+
 /** Message for the caller. Names no path, so no IDs or query values end up in it. */
 export function denialMessage(
   scope: ClientScope,
@@ -187,9 +235,21 @@ export function createScopeGate(env: GateEnv): RequestGate {
         request.method,
         request.url,
       );
-      if (decision.ok) return;
-      deny(request.method, decision.reason, decision.operationId, decision.class);
-      throw new SevdeskError("policy", denialMessage(env.scope, request.method, decision));
+      if (!decision.ok) {
+        deny(request.method, decision.reason, decision.operationId, decision.class);
+        throw new SevdeskError("policy", denialMessage(env.scope, request.method, decision));
+      }
+      // Allowlist, not denylist: only the query keys the spec declares for
+      // this operation reach sevdesk.
+      const key = undeclaredQueryKey(decision.operationId, request.url);
+      if (key === undefined) return;
+      const shown = shownQueryKey(key);
+      deny(request.method, `query:${shown}`, decision.operationId, decision.class);
+      throw new SevdeskError(
+        "policy",
+        `${caller(env.scope)} may not send the query parameter "${shown}" to sevdesk operation ` +
+          `${decision.operationId}: it is not declared for this operation. Nothing was sent to sevdesk.`,
+      );
     },
     callRefused(method, reason) {
       deny(method, reason, undefined, undefined);

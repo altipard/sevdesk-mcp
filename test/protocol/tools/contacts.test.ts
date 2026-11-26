@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { delay } from "msw";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { NAME_LOOKUP_TIMEOUT_MS } from "../../../src/tools/contacts.js";
 import { address, communicationWay, contact, list, person } from "../../fixtures/sevdesk.js";
 import {
   connect,
@@ -114,7 +116,10 @@ describe("search_contacts", () => {
     });
     expect(data.scan).toMatchObject({ checked: 500, truncated: true });
     expect(String(data.scan?.note)).toContain("first 500 contacts");
-    expect(data.page).toEqual({ offset: 0, limit: 5, count: 5, total: 500, hasMore: true });
+    expect(String(data.scan?.note)).toContain("more matching contacts may exist beyond them");
+    expect(String(data.scan?.note)).toContain("a longer part of the name");
+    // Contacts beyond the scan may match too, so the total is unknown.
+    expect(data.page).toEqual({ offset: 0, limit: 5, count: 5, total: null, hasMore: true });
   });
 
   /** 500 contacts named "Firma n", of which only id 3 matches "muster". */
@@ -150,7 +155,8 @@ describe("search_contacts", () => {
     // Sent as typed; only the local re-match folds accents.
     expect(queryOf(api.requests[5])).toMatchObject({ depth: "0", name: "Müster" });
     expect(data.contacts.map((x) => x.id)).toEqual([3, 9001]);
-    expect(data.page).toMatchObject({ count: 2, total: 2, hasMore: false });
+    // The scan stopped early: neither complete nor the last page.
+    expect(data.page).toMatchObject({ count: 2, total: null, hasMore: true });
     expect(data.scan).toMatchObject({ mode: "name", checked: 500, truncated: true });
     expect(String(data.scan?.note)).toContain("name filter found 1 more organisations");
     expect(String(data.scan?.note)).toContain("may miss umlaut and spelling variants");
@@ -160,6 +166,16 @@ describe("search_contacts", () => {
       await c.call("search_contacts", { query: "muster", limit: 1, offset: 1 }),
     );
     expect(second.contacts.map((x) => x.id)).toEqual([9001]);
+    expect(second.page).toMatchObject({ count: 1, total: null, hasMore: true });
+
+    // Past the reachable matches: an empty page ends paging, so a client
+    // walking until hasMore is false does not loop over the same scan.
+    const past = structured<Search>(
+      await c.call("search_contacts", { query: "muster", limit: 1, offset: 2 }),
+    );
+    expect(past.contacts).toEqual([]);
+    expect(past.page).toEqual({ offset: 2, limit: 1, count: 0, total: null, hasMore: false });
+    expect(past.scan).toMatchObject({ truncated: true });
   });
 
   it("adds no duplicates or false matches if sevdesk ignores the name filter", async () => {
@@ -191,10 +207,29 @@ describe("search_contacts", () => {
       checked: 500,
       truncated: true,
       note:
-        "Checked the first 500 contacts only; later ones may match too. " +
-        "Use customerNumber or a more specific query. " +
+        "Checked the first 500 contacts only; more matching contacts may exist beyond them, " +
+        "so total is unknown and paging ends after the matches found. " +
+        "Search more specifically: a longer part of the name, an e-mail address " +
+        "(query with @) or customerNumber. " +
         "sevdesk's name filter failed (bad_request 400), so only the scan was used.",
     });
+  });
+
+  it("warns that pages can shift when the name filter fails on a later page", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Contact"), ({ request }) => {
+        if (!new URL(request.url).searchParams.has("name")) return scanPages(request);
+        return HttpResponse.json({ error: { message: "unknown parameter" } }, { status: 400 });
+      }),
+    );
+    const c = await connect();
+    const later = structured<Search>(
+      await c.call("search_contacts", { query: "muster", limit: 1, offset: 1 }),
+    );
+    expect(String(later.scan?.note)).toContain("matches can have shifted or be missing");
+    expect(String(later.scan?.note)).toContain("repeat the search from offset 0");
+    const first = structured<Search>(await c.call("search_contacts", { query: "muster" }));
+    expect(String(first.scan?.note)).not.toContain("shifted");
   });
 
   it("falls back to the plain scan on a server error from the name filter", async () => {
@@ -214,6 +249,58 @@ describe("search_contacts", () => {
       "sevdesk's name filter failed (server_error 500), so only the scan was used.",
     );
     expect(textOf(result)).not.toContain("secret upstream text");
+  });
+
+  describe("name filter time limit", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    /** Shortens only the name filter's own limit; the client's timeouts stay real. */
+    function shortenLookupLimit(ms: number) {
+      const timeout = AbortSignal.timeout.bind(AbortSignal);
+      return vi
+        .spyOn(AbortSignal, "timeout")
+        .mockImplementation((limit) => timeout(limit === NAME_LOOKUP_TIMEOUT_MS ? ms : limit));
+    }
+
+    it("falls back to the scan when the name filter hangs", async () => {
+      const spy = shortenLookupLimit(50);
+      api.server.use(
+        http.get(sevdeskUrl("/Contact"), async ({ request }) => {
+          if (!new URL(request.url).searchParams.has("name")) return scanPages(request);
+          await delay("infinite");
+          return HttpResponse.json(list([]));
+        }),
+      );
+      const c = await connect();
+      const result = await c.call("search_contacts", { query: "muster" });
+      expect(result.isError, textOf(result)).toBeFalsy();
+      const data = structured<Search>(result);
+      expect(spy).toHaveBeenCalledWith(NAME_LOOKUP_TIMEOUT_MS);
+      // One lookup attempt, not retried after the abort.
+      expect(api.requests.filter((r) => new URL(r.url).searchParams.has("name"))).toHaveLength(1);
+      expect(data.contacts.map((x) => x.id)).toEqual([3]);
+      expect(data.scan).toMatchObject({ mode: "name", checked: 500, truncated: true });
+      expect(String(data.scan?.note)).toContain(
+        "sevdesk's name filter did not answer within 10 s, so only the scan was used.",
+      );
+    });
+
+    it("does not retry the name filter on a retryable status", async () => {
+      api.server.use(
+        http.get(sevdeskUrl("/Contact"), ({ request }) => {
+          if (!new URL(request.url).searchParams.has("name")) return scanPages(request);
+          return HttpResponse.json({ error: { message: "busy" } }, { status: 503 });
+        }),
+      );
+      const c = await connect();
+      const data = structured<Search>(await c.call("search_contacts", { query: "muster" }));
+      expect(api.requests.filter((r) => new URL(r.url).searchParams.has("name"))).toHaveLength(1);
+      expect(data.contacts.map((x) => x.id)).toEqual([3]);
+      expect(String(data.scan?.note)).toContain("sevdesk's name filter failed (");
+      expect(String(data.scan?.note)).toContain("503), so only the scan was used.");
+    });
   });
 
   it("searches e-mail addresses for a query with @", async () => {
@@ -261,6 +348,109 @@ describe("search_contacts", () => {
     expect(data.contacts).toEqual([]);
     expect(data.scan).toMatchObject({ mode: "email", checked: 500, truncated: true });
     expect(String(data.scan?.note)).toContain("first 500 e-mail addresses");
+    expect(String(data.scan?.note)).toContain("more matching contacts may exist beyond them");
+    expect(data.page).toMatchObject({ count: 0, total: null, hasMore: false });
+  });
+
+  describe("e-mail matches of a cut-short address scan", () => {
+    // 500 addresses; the first 3 match, the rest belong to other domains.
+    function mockAddresses() {
+      api.server.use(
+        http.get(sevdeskUrl("/CommunicationWay"), ({ request }) => {
+          const offset = Number(new URL(request.url).searchParams.get("offset"));
+          return HttpResponse.json(
+            list(
+              Array.from({ length: 100 }, (_, i) => {
+                const n = offset + i;
+                return communicationWay({
+                  id: String(7000 + n),
+                  value: n < 3 ? `x${n}@muster.example` : `x${n}@other.example`,
+                  contact: { id: String(3000 + n), objectName: "Contact" },
+                });
+              }),
+            ),
+          );
+        }),
+        http.get(sevdeskUrl("/Contact/:id"), ({ params }) =>
+          HttpResponse.json(list([contact({ id: String(params.id) })])),
+        ),
+      );
+    }
+
+    it.each([true, false])(
+      "reports no total and more results while pages return matches (includePersons %s)",
+      async (includePersons) => {
+        mockAddresses();
+        const c = await connect();
+        const first = structured<Search>(
+          await c.call("search_contacts", { query: "@muster", includePersons, limit: 3 }),
+        );
+        expect(first.contacts.map((x) => x.id)).toEqual([3000, 3001, 3002]);
+        expect(first.page).toEqual({ offset: 0, limit: 3, count: 3, total: null, hasMore: true });
+        expect(first.scan).toMatchObject({ mode: "email", truncated: true });
+
+        const past = structured<Search>(
+          await c.call("search_contacts", { query: "@muster", includePersons, offset: 3 }),
+        );
+        expect(past.contacts).toEqual([]);
+        expect(past.page).toMatchObject({ count: 0, total: null, hasMore: false });
+      },
+    );
+  });
+
+  describe("e-mail matches whose contacts are gone", () => {
+    // 30 matching addresses; the contacts for which `gone` holds answer 404.
+    function mockMatches(gone: (index: number) => boolean) {
+      api.server.use(
+        http.get(sevdeskUrl("/CommunicationWay"), () =>
+          HttpResponse.json(
+            list(
+              Array.from({ length: 30 }, (_, i) =>
+                communicationWay({ id: String(8000 + i), contact: { id: String(4000 + i) } }),
+              ),
+            ),
+          ),
+        ),
+        http.get(sevdeskUrl("/Contact/:id"), ({ params }) =>
+          gone(Number(params.id) - 4000)
+            ? HttpResponse.json({ error: { message: "not found" } }, { status: 404 })
+            : HttpResponse.json(list([contact({ id: String(params.id) })])),
+        ),
+      );
+    }
+
+    /** Pages like a client until hasMore is false, with a bound against loops. */
+    async function walk(c: Awaited<ReturnType<typeof connect>>) {
+      const pages: Search["page"][] = [];
+      let offset = 0;
+      for (let i = 0; i < 5; i++) {
+        const data = structured<Search>(
+          await c.call("search_contacts", { query: "@muster", limit: 25, offset }),
+        );
+        pages.push(data.page);
+        if (!data.page.hasMore) return pages;
+        offset = (data.page.offset as number) + (data.page.limit as number);
+      }
+      throw new Error(`still more after 5 pages: ${JSON.stringify(pages)}`);
+    }
+
+    it("offers the next slice after a page of only missing contacts", async () => {
+      mockMatches((i) => i < 25);
+      const c = await connect();
+      expect(await walk(c)).toEqual([
+        { offset: 0, limit: 25, count: 0, total: 30, hasMore: true },
+        { offset: 25, limit: 25, count: 5, total: 30, hasMore: false },
+      ]);
+    });
+
+    it("ends after a last page of only missing contacts", async () => {
+      mockMatches((i) => i >= 25);
+      const c = await connect();
+      expect(await walk(c)).toEqual([
+        { offset: 0, limit: 25, count: 25, total: 30, hasMore: true },
+        { offset: 25, limit: 25, count: 0, total: 30, hasMore: false },
+      ]);
+    });
   });
 
   it("skips matches whose contact is gone instead of failing", async () => {

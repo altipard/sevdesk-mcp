@@ -15,7 +15,9 @@ import {
   createScopeGate,
   genericScope,
   scopeProblems,
+  shownQueryKey,
   toolScope,
+  undeclaredQueryKey,
 } from "../../src/policy/scope.js";
 import {
   createSevdeskClient,
@@ -103,6 +105,48 @@ describe("checkRequest", () => {
 
   it("matches the method case-insensitively, as openapi-fetch's request() passes it", () => {
     expect(checkRequest(readScope, "read", BASE, "get", url("/Invoice")).ok).toBe(true);
+  });
+});
+
+describe("undeclaredQueryKey", () => {
+  it.each([
+    ["getInvoices", "/Invoice?limit=1&offset=0&countAll=true"],
+    ["getInvoices", "/Invoice"],
+    ["getInvoices", "/Invoice?embed=a&embed=b"],
+    ["getCommunicationWays", "/CommunicationWay?contact[id]=1&contact[objectName]=Contact"],
+    ["getCommunicationWays", "/CommunicationWay?contact%5Bid%5D=1"],
+    ["exportInvoice", "/Export/invoiceCsv?sevQuery[modelName]=Invoice&download=true"],
+    ["exportInvoice", "/Export/invoiceCsv?sevQuery[filter][contact][id]=1&sevQuery[x][]=2"],
+  ])("accepts the keys %s declares: %s", (operationId, path) => {
+    expect(undeclaredQueryKey(operationId as OperationId, url(path))).toBeUndefined();
+  });
+
+  it.each([
+    ["getInvoices", "/Invoice?limit=1&method=DELETE", "method"],
+    ["getInvoices", "/Invoice?_method=DELETE", "_method"],
+    ["getInvoices", "/Invoice?X-HTTP-Method-Override=DELETE", "X-HTTP-Method-Override"],
+    ["getInvoices", "/Invoice?LIMIT=1", "LIMIT"],
+    ["getInvoices", "/Invoice?limit[]=1", "limit[]"],
+    ["getInvoices", "/Invoice?limit%00=1", "limit\u0000"],
+    ["getContactById", "/Contact/1?name=x", "name"],
+    ["getCommunicationWays", "/CommunicationWay?contact[foo]=1", "contact[foo]"],
+    ["getCommunicationWays", "/CommunicationWay?contact=1", "contact"],
+    ["exportInvoice", "/Export/invoiceCsv?sevQuery[a]b=1", "sevQuery[a]b"],
+    ["exportInvoice", "/Export/invoiceCsv?download[x]=1", "download[x]"],
+    ["exportInvoice", "/Export/invoiceCsv?sevQueryX[a]=1", "sevQueryX[a]"],
+  ])("finds the undeclared key for %s in %s", (operationId, path, key) => {
+    expect(undeclaredQueryKey(operationId as OperationId, url(path))).toBe(key);
+  });
+
+  it("covers every operation of the table without throwing", () => {
+    for (const operationId of Object.keys(OPERATIONS) as OperationId[]) {
+      expect(undeclaredQueryKey(operationId, url("/x?zz_undeclared=1"))).toBe("zz_undeclared");
+    }
+  });
+
+  it("shows a key cut short and without control characters", () => {
+    expect(shownQueryKey("a\nb\u0000c")).toBe("a?b?c");
+    expect(shownQueryKey("k".repeat(100))).toHaveLength(60);
   });
 });
 

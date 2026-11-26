@@ -76,6 +76,12 @@ const PROBES: readonly ToolDefinition[] = [
   probe("declared_read", (s) => s.api.GET("/Invoice", { params: { query: { limit: 1 } } })),
   probe("declared_extra", (s) => s.api.GET("/Contact"), { operations: ["getContacts"] }),
   probe("with_signal", (s) => s.api.GET("/Invoice", { signal: new AbortController().signal })),
+  probe("query_method", (s) => untyped(s.api)("get", "/Invoice?method=DELETE")),
+  probe("query_undeclared", (s) =>
+    s.api.GET("/Invoice", { params: { query: { limit: 1, foo: "x" } as never } }),
+  ),
+  probe("query_case", (s) => untyped(s.api)("get", "/Invoice?Limit=1")),
+  probe("query_brackets", (s) => untyped(s.api)("get", "/Invoice?limit[]=1")),
   defineTool({
     name: "reads_config",
     title: "reads_config",
@@ -98,7 +104,7 @@ const PROBES: readonly ToolDefinition[] = [
     class: "W+",
     operationId: "invoiceSendBy",
     operations: ["getInvoiceById"],
-    inputSchema: z.object({ write: z.boolean() }),
+    inputSchema: z.object({ write: z.boolean(), query: z.string().optional() }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: true,
@@ -108,9 +114,11 @@ const PROBES: readonly ToolDefinition[] = [
     preview: async (args, { sevdesk }) => {
       const path = { params: { path: { invoiceId: 1 } } };
       await sevdesk.call(
-        (args.write
-          ? sevdesk.api.PUT("/Invoice/{invoiceId}/sendBy", { ...path, body: {} as never })
-          : sevdesk.api.GET("/Invoice/{invoiceId}", path)) as Promise<never>,
+        (args.query !== undefined
+          ? untyped(sevdesk.api)("get", `/Invoice/1?${args.query}`)
+          : args.write
+            ? sevdesk.api.PUT("/Invoice/{invoiceId}/sendBy", { ...path, body: {} as never })
+            : sevdesk.api.GET("/Invoice/{invoiceId}", path)) as Promise<never>,
       );
       return { invoiceId: 1 };
     },
@@ -304,6 +312,70 @@ describe("client scope of curated tools", () => {
     expect(result.isError, textOf(result)).toBeFalsy();
     expect(api.requests.map((r) => new URL(r.url).pathname)).toEqual([`/api/v1${path}`]);
     expect(h.audit).toEqual([]);
+  });
+
+  it.each([
+    ["query_method", "method"],
+    ["query_undeclared", "foo"],
+    ["query_case", "Limit"],
+    ["query_brackets", "limit[]"],
+  ])("refuses %s, a query key getInvoices does not declare", async (tool, key) => {
+    api.server.use(http.all(sevdeskUrl("/*"), () => HttpResponse.json({ objects: [] })));
+    const h = await harness();
+    const result = await h.call(tool);
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toBe(
+      `${tool} may not send the query parameter "${key}" to sevdesk operation getInvoices: ` +
+        "it is not declared for this operation. Nothing was sent to sevdesk.",
+    );
+    expect(api.requests).toEqual([]);
+    expect(h.audit).toEqual([
+      expect.objectContaining({
+        tool,
+        operationId: "getInvoices",
+        class: "R",
+        attemptedClass: "R",
+        outcome: "denied",
+        reason: `client_scope:query:${key}`,
+      }),
+    ]);
+  });
+
+  it("refuses an undeclared query key in a preview", async () => {
+    api.server.use(http.all(sevdeskUrl("/*"), () => HttpResponse.json({ objects: [] })));
+    const h = await harness();
+    const result = await h.call("mark_invoice_sent", { write: false, query: "method=PUT" });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain(
+      'mark_invoice_sent (preview) may not send the query parameter "method"',
+    );
+    expect(api.requests).toEqual([]);
+    expect(h.audit).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          tool: "mark_invoice_sent",
+          operationId: "getInvoiceById",
+          outcome: "denied",
+          reason: "client_scope:preview:query:method",
+        }),
+      ]),
+    );
+  });
+
+  it("audits a method-override query refused by the client under its key", async () => {
+    api.server.use(http.all(sevdeskUrl("/*"), () => HttpResponse.json({ objects: [] })));
+    const h = await harness();
+    const result = await h.call("mark_invoice_sent", { write: false, query: "_method=DELETE" });
+    expect(result.isError).toBe(true);
+    expect(api.requests).toEqual([]);
+    expect(h.audit).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          outcome: "denied",
+          reason: "client_scope:preview:query:_method",
+        }),
+      ]),
+    );
   });
 
   it("still refuses when the audit sink fails", async () => {

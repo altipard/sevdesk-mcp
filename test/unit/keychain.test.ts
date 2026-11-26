@@ -112,6 +112,24 @@ describe("readKeychainToken", () => {
     }
   });
 
+  it("starts the lookup tool without the server's secrets", async () => {
+    const exec = fakeExecFile({ stdout: TEST_TOKEN });
+    const env = {
+      PATH: "/usr/bin",
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+      SEVDESK_API_TOKEN: "",
+      SEVDESK_CONFIRM_SECRET: "c".repeat(40),
+    };
+    await readKeychainToken({ platform: "linux", execFile: exec.fn, env });
+    expect(exec.calls[0]?.options).toHaveProperty("env");
+    expect((exec.calls[0]?.options as { env?: unknown } | undefined)?.env).toEqual({
+      PATH: "/usr/bin",
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+    });
+    // The caller's environment stays as it was.
+    expect(env.SEVDESK_CONFIRM_SECRET).toBe("c".repeat(40));
+  });
+
   it("keeps everything but the final newline", async () => {
     const exec = fakeExecFile({ stdout: ` ${TEST_TOKEN}\r\n` });
     expect(await readKeychainToken({ platform: "darwin", execFile: exec.fn })).toEqual({
