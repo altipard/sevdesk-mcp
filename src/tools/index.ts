@@ -3,6 +3,7 @@ import { getAccountInfo } from "./account.js";
 import { listBankAccounts, searchTransactions } from "./banking.js";
 import { createContact, updateContact } from "./contact-writes.js";
 import { getContact, searchContacts } from "./contacts.js";
+import { enshrineDocument, resetDocumentStatus, tagDocument } from "./document-actions.js";
 import { createInvoiceDraft, createInvoiceFromOrder, createOrderDraft } from "./document-drafts.js";
 import { getDocumentPdf } from "./documents.js";
 import { GENERIC_TOOL_NAME } from "./generic.js";
@@ -17,6 +18,7 @@ import { getInvoice, listOpenReceivables, searchInvoices } from "./invoices.js";
 import { searchOrders } from "./orders.js";
 import { searchParts } from "./parts.js";
 import { getReport } from "./reports.js";
+import { bookVoucherPayment, createVoucher } from "./voucher-writes.js";
 import { getVoucher, searchVouchers } from "./vouchers.js";
 
 /**
@@ -52,6 +54,11 @@ export const TOOLS: readonly ToolDefinition[] = [
   bookInvoicePayment,
   sendInvoiceEmail,
   cancelInvoice,
+  createVoucher,
+  tagDocument,
+  resetDocumentStatus,
+  bookVoucherPayment,
+  enshrineDocument,
 ];
 
 /** Names valid in SEVDESK_ALLOWED_TOOLS, SEVDESK_DENIED_TOOLS and SEVDESK_ENABLE_TOOLS. */
