@@ -548,6 +548,47 @@ describe("timeouts and deadline", () => {
     expect(error.message).toBe("Could not reach sevdesk. Gave up within the 500 ms deadline.");
   });
 
+  it("warns that a write that timed out may have happened", async () => {
+    let calls = 0;
+    server.use(
+      http.post(url("/Contact"), async () => {
+        calls++;
+        await delay(500);
+        return HttpResponse.json({ objects: {} });
+      }),
+    );
+    const { client } = setup({ timeoutMs: 20 });
+
+    const error = await captureError(
+      client.call(client.api.POST("/Contact", { body: {} as never })),
+    );
+
+    expect(error.kind).toBe("timeout");
+    expect(error.message).toBe(
+      "sevdesk did not answer within 20 ms. The outcome is unknown: check sevdesk before retrying.",
+    );
+    expect(calls).toBe(1);
+  });
+
+  it("warns that a write that hit a network error may have happened", async () => {
+    server.use(http.put(url("/Contact/:id"), () => HttpResponse.error()));
+    const { client } = setup();
+
+    const error = await captureError(
+      client.call(
+        client.api.PUT("/Contact/{contactId}", {
+          params: { path: { contactId: 1 } },
+          body: {} as never,
+        }),
+      ),
+    );
+
+    expect(error.kind).toBe("network");
+    expect(error.message).toBe(
+      "Could not reach sevdesk. The outcome is unknown: check sevdesk before retrying.",
+    );
+  });
+
   it("passes a 204 through without a body", async () => {
     server.use(http.delete(url("/Contact/:id"), () => new HttpResponse(null, { status: 204 })));
     const { client } = setup();

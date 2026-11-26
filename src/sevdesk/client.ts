@@ -161,17 +161,21 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
           await policy.sleep(delay);
           continue;
         }
+        // A write may have reached sevdesk before the connection failed, so
+        // the caller must not simply repeat it.
+        const unknownOutcome =
+          method === "GET" ? "" : " The outcome is unknown: check sevdesk before retrying.";
         if (kind === "timeout") {
           const within = deadlineHit
             ? `within the ${policy.deadlineMs} ms deadline`
             : `within ${attemptTimeoutMs} ms`;
-          throw new SevdeskError("timeout", `sevdesk did not answer ${within}.`);
+          throw new SevdeskError("timeout", `sevdesk did not answer ${within}.${unknownOutcome}`);
         }
         const code = networkErrorCode(error);
         const gaveUp = deadlineHit ? ` Gave up within the ${policy.deadlineMs} ms deadline.` : "";
         throw new SevdeskError(
           "network",
-          `Could not reach sevdesk${code ? ` (${code})` : ""}.${gaveUp}`,
+          `Could not reach sevdesk${code ? ` (${code})` : ""}.${gaveUp}${unknownOutcome}`,
         );
       }
 
