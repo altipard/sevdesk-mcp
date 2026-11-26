@@ -1,0 +1,195 @@
+import createClient, { type Client } from "openapi-fetch";
+import type { paths } from "../generated/sevdesk.js";
+import { type Logger, silentLogger } from "../logger.js";
+import { createRedactor, type Redactor } from "../redact.js";
+import { USER_AGENT } from "../version.js";
+import { mapHttpError, parseRetryAfter, SevdeskError } from "./errors.js";
+
+export interface RetryOptions {
+  /** Additional attempts after the first one. Only GET requests are retried. */
+  maxRetries: number;
+  baseDelayMs: number;
+  /** Upper bound per wait. A longer Retry-After ends retrying instead. */
+  maxDelayMs: number;
+}
+
+export interface SevdeskClientOptions {
+  baseUrl: string;
+  token: string;
+  userAgent?: string;
+  timeoutMs?: number;
+  retry?: Partial<RetryOptions>;
+  logger?: Logger;
+  /** Injected in tests so retries do not wait in real time. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+export type SevdeskApi = Client<paths>;
+
+export interface SevdeskClient {
+  /** Typed openapi-fetch client. Pass its promise to `call` to get data or a SevdeskError. */
+  readonly api: SevdeskApi;
+  call<T>(request: Promise<ApiResult<T>>): Promise<T>;
+}
+
+type ApiResult<T> =
+  | { data: T; error?: never; response: Response }
+  | { data?: never; error: unknown; response: Response };
+
+export const DEFAULT_TIMEOUT_MS = 30_000;
+export const DEFAULT_RETRY: RetryOptions = { maxRetries: 3, baseDelayMs: 500, maxDelayMs: 10_000 };
+
+const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+function isRetryableStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function backoffDelay(attempt: number, retry: RetryOptions): number {
+  const exponential = Math.min(retry.maxDelayMs, retry.baseDelayMs * 2 ** (attempt - 1));
+  // Jitter between 50 % and 100 % so parallel callers do not retry in lockstep.
+  return Math.round(exponential * (0.5 + Math.random() * 0.5));
+}
+
+function networkErrorCode(error: unknown): string | undefined {
+  const cause = (error as { cause?: { code?: unknown } } | undefined)?.cause;
+  return typeof cause?.code === "string" ? cause.code : undefined;
+}
+
+/**
+ * Rejects as soon as the signal aborts, even if the underlying fetch
+ * implementation ignores the signal (some interceptors and polyfills do).
+ */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+interface FetchPolicy {
+  timeoutMs: number;
+  retry: RetryOptions;
+  logger: Logger;
+  sleep: (ms: number) => Promise<void>;
+}
+
+/**
+ * fetch with a per-attempt timeout and retries. Retries happen only for
+ * GET: sevdesk sometimes answers 500 to bad input, and repeating a write
+ * could create or send something twice.
+ */
+function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<Response> {
+  return async (request) => {
+    const method = request.method.toUpperCase();
+    const maxAttempts = method === "GET" ? policy.retry.maxRetries + 1 : 1;
+    const path = new URL(request.url).pathname;
+
+    for (let attempt = 1; ; attempt++) {
+      const timeout = AbortSignal.timeout(policy.timeoutMs);
+      const started = performance.now();
+      const canRetry = attempt < maxAttempts;
+      let response: Response;
+
+      try {
+        const signal = AbortSignal.any([request.signal, timeout]);
+        response = await untilAborted(fetch(new Request(request, { signal })), signal);
+      } catch (error) {
+        if (request.signal.aborted) throw error;
+        const kind = timeout.aborted ? "timeout" : "network";
+        if (canRetry) {
+          const delay = backoffDelay(attempt, policy.retry);
+          policy.logger.warn("sevdesk request failed, retrying", {
+            method,
+            path,
+            attempt,
+            kind,
+            delayMs: delay,
+          });
+          await policy.sleep(delay);
+          continue;
+        }
+        if (kind === "timeout") {
+          throw new SevdeskError(
+            "timeout",
+            `sevdesk did not answer within ${policy.timeoutMs} ms.`,
+          );
+        }
+        const code = networkErrorCode(error);
+        throw new SevdeskError("network", `Could not reach sevdesk${code ? ` (${code})` : ""}.`);
+      }
+
+      policy.logger.debug("sevdesk request", {
+        method,
+        path,
+        status: response.status,
+        attempt,
+        durationMs: Math.round(performance.now() - started),
+      });
+
+      if (!canRetry || !isRetryableStatus(response.status)) return response;
+
+      const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
+      const delay = retryAfter ?? backoffDelay(attempt, policy.retry);
+      // A server asking for a longer pause than we are willing to wait gets
+      // the error passed through, including its Retry-After hint.
+      if (delay > policy.retry.maxDelayMs) return response;
+
+      await response.body?.cancel();
+      policy.logger.warn("sevdesk request failed, retrying", {
+        method,
+        path,
+        attempt,
+        status: response.status,
+        delayMs: delay,
+      });
+      await policy.sleep(delay);
+    }
+  };
+}
+
+export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClient {
+  const redact: Redactor = createRedactor([options.token]);
+  const policy: FetchPolicy = {
+    timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    retry: { ...DEFAULT_RETRY, ...options.retry },
+    logger: options.logger ?? silentLogger,
+    sleep: options.sleep ?? realSleep,
+  };
+
+  const api = createClient<paths>({
+    baseUrl: options.baseUrl.replace(/\/+$/, ""),
+    headers: {
+      // sevdesk expects the raw token, without a "Bearer" prefix.
+      Authorization: options.token,
+      "User-Agent": options.userAgent ?? USER_AGENT,
+      Accept: "application/json",
+    },
+    fetch: createPolicyFetch(policy),
+  });
+
+  return {
+    api,
+    async call<T>(request: Promise<ApiResult<T>>): Promise<T> {
+      const { data, error, response } = await request;
+      if (response.ok) return data as T;
+      throw mapHttpError({
+        status: response.status,
+        body: error,
+        retryAfter: response.headers.get("retry-after"),
+        redact,
+      });
+    },
+  };
+}
