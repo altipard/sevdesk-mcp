@@ -22,6 +22,7 @@ import {
   TEST_TOKEN,
   testConfig,
 } from "../helpers.js";
+import { READ_TOOLS } from "../support/tool-names.js";
 
 // Test-only tools for the W, W+ and X paths. Production tools of these
 // classes do not exist yet; the guard is the same for all of them.
@@ -213,7 +214,7 @@ describe("registration by mode", () => {
     try {
       const { tools } = await client.listTools();
       for (const tool of tools) expect(tool.annotations?.readOnlyHint).toBe(true);
-      expect(tools.map((t) => t.name)).toEqual(["get_account_info", "sevdesk_api_request"]);
+      expect(tools.map((t) => t.name)).toEqual([...READ_TOOLS, "sevdesk_api_request"]);
     } finally {
       await client.close();
       await server.close();

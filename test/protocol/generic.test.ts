@@ -9,6 +9,7 @@ import { createPolicyRuntime } from "../../src/policy/runtime.js";
 import { createServer } from "../../src/server.js";
 import { createSevdeskClient } from "../../src/sevdesk/client.js";
 import { captureLogger, MOCK_BASE_URL, TEST_TOKEN, testConfig } from "../helpers.js";
+import { READ_TOOLS } from "../support/tool-names.js";
 
 const api = setupServer();
 const seen: Request[] = [];
@@ -121,11 +122,9 @@ describe("sevdesk_api_request allowlist", () => {
 
   it("is not registered when nothing usable is listed or it is denied", async () => {
     const none = await open({ mode: "read", apiAllow: ["createContact"] });
-    expect((await none.client.listTools()).tools.map((t) => t.name)).toEqual(["get_account_info"]);
+    expect((await none.client.listTools()).tools.map((t) => t.name)).toEqual([...READ_TOOLS]);
     const denied = await open({ deniedTools: ["sevdesk_api_request"] });
-    expect((await denied.client.listTools()).tools.map((t) => t.name)).toEqual([
-      "get_account_info",
-    ]);
+    expect((await denied.client.listTools()).tools.map((t) => t.name)).toEqual([...READ_TOOLS]);
   });
 });
 
