@@ -4,7 +4,9 @@ info:
   version: 1.0.0
 # Applied by `npm run gen` on top of openapi/sevdesk.openapi.yaml.
 # Every action must match at least one node, otherwise gen fails:
-# that is how drift in the upstream spec gets noticed.
+# that is how drift in the upstream spec gets noticed. Actions therefore
+# target one path each; a union target would count as used as soon as one
+# of its paths matched. Shared values are YAML anchors (&name / *name).
 actions:
   # Shared building blocks. The upstream spec has no components.parameters
   # or components.responses at all.
@@ -103,38 +105,111 @@ actions:
 
   # List endpoints: limit/offset/countAll/embed are documented as generic
   # but not declared on these operations.
-  - target: "$.paths['/Contact','/Invoice','/Order','/Voucher','/CheckAccountTransaction','/Part'].get.parameters"
-    description: Pagination and embed on list endpoints with an existing parameter list
-    update:
+  - target: "$.paths['/Contact'].get.parameters"
+    description: Pagination and embed on GET /Contact
+    update: &listParameters
       - $ref: "#/components/parameters/limit"
       - $ref: "#/components/parameters/offset"
       - $ref: "#/components/parameters/countAll"
       - $ref: "#/components/parameters/embed"
-
+  - target: "$.paths['/Invoice'].get.parameters"
+    description: Pagination and embed on GET /Invoice
+    update: *listParameters
+  - target: "$.paths['/Order'].get.parameters"
+    description: Pagination and embed on GET /Order
+    update: *listParameters
+  - target: "$.paths['/Voucher'].get.parameters"
+    description: Pagination and embed on GET /Voucher
+    update: *listParameters
+  - target: "$.paths['/CheckAccountTransaction'].get.parameters"
+    description: Pagination and embed on GET /CheckAccountTransaction
+    update: *listParameters
+  - target: "$.paths['/Part'].get.parameters"
+    description: Pagination and embed on GET /Part
+    update: *listParameters
   - target: "$.paths['/CheckAccount'].get"
     description: Pagination and embed on GET /CheckAccount, which has no parameter list upstream
     update:
-      parameters:
-        - $ref: "#/components/parameters/limit"
-        - $ref: "#/components/parameters/offset"
-        - $ref: "#/components/parameters/countAll"
-        - $ref: "#/components/parameters/embed"
+      parameters: *listParameters
 
-  - target: "$.paths['/Contact/{contactId}','/Invoice/{invoiceId}','/Order/{orderId}','/Voucher/{voucherId}','/CheckAccount/{checkAccountId}','/CheckAccountTransaction/{checkAccountTransactionId}','/Part/{partId}'].get.parameters"
-    description: embed on single-object endpoints
-    update:
+  # Single-object endpoints: embed.
+  - target: "$.paths['/Contact/{contactId}'].get.parameters"
+    description: embed on GET /Contact/{contactId}
+    update: &embedParameter
       - $ref: "#/components/parameters/embed"
+  - target: "$.paths['/Invoice/{invoiceId}'].get.parameters"
+    description: embed on GET /Invoice/{invoiceId}
+    update: *embedParameter
+  - target: "$.paths['/Order/{orderId}'].get.parameters"
+    description: embed on GET /Order/{orderId}
+    update: *embedParameter
+  - target: "$.paths['/Voucher/{voucherId}'].get.parameters"
+    description: embed on GET /Voucher/{voucherId}
+    update: *embedParameter
+  - target: "$.paths['/CheckAccount/{checkAccountId}'].get.parameters"
+    description: embed on GET /CheckAccount/{checkAccountId}
+    update: *embedParameter
+  - target: "$.paths['/CheckAccountTransaction/{checkAccountTransactionId}'].get.parameters"
+    description: embed on GET /CheckAccountTransaction/{checkAccountTransactionId}
+    update: *embedParameter
+  - target: "$.paths['/Part/{partId}'].get.parameters"
+    description: embed on GET /Part/{partId}
+    update: *embedParameter
 
   # Error responses. Upstream declares 400/401/500 without a body and no
   # 403/404/429. Remove the body-less entries first so the update does not
-  # merge a $ref next to a description.
-  - target: "$.paths['/Contact','/Invoice','/Order','/Voucher','/CheckAccount','/CheckAccountTransaction','/Part','/Contact/{contactId}','/Invoice/{invoiceId}','/Order/{orderId}','/Voucher/{voucherId}','/CheckAccount/{checkAccountId}','/CheckAccountTransaction/{checkAccountTransactionId}','/Part/{partId}','/Tools/bookkeepingSystemVersion'].get.responses['400','401','500']"
-    description: Drop body-less error responses before replacing them
+  # merge a $ref next to a description. The key union is fine here: not
+  # every operation declares all three.
+  - target: "$.paths['/Contact'].get.responses['400','401','500']"
+    description: Drop body-less error responses on GET /Contact
+    remove: true
+  - target: "$.paths['/Invoice'].get.responses['400','401','500']"
+    description: Drop body-less error responses on GET /Invoice
+    remove: true
+  - target: "$.paths['/Order'].get.responses['400','401','500']"
+    description: Drop body-less error responses on GET /Order
+    remove: true
+  - target: "$.paths['/Voucher'].get.responses['400','401','500']"
+    description: Drop body-less error responses on GET /Voucher
+    remove: true
+  - target: "$.paths['/CheckAccount'].get.responses['400','401','500']"
+    description: Drop body-less error responses on GET /CheckAccount
+    remove: true
+  - target: "$.paths['/CheckAccountTransaction'].get.responses['400','401','500']"
+    description: Drop body-less error responses on GET /CheckAccountTransaction
+    remove: true
+  - target: "$.paths['/Part'].get.responses['400','401','500']"
+    description: Drop body-less error responses on GET /Part
+    remove: true
+  - target: "$.paths['/Contact/{contactId}'].get.responses['400','401','500']"
+    description: Drop body-less error responses on GET /Contact/{contactId}
+    remove: true
+  - target: "$.paths['/Invoice/{invoiceId}'].get.responses['400','401','500']"
+    description: Drop body-less error responses on GET /Invoice/{invoiceId}
+    remove: true
+  - target: "$.paths['/Order/{orderId}'].get.responses['400','401','500']"
+    description: Drop body-less error responses on GET /Order/{orderId}
+    remove: true
+  - target: "$.paths['/Voucher/{voucherId}'].get.responses['400','401','500']"
+    description: Drop body-less error responses on GET /Voucher/{voucherId}
+    remove: true
+  - target: "$.paths['/CheckAccount/{checkAccountId}'].get.responses['400','401','500']"
+    description: Drop body-less error responses on GET /CheckAccount/{checkAccountId}
+    remove: true
+  - target: "$.paths['/CheckAccountTransaction/{checkAccountTransactionId}'].get.responses['400','401','500']"
+    description: Drop body-less error responses on GET /CheckAccountTransaction/{checkAccountTransactionId}
+    remove: true
+  - target: "$.paths['/Part/{partId}'].get.responses['400','401','500']"
+    description: Drop body-less error responses on GET /Part/{partId}
+    remove: true
+  - target: "$.paths['/Tools/bookkeepingSystemVersion'].get.responses['400','401','500']"
+    description: Drop body-less error responses on GET /Tools/bookkeepingSystemVersion
     remove: true
 
-  - target: "$.paths['/Contact','/Invoice','/Order','/Voucher','/CheckAccount','/CheckAccountTransaction','/Part','/Tools/bookkeepingSystemVersion'].get.responses"
-    description: Error responses on list and account endpoints
-    update:
+  # Error responses on list and account endpoints.
+  - target: "$.paths['/Contact'].get.responses"
+    description: Error responses on GET /Contact
+    update: &listResponses
       "400":
         $ref: "#/components/responses/BadRequest"
       "401":
@@ -145,10 +220,32 @@ actions:
         $ref: "#/components/responses/TooManyRequests"
       "500":
         $ref: "#/components/responses/ServerError"
+  - target: "$.paths['/Invoice'].get.responses"
+    description: Error responses on GET /Invoice
+    update: *listResponses
+  - target: "$.paths['/Order'].get.responses"
+    description: Error responses on GET /Order
+    update: *listResponses
+  - target: "$.paths['/Voucher'].get.responses"
+    description: Error responses on GET /Voucher
+    update: *listResponses
+  - target: "$.paths['/CheckAccount'].get.responses"
+    description: Error responses on GET /CheckAccount
+    update: *listResponses
+  - target: "$.paths['/CheckAccountTransaction'].get.responses"
+    description: Error responses on GET /CheckAccountTransaction
+    update: *listResponses
+  - target: "$.paths['/Part'].get.responses"
+    description: Error responses on GET /Part
+    update: *listResponses
+  - target: "$.paths['/Tools/bookkeepingSystemVersion'].get.responses"
+    description: Error responses on GET /Tools/bookkeepingSystemVersion
+    update: *listResponses
 
-  - target: "$.paths['/Contact/{contactId}','/Invoice/{invoiceId}','/Order/{orderId}','/Voucher/{voucherId}','/CheckAccount/{checkAccountId}','/CheckAccountTransaction/{checkAccountTransactionId}','/Part/{partId}'].get.responses"
-    description: Error responses on single-object endpoints
-    update:
+  # Error responses on single-object endpoints, including 404.
+  - target: "$.paths['/Contact/{contactId}'].get.responses"
+    description: Error responses on GET /Contact/{contactId}
+    update: &singleResponses
       "400":
         $ref: "#/components/responses/BadRequest"
       "401":
@@ -161,3 +258,21 @@ actions:
         $ref: "#/components/responses/TooManyRequests"
       "500":
         $ref: "#/components/responses/ServerError"
+  - target: "$.paths['/Invoice/{invoiceId}'].get.responses"
+    description: Error responses on GET /Invoice/{invoiceId}
+    update: *singleResponses
+  - target: "$.paths['/Order/{orderId}'].get.responses"
+    description: Error responses on GET /Order/{orderId}
+    update: *singleResponses
+  - target: "$.paths['/Voucher/{voucherId}'].get.responses"
+    description: Error responses on GET /Voucher/{voucherId}
+    update: *singleResponses
+  - target: "$.paths['/CheckAccount/{checkAccountId}'].get.responses"
+    description: Error responses on GET /CheckAccount/{checkAccountId}
+    update: *singleResponses
+  - target: "$.paths['/CheckAccountTransaction/{checkAccountTransactionId}'].get.responses"
+    description: Error responses on GET /CheckAccountTransaction/{checkAccountTransactionId}
+    update: *singleResponses
+  - target: "$.paths['/Part/{partId}'].get.responses"
+    description: Error responses on GET /Part/{partId}
+    update: *singleResponses

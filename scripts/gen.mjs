@@ -1,18 +1,31 @@
 // Applies openapi/overlay.yaml to the vendored sevdesk spec and generates
 // TypeScript types into src/generated/. Fails if an overlay action matches
 // nothing, so upstream spec changes cannot silently disable a correction.
+//
+// Options (used by tests): --overlay <file> --out <dir>
 import { mkdir, writeFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { parseArgs } from "node:util";
 import openapiFormat from "openapi-format";
 import openapiTS, { astToString } from "openapi-typescript";
 
 const root = new URL("../", import.meta.url);
+const { values: args } = parseArgs({
+  options: { overlay: { type: "string" }, out: { type: "string" } },
+});
+
 const specPath = fileURLToPath(new URL("openapi/sevdesk.openapi.yaml", root));
-const overlayPath = fileURLToPath(new URL("openapi/overlay.yaml", root));
-const outDir = new URL("src/generated/", root);
+const overlayPath = args.overlay
+  ? resolve(args.overlay)
+  : fileURLToPath(new URL("openapi/overlay.yaml", root));
+const outDir = args.out ? pathToFileURL(`${resolve(args.out)}/`) : new URL("src/generated/", root);
 
 const spec = await openapiFormat.parseFile(specPath, { bundle: false });
 const overlay = await openapiFormat.parseFile(overlayPath, { bundle: false });
+// YAML anchors make several actions share one object; copy each action so
+// applying one can never modify the value another action inserts.
+overlay.actions = (overlay.actions ?? []).map((action) => structuredClone(action));
 
 const { data: patched, resultData } = await openapiFormat.openapiOverlay(spec, {
   overlaySet: overlay,
@@ -32,5 +45,5 @@ await writeFile(new URL("sevdesk.openapi.json", outDir), `${JSON.stringify(patch
 await writeFile(new URL("sevdesk.d.ts", outDir), types);
 
 console.error(
-  `gen: applied ${resultData.totalUsedActions}/${resultData.totalActions} overlay actions, wrote src/generated/sevdesk.d.ts`,
+  `gen: applied ${resultData.totalUsedActions}/${resultData.totalActions} overlay actions, wrote ${fileURLToPath(new URL("sevdesk.d.ts", outDir))}`,
 );
