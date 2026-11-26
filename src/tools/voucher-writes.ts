@@ -57,12 +57,13 @@ import {
 
 /**
  * Largest file accepted, decoded. The file travels as base64 inside the
- * JSON-RPC message (4/3 of its size plus the JSON envelope). The SDK's HTTP
- * transport refuses bodies over 4 MiB and an oversized stdio message ends
- * the whole session, so 2.5 MiB (about 3.4 MiB as base64) keeps every
- * transport safely below its limit. Raise it together with the transports.
+ * JSON-RPC message (4/3 of its size plus the JSON envelope). Both
+ * transports take messages up to 16 MiB (HTTP_MAX_REQUEST_BODY_BYTES in
+ * src/http/app.ts, STDIO_MAX_MESSAGE_BYTES in src/bin/stdio.ts), so 10 MiB
+ * (about 13.3 MiB as base64) leaves room for the rest of the call. Raise it
+ * only together with both.
  */
-export const MAX_VOUCHER_FILE_BYTES = 2.5 * 1024 * 1024;
+export const MAX_VOUCHER_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_FILE_MIB = MAX_VOUCHER_FILE_BYTES / 1024 / 1024;
 /** Base64 length of the largest file, with padding. */
 const MAX_BASE64_LENGTH = Math.ceil(MAX_VOUCHER_FILE_BYTES / 3) * 4;

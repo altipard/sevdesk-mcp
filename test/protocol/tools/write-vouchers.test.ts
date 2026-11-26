@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { HTTP_MAX_REQUEST_BODY_BYTES } from "../../../src/http/app.js";
 import { unixSeconds } from "../../../src/tools/format.js";
 import { MAX_VOUCHER_FILE_BYTES } from "../../../src/tools/voucher-writes.js";
 import { checkAccount, contact, list, PDF_BYTES, voucher } from "../../fixtures/sevdesk.js";
@@ -269,7 +270,7 @@ describe("create_voucher (W)", () => {
     [
       "a file over the limit",
       { content: tooBig.toString("base64") },
-      `at most ${MAX_VOUCHER_FILE_BYTES} (2.5 MiB)`,
+      `at most ${MAX_VOUCHER_FILE_BYTES} (10 MiB)`,
     ],
     ["a path in the file name", { filename: "../etc/rechnung.pdf" }, "plain file name"],
   ];
@@ -283,7 +284,7 @@ describe("create_voucher (W)", () => {
     expect(api.requests).toHaveLength(0);
   });
 
-  it("keeps a file at the limit, as base64 in a JSON-RPC message, below 4 MiB", () => {
+  it("keeps a file at the limit, as base64 in a JSON-RPC message, below 16 MiB", () => {
     const content = Buffer.alloc(MAX_VOUCHER_FILE_BYTES).toString("base64");
     const message = JSON.stringify({
       jsonrpc: "2.0",
@@ -291,7 +292,8 @@ describe("create_voucher (W)", () => {
       method: "tools/call",
       params: { name: "create_voucher", arguments: { ...base, file: { ...pdfFile, content } } },
     });
-    expect(message.length).toBeLessThan(4 * 1024 * 1024 - 256 * 1024);
+    expect(HTTP_MAX_REQUEST_BODY_BYTES).toBe(16 * 1024 * 1024);
+    expect(message.length).toBeLessThan(HTTP_MAX_REQUEST_BODY_BYTES - 1024 * 1024);
   });
 
   it("accepts a file of exactly the limit", async () => {
