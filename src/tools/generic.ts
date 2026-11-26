@@ -1,4 +1,4 @@
-import type { CallToolResult, ServerContext } from "@modelcontextprotocol/server";
+import type { CallToolResult, RegisteredTool, ServerContext } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { classOf, type OperationClass } from "../policy/classification.js";
 import { CONFIRMATION_TOKEN_DESCRIPTION, runGuarded, type ToolOutput } from "../policy/guard.js";
@@ -373,12 +373,12 @@ type UntypedRequest = (
  * Registers sevdesk_api_request: one operation by operationId, only from
  * SEVDESK_API_ALLOW (default DEFAULT_API_ALLOW) and only up to the caller's
  * rights. W+/X operations go through the same guard as curated tools.
- * Returns false if there is nothing the caller may call.
+ * Returns undefined if there is nothing the caller may call.
  */
-export function registerGenericTool(env: RegistrationEnv): boolean {
+export function registerGenericTool(env: RegistrationEnv): RegisteredTool | undefined {
   const { server, policy, deps } = env;
   if (!isToolEnabled(policy.config, policy.rights, { name: GENERIC_TOOL_NAME, class: "R" })) {
-    return false;
+    return undefined;
   }
   const allowList = policy.config.apiAllow ?? DEFAULT_API_ALLOW;
   const usable = allowList.filter((id): id is OperationId => {
@@ -386,7 +386,8 @@ export function registerGenericTool(env: RegistrationEnv): boolean {
     return operationClass !== undefined && allows(policy.rights, operationClass);
   });
   const [first, ...rest] = usable;
-  if (first === undefined) return false;
+  if (first === undefined) return undefined;
+  const released = new Set<string>(usable);
 
   const classes = new Set<OperationClass>(usable.map((id) => classOf(id) as OperationClass));
   const readOnly = [...classes].every((c) => c === "R" || c === "R+");
@@ -410,7 +411,7 @@ export function registerGenericTool(env: RegistrationEnv): boolean {
     }),
   });
 
-  server.registerTool(
+  return server.registerTool(
     GENERIC_TOOL_NAME,
     {
       title: "sevdesk API request",
@@ -428,6 +429,11 @@ export function registerGenericTool(env: RegistrationEnv): boolean {
     },
     async (input: z.infer<typeof inputSchema>, ctx: ServerContext) => {
       const operationId = input.operationId as OperationId;
+      // The input schema already restricts operationId to the released set;
+      // checked again so a schema change or a bypass cannot widen it.
+      if (!released.has(operationId)) {
+        return failure(`${String(operationId).slice(0, 80)} is not released for this server.`);
+      }
       const operationClass = classOf(operationId);
       if (operationClass === undefined) return failure(`${operationId} is not classified.`);
       const operation = OPERATIONS[operationId];
@@ -495,5 +501,4 @@ export function registerGenericTool(env: RegistrationEnv): boolean {
       });
     },
   );
-  return true;
 }
