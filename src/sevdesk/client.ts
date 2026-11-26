@@ -128,7 +128,11 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
     const maxAttempts = method === "GET" ? policy.retry.maxRetries + 1 : 1;
     const path = new URL(request.url).pathname;
     const deadline = policy.now() + policy.deadlineMs;
-    const fitsDeadline = (delayMs: number) => policy.now() + delayMs < deadline;
+    // A retry only starts if, after the wait, a meaningful attempt still
+    // fits. Otherwise the last attempt would get a few milliseconds and its
+    // timeout message would report that tiny budget instead of the deadline.
+    const minAttemptMs = Math.min(policy.timeoutMs, 1000);
+    const fitsDeadline = (delayMs: number) => policy.now() + delayMs + minAttemptMs <= deadline;
 
     for (let attempt = 1; ; attempt++) {
       const attemptTimeoutMs = Math.max(1, Math.min(policy.timeoutMs, deadline - policy.now()));
@@ -145,7 +149,8 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
         if (request.signal.aborted) throw error;
         const kind = timeout.aborted ? "timeout" : "network";
         const delay = backoffDelay(attempt, policy.retry);
-        if (canRetry && fitsDeadline(delay)) {
+        const deadlineHit = canRetry && !fitsDeadline(delay);
+        if (canRetry && !deadlineHit) {
           policy.logger.warn("sevdesk request failed, retrying", {
             method,
             path,
@@ -157,13 +162,17 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
           continue;
         }
         if (kind === "timeout") {
-          throw new SevdeskError(
-            "timeout",
-            `sevdesk did not answer within ${attemptTimeoutMs} ms.`,
-          );
+          const within = deadlineHit
+            ? `within the ${policy.deadlineMs} ms deadline`
+            : `within ${attemptTimeoutMs} ms`;
+          throw new SevdeskError("timeout", `sevdesk did not answer ${within}.`);
         }
         const code = networkErrorCode(error);
-        throw new SevdeskError("network", `Could not reach sevdesk${code ? ` (${code})` : ""}.`);
+        const gaveUp = deadlineHit ? ` Gave up within the ${policy.deadlineMs} ms deadline.` : "";
+        throw new SevdeskError(
+          "network",
+          `Could not reach sevdesk${code ? ` (${code})` : ""}.${gaveUp}`,
+        );
       }
 
       policy.logger.debug("sevdesk request", {

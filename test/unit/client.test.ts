@@ -1,6 +1,6 @@
 import { delay, HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createSevdeskClient, type SevdeskClientOptions } from "../../src/sevdesk/client.js";
 import { SevdeskError, type SevdeskErrorKind } from "../../src/sevdesk/errors.js";
 import { USER_AGENT } from "../../src/version.js";
@@ -466,6 +466,7 @@ describe("timeouts and deadline", () => {
       }),
     );
     const { client } = setup({
+      timeoutMs: 100,
       deadlineMs: 1000,
       retry: { maxRetries: 10, baseDelayMs: 300 },
       now: () => clock,
@@ -489,12 +490,62 @@ describe("timeouts and deadline", () => {
         return HttpResponse.json({ objects: [] });
       }),
     );
-    const { client } = setup({ timeoutMs: 10_000, deadlineMs: 40, now: () => 0 });
+    const { client } = setup({
+      timeoutMs: 10_000,
+      deadlineMs: 40,
+      retry: { maxRetries: 0 },
+      now: () => 0,
+    });
 
     const error = await captureError(client.call(client.api.GET("/Part")));
 
     expect(error.kind).toBe("timeout");
     expect(error.message).toBe("sevdesk did not answer within 40 ms.");
+  });
+
+  it("does not start a retry that would only get a sliver of the deadline", async () => {
+    let clock = 0;
+    let calls = 0;
+    server.use(
+      http.get(url("/Part"), async () => {
+        calls++;
+        await delay(500);
+        return HttpResponse.json({ objects: [] });
+      }),
+    );
+    const { client, sleeps } = setup({
+      timeoutMs: 20,
+      deadlineMs: 1000,
+      retry: { maxRetries: 5, baseDelayMs: 600, maxDelayMs: 600 },
+      now: () => clock,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+    });
+
+    // No jitter: every wait is exactly 600 ms.
+    const random = vi.spyOn(Math, "random").mockReturnValue(1);
+    const error = await captureError(client.call(client.api.GET("/Part"))).finally(() =>
+      random.mockRestore(),
+    );
+
+    // 600 ms wait + 20 ms attempt fit into 1000 ms once; a second wait would
+    // leave less than one attempt, so the client stops and names the deadline.
+    expect(error.kind).toBe("timeout");
+    expect(error.message).toBe("sevdesk did not answer within the 1000 ms deadline.");
+    expect(calls).toBe(2);
+    expect(sleeps).toEqual([600]);
+  });
+
+  it("names the deadline for a network failure it stopped retrying", async () => {
+    server.use(http.get(url("/Part"), () => HttpResponse.error()));
+    const { client } = setup({ timeoutMs: 5000, deadlineMs: 500, now: () => 0 });
+
+    const error = await captureError(client.call(client.api.GET("/Part")));
+
+    expect(error.kind).toBe("network");
+    expect(error.message).toBe("Could not reach sevdesk. Gave up within the 500 ms deadline.");
   });
 
   it("passes a 204 through without a body", async () => {
