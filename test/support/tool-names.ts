@@ -13,4 +13,8 @@ export const READ_TOOLS = [
   "search_orders",
   "search_vouchers",
   "get_voucher",
+  "list_bank_accounts",
+  "search_transactions",
+  "search_parts",
+  "get_tax_guidance",
 ] as const;
