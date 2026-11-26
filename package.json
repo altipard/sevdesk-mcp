@@ -37,7 +37,7 @@
     "lint": "biome check .",
     "format": "biome check --write .",
     "typecheck": "npm run gen && tsc -p tsconfig.json",
-    "test": "npm run build && vitest run",
+    "test": "npm run build && vitest run --dir test",
     "check": "npm run gen && npm run lint && npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
