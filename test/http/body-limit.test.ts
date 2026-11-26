@@ -71,30 +71,36 @@ describe("screening before the body is read", () => {
   it("answers every case screen() decides exactly as fetch() does without it", async () => {
     const server = await fx.server();
     const aud = server.resourceUrl.href;
-    const cases = {
-      healthGet: { method: "GET", path: "/healthz" },
-      healthPost: { path: "/healthz" },
-      metadata: { method: "GET", path: "/.well-known/oauth-protected-resource" },
-      metadataPost: { path: "/.well-known/oauth-protected-resource" },
-      unknownPath: { path: "/other" },
-      foreignHost: { host: "evil.example" },
-      foreignOrigin: { origin: "https://evil.example", token: await signToken(fx.iss, aud) },
-      noToken: {},
-      badToken: { token: "not-a-jwt" },
-      wrongAudience: { token: await signToken(fx.iss, "http://127.0.0.1:1/mcp") },
-      writeOnly: { token: await signToken(fx.iss, aud, { scope: "sevdesk:write" }) },
-    };
-    for (const [name, init] of Object.entries(cases)) {
+    const cases: Array<[string, Parameters<typeof mcpRequest>[1], number]> = [
+      ["health GET", { method: "GET", path: "/healthz" }, 200],
+      ["health POST", { path: "/healthz" }, 405],
+      ["metadata", { method: "GET", path: "/.well-known/oauth-protected-resource" }, 200],
+      ["metadata POST", { path: "/.well-known/oauth-protected-resource" }, 405],
+      ["unknown path", { path: "/other", token: await signToken(fx.iss, aud) }, 404],
+      ["foreign Host", { host: "evil.example", token: await signToken(fx.iss, aud) }, 403],
+      [
+        "foreign Origin",
+        { origin: "https://evil.example", token: await signToken(fx.iss, aud) },
+        403,
+      ],
+      ["no token", {}, 401],
+      ["bad token", { token: "not-a-jwt" }, 401],
+      ["wrong audience", { token: await signToken(fx.iss, "http://127.0.0.1:1/mcp") }, 401],
+      [
+        "write-only token",
+        { token: await signToken(fx.iss, aud, { scope: "sevdesk:write" }) },
+        403,
+      ],
+    ];
+    for (const [name, init, status] of cases) {
       const screened = await server.app.screen(mcpRequest(server, init));
       expect(screened, name).toBeInstanceOf(Response);
       const direct = await server.app.fetch(mcpRequest(server, init));
-      expect((screened as Response).status, name).toBe(direct.status);
+      expect((screened as Response).status, name).toBe(status);
+      expect(direct.status, name).toBe(status);
       expect((screened as Response).headers.get("www-authenticate"), name).toBe(
         direct.headers.get("www-authenticate"),
       );
-      if ((screened as Response).status === 401 || (screened as Response).status === 403) {
-        expect(direct.status, name).toBeGreaterThanOrEqual(400);
-      }
     }
     // An authorized request passes the screen with its verified token, and fetch serves it.
     const ok = { token: await signToken(fx.iss, aud, { scope: READ }) };
