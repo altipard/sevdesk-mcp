@@ -1,7 +1,10 @@
 import { HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { classOf } from "../../src/policy/classification.js";
 import {
+  BODY_PINS,
+  checkBodyPins,
   enforceRequestPins,
   matchOperation,
   PinViolation,
@@ -106,5 +109,101 @@ describe("pins in the sevdesk client (every call path)", () => {
     expect((error as SevdeskError).kind).toBe("policy");
     expect((error as SevdeskError).message).toBe("preventSendBy is always true on this server");
     expect(urls).toEqual([]);
+  });
+});
+
+describe("body pins", () => {
+  it("cover the W operations that can set status or send fields", () => {
+    expect(Object.keys(BODY_PINS).sort()).toEqual(
+      [
+        "createInvoiceByFactory",
+        "createOrder",
+        "createTransaction",
+        "createcreditNote",
+        "updateOrder",
+        "voucherFactorySaveVoucher",
+      ].sort(),
+    );
+    for (const id of Object.keys(BODY_PINS)) expect(classOf(id), id).toBe("W");
+  });
+
+  it("allow drafts and absent fields", () => {
+    expect(() =>
+      checkBodyPins("createInvoiceByFactory", { invoice: { status: "100" } }),
+    ).not.toThrow();
+    expect(() =>
+      checkBodyPins("createInvoiceByFactory", { invoice: { status: 100, sendDate: null } }),
+    ).not.toThrow();
+    expect(() => checkBodyPins("createInvoiceByFactory", { invoicePosSave: [] })).not.toThrow();
+    expect(() => checkBodyPins("createInvoiceByFactory", undefined)).not.toThrow();
+    expect(() =>
+      checkBodyPins("voucherFactorySaveVoucher", { voucher: { status: 50 } }),
+    ).not.toThrow();
+    expect(() => checkBodyPins("createTransaction", { status: 100 })).not.toThrow();
+    expect(() => checkBodyPins("getInvoices", { anything: 1 })).not.toThrow();
+  });
+
+  it.each([
+    [
+      "createInvoiceByFactory",
+      { invoice: { status: "200" } },
+      "invoice.status may only be 100 (draft)",
+    ],
+    [
+      "createInvoiceByFactory",
+      { invoice: { status: 1000 } },
+      "invoice.status may only be 100 (draft)",
+    ],
+    [
+      "createInvoiceByFactory",
+      { invoice: { sendDate: "2026-11-26" } },
+      "invoice.sendDate must not be set",
+    ],
+    ["createInvoiceByFactory", { invoice: { sendType: "VM" } }, "invoice.sendType must not be set"],
+    [
+      "createInvoiceByFactory",
+      { invoice: { enshrined: "2026-11-26" } },
+      "invoice.enshrined must not be set",
+    ],
+    ["createcreditNote", { creditNote: { status: "1000" } }, "creditNote.status may only be 100"],
+    [
+      "createcreditNote",
+      { creditNote: { sendType: "VPR" } },
+      "creditNote.sendType must not be set",
+    ],
+    ["createOrder", { order: { status: 200 } }, "order.status may only be 100"],
+    ["createOrder", { order: { sendDate: "x" } }, "order.sendDate must not be set"],
+    ["updateOrder", { status: 1000 }, "updateOrder: status may only be 100"],
+    ["updateOrder", { sendType: "VM" }, "updateOrder: sendType must not be set"],
+    ["voucherFactorySaveVoucher", { voucher: { status: 100 } }, "voucher.status may only be 50"],
+    ["voucherFactorySaveVoucher", { voucher: { status: "abc" } }, "voucher.status may only be 50"],
+    ["createTransaction", { status: 400 }, "createTransaction: status may only be 100"],
+  ] as const)("reject %s with %j", (id, body, message) => {
+    expect(() => checkBodyPins(id, body)).toThrow(PinViolation);
+    expect(() => checkBodyPins(id, body)).toThrow(message);
+  });
+
+  it("are enforced by the client before anything is sent", async () => {
+    const out = new Request(`${MOCK_BASE_URL}/Invoice/Factory/saveInvoice`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ invoice: { status: 1000 } }),
+    });
+    await expect(enforceRequestPins(out, MOCK_BASE_URL)).rejects.toThrow(
+      "invoice.status may only be 100",
+    );
+    const form = new Request(`${MOCK_BASE_URL}/Invoice/Factory/saveInvoice`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: "invoice[status]=1000",
+    });
+    await expect(enforceRequestPins(form, MOCK_BASE_URL)).rejects.toThrow("body must be JSON");
+    const ok = new Request(`${MOCK_BASE_URL}/Invoice/Factory/saveInvoice`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ invoice: { status: 100 } }),
+    });
+    const passed = await enforceRequestPins(ok, MOCK_BASE_URL);
+    expect(await passed.json()).toEqual({ invoice: { status: 100 } });
   });
 });

@@ -42,6 +42,67 @@ export function pinQueryParam(name: string, value: unknown): PinnedParam | undef
   return pinned ? { omit: false, value: pinned } : { omit: true };
 }
 
+interface BodyPin {
+  /** Field path inside the JSON body. */
+  readonly path: readonly string[];
+  /** Allowed values (compared as numbers); without it the field must be absent or null. */
+  readonly allow?: readonly number[];
+}
+
+const draftOnly = (prefix: readonly string[], draft: number, extra: readonly string[] = []) => [
+  { path: [...prefix, "status"], allow: [draft] },
+  ...["sendDate", "sendType", "enshrined", ...extra].map((field) => ({ path: [...prefix, field] })),
+];
+
+/**
+ * Body fields of W operations that would reach W+ (or X) effects without a
+ * confirmation: setting a document to sent/paid/booked, a send date or
+ * send type, or the enshrined flag. These operations may only create or
+ * change drafts; status changes run through their own confirmed operations.
+ */
+export const BODY_PINS: Readonly<Partial<Record<OperationId, readonly BodyPin[]>>> = {
+  createInvoiceByFactory: draftOnly(["invoice"], 100),
+  createcreditNote: draftOnly(["creditNote"], 100),
+  createOrder: draftOnly(["order"], 100),
+  updateOrder: draftOnly([], 100),
+  // Voucher draft is 50; 100 is already "unpaid" (booked as open).
+  voucherFactorySaveVoucher: draftOnly(["voucher"], 50),
+  // Transaction 100 = created; 200 linked, 300 private, 400 booked.
+  createTransaction: [{ path: ["status"], allow: [100] }],
+};
+
+function fieldAt(body: unknown, path: readonly string[]): unknown {
+  let current = body;
+  for (const key of path) {
+    if (typeof current !== "object" || current === null || Array.isArray(current)) return undefined;
+    current = Object.hasOwn(current, key) ? (current as Record<string, unknown>)[key] : undefined;
+  }
+  return current;
+}
+
+/** Throws PinViolation if the body sets a pinned field to a disallowed value. */
+export function checkBodyPins(operationId: OperationId, body: unknown): void {
+  for (const pin of BODY_PINS[operationId] ?? []) {
+    const value = fieldAt(body, pin.path);
+    if (value === undefined || value === null) continue;
+    const field = pin.path.join(".");
+    if (pin.allow === undefined) {
+      throw new PinViolation(
+        `${operationId}: ${field} must not be set on this server. ` +
+          "Sending and status changes run through their own confirmed operations.",
+      );
+    }
+    const numeric =
+      typeof value === "number" || typeof value === "string" ? Number(value) : Number.NaN;
+    if (!pin.allow.includes(numeric)) {
+      throw new PinViolation(
+        `${operationId}: ${field} may only be ${pin.allow.join(" or ")} (draft) on this server. ` +
+          "Status changes run through their own confirmed operations.",
+      );
+    }
+  }
+}
+
 interface Route {
   readonly operationId: OperationId;
   readonly method: string;
@@ -83,6 +144,18 @@ export async function enforceRequestPins(request: Request, baseUrl: string): Pro
   if (!url.pathname.startsWith(`${basePath}/`)) return request;
   const operationId = matchOperation(request.method, url.pathname.slice(basePath.length));
   if (operationId === undefined) return request;
+
+  if (BODY_PINS[operationId] !== undefined && request.body !== null) {
+    const type = request.headers.get("content-type") ?? "";
+    let body: unknown;
+    try {
+      if (!type.includes("json")) throw new Error("not JSON");
+      body = JSON.parse(await request.clone().text());
+    } catch {
+      throw new PinViolation(`${operationId}: the request body must be JSON on this server`);
+    }
+    checkBodyPins(operationId, body);
+  }
 
   let changed = false;
   for (const spec of OPERATIONS[operationId].params) {

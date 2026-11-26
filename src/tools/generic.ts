@@ -3,7 +3,7 @@ import { z } from "zod";
 import { classOf, type OperationClass } from "../policy/classification.js";
 import { CONFIRMATION_TOKEN_DESCRIPTION, runGuarded, type ToolOutput } from "../policy/guard.js";
 import { OPERATIONS, type OperationId, type ParamSpec } from "../policy/operations.js";
-import { type PinnedParam, PinViolation, pinQueryParam } from "../policy/pins.js";
+import { checkBodyPins, type PinnedParam, PinViolation, pinQueryParam } from "../policy/pins.js";
 import { isToolEnabled, type RegistrationEnv } from "../policy/registry.js";
 import { allows } from "../policy/rights.js";
 
@@ -434,6 +434,12 @@ export function registerGenericTool(env: RegistrationEnv): boolean {
       const params = input.params ?? {};
       if (input.body !== undefined && !operation.body) {
         return failure(`${operationId} takes no request body.`);
+      }
+      try {
+        checkBodyPins(operationId, input.body);
+      } catch (error) {
+        if (error instanceof PinViolation) return failure(error.message);
+        throw error;
       }
       let built: BuiltRequest;
       try {

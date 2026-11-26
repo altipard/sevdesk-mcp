@@ -218,6 +218,32 @@ describe("sevdesk_api_request class rules", () => {
     ]);
   });
 
+  it("refuses W bodies that would mark a document as sent or booked", async () => {
+    const c = await open({ mode: "write", apiAllow: ["createInvoiceByFactory"] });
+    const result = await call(c, {
+      operationId: "createInvoiceByFactory",
+      body: { invoice: { status: "1000", sendType: "VM" } },
+    });
+    expect(result.isError).toBe(true);
+    expect(text(result)).toContain("invoice.status may only be 100 (draft)");
+    expect(seen).toEqual([]);
+  });
+
+  it("passes a draft body through", async () => {
+    api.use(
+      http.post(`${MOCK_BASE_URL}/Invoice/Factory/saveInvoice`, () =>
+        HttpResponse.json({ objects: { invoice: { id: "1" } } }),
+      ),
+    );
+    const c = await open({ mode: "write", apiAllow: ["createInvoiceByFactory"] });
+    const result = await call(c, {
+      operationId: "createInvoiceByFactory",
+      body: { invoice: { status: "100" } },
+    });
+    expect(result.isError).toBeFalsy();
+    expect(await seen[0]?.json()).toEqual({ invoice: { status: "100" } });
+  });
+
   it("requires the confirmation token for W+", async () => {
     api.use(
       http.put(`${MOCK_BASE_URL}/Invoice/4/sendBy`, () => HttpResponse.json({ objects: {} })),
