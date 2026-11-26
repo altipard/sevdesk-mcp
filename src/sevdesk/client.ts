@@ -41,8 +41,12 @@ export const DEFAULT_RETRY: RetryOptions = { maxRetries: 3, baseDelayMs: 500, ma
 
 const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+// 500 is left out on purpose: sevdesk answers some invalid input with 500,
+// and repeating that only multiplies the failure.
+const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+
 function isRetryableStatus(status: number): boolean {
-  return status === 429 || status >= 500;
+  return RETRYABLE_STATUS.has(status);
 }
 
 function backoffDelay(attempt: number, retry: RetryOptions): number {

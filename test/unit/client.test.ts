@@ -252,7 +252,7 @@ describe("retries", () => {
     server.use(
       http.get(url("/Voucher"), () => {
         calls++;
-        return HttpResponse.json({}, { status: 500 });
+        return HttpResponse.json({}, { status: 503 });
       }),
     );
     const { client, sleeps } = setup({ retry: { maxRetries: 2 } });
@@ -262,6 +262,35 @@ describe("retries", () => {
     expect(error.kind).toBe("server_error");
     expect(calls).toBe(3);
     expect(sleeps).toHaveLength(2);
+  });
+
+  it.each([500, 501, 505])("does not retry a GET answered with %i", async (status) => {
+    let calls = 0;
+    server.use(
+      http.get(url("/Voucher"), () => {
+        calls++;
+        return HttpResponse.json({}, { status });
+      }),
+    );
+    const { client, sleeps } = setup();
+
+    const error = await captureError(client.call(client.api.GET("/Voucher")));
+
+    expect(error.kind).toBe("server_error");
+    expect(calls).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  it.each([502, 504])("retries a GET answered with %i", async (status) => {
+    let calls = 0;
+    server.use(
+      http.get(url("/Voucher"), () =>
+        calls++ === 0 ? HttpResponse.json({}, { status }) : HttpResponse.json({ objects: [] }),
+      ),
+    );
+    const { client } = setup();
+    await expect(client.call(client.api.GET("/Voucher"))).resolves.toEqual({ objects: [] });
+    expect(calls).toBe(2);
   });
 
   it("does not wait for a Retry-After longer than maxDelayMs", async () => {
