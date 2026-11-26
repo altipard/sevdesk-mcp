@@ -86,5 +86,42 @@ export const connectRedisNonceStore: ConnectNonceStore = async (url, logger) => 
     await close();
     throw error;
   }
+  await checkEvictionPolicy(() => client.configGet("maxmemory-policy"), logger);
   return { store, close };
 };
+
+/**
+ * Warns when Redis may evict keys: an evicted nonce makes a used
+ * confirmation valid again, and the sentinel cannot see a partial loss.
+ * Only a warning, never a startup failure: managed Redis services often
+ * forbid CONFIG, and the policy can be right without being readable.
+ */
+export async function checkEvictionPolicy(
+  read: () => Promise<unknown>,
+  logger: Logger,
+  timeoutMs = REDIS_COMMAND_TIMEOUT_MS,
+): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  let policy: unknown;
+  try {
+    const reply = await Promise.race([
+      read(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("CONFIG GET timed out")), timeoutMs);
+      }),
+    ]);
+    policy = (reply as Record<string, unknown> | null)?.["maxmemory-policy"];
+  } catch (error) {
+    logger.warn("could not read the redis maxmemory-policy; make sure it is noeviction", {
+      error,
+    });
+    return;
+  } finally {
+    clearTimeout(timer);
+  }
+  if (policy === "noeviction") return;
+  logger.warn("redis maxmemory-policy is not noeviction: used nonces can be evicted", {
+    policy: typeof policy === "string" ? policy : "unknown",
+    hint: "set maxmemory-policy noeviction on a Redis of its own",
+  });
+}

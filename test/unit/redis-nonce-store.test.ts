@@ -233,3 +233,37 @@ describe("connectRedisNonceStore", () => {
     expect(lines.length).toBeGreaterThan(0);
   }, 20_000);
 });
+
+describe("checkEvictionPolicy", () => {
+  async function warnings(read: () => Promise<unknown>, timeoutMs?: number) {
+    const { checkEvictionPolicy } = await import("../../src/http/redis.js");
+    const lines: Array<{ msg: string; fields: unknown }> = [];
+    const logger = {
+      ...silentLogger,
+      warn: (msg: string, fields?: unknown) => void lines.push({ msg, fields }),
+    };
+    await checkEvictionPolicy(read, logger, timeoutMs);
+    return lines;
+  }
+
+  it("is silent for noeviction", async () => {
+    expect(await warnings(async () => ({ "maxmemory-policy": "noeviction" }))).toEqual([]);
+  });
+
+  it("warns for any other policy and names it", async () => {
+    const lines = await warnings(async () => ({ "maxmemory-policy": "allkeys-lru" }));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.msg).toContain("not noeviction");
+    expect(lines[0]?.fields).toMatchObject({ policy: "allkeys-lru" });
+    expect((await warnings(async () => ({})))[0]?.fields).toMatchObject({ policy: "unknown" });
+  });
+
+  it("only logs when CONFIG GET is refused or hangs; startup goes on", async () => {
+    const refused = await warnings(async () => {
+      throw new Error("ERR unknown command 'CONFIG'");
+    });
+    expect(refused[0]?.msg).toContain("could not read");
+    const hanging = await warnings(() => new Promise(() => {}), 50);
+    expect(hanging[0]?.msg).toContain("could not read");
+  });
+});
