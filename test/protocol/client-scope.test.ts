@@ -174,29 +174,33 @@ const CONFIRM_SECRET = "c".repeat(40);
 
 describe("client scope of curated tools", () => {
   it.each([
-    ["post_from_r", "createInvoiceByFactory", "class_exceeded"],
-    ["delete_from_r", "deleteContact", "class_exceeded"],
-    ["export_from_r", "exportContact", "class_exceeded"],
-    ["undeclared_read", "getContacts", "not_declared"],
-  ])("refuses %s (%s) before the network and audits it", async (tool, operationId, reason) => {
-    api.server.use(http.all(sevdeskUrl("/*"), () => HttpResponse.json({ objects: [] })));
-    const h = await harness();
-    const result = await h.call(tool);
-    expect(result.isError).toBe(true);
-    expect(api.requests).toEqual([]);
-    expect(textOf(result)).toContain(`${tool} may not call sevdesk operation ${operationId}`);
-    expect(textOf(result)).toContain("Nothing was sent to sevdesk.");
-    expect(h.audit).toEqual([
-      expect.objectContaining({
-        subject: "stdio",
-        tool,
-        operationId,
-        class: "R",
-        outcome: "denied",
-        reason: `client_scope:${reason}`,
-      }),
-    ]);
-  });
+    ["post_from_r", "createInvoiceByFactory", "W", "class_exceeded"],
+    ["delete_from_r", "deleteContact", "X", "class_exceeded"],
+    ["export_from_r", "exportContact", "R+", "class_exceeded"],
+    ["undeclared_read", "getContacts", "R", "not_declared"],
+  ])(
+    "refuses %s (%s, class %s) before the network and audits it",
+    async (tool, operationId, attemptedClass, reason) => {
+      api.server.use(http.all(sevdeskUrl("/*"), () => HttpResponse.json({ objects: [] })));
+      const h = await harness();
+      const result = await h.call(tool);
+      expect(result.isError).toBe(true);
+      expect(api.requests).toEqual([]);
+      expect(textOf(result)).toContain(`${tool} may not call sevdesk operation ${operationId}`);
+      expect(textOf(result)).toContain("Nothing was sent to sevdesk.");
+      expect(h.audit).toEqual([
+        expect.objectContaining({
+          subject: "stdio",
+          tool,
+          operationId,
+          class: "R",
+          attemptedClass,
+          outcome: "denied",
+          reason: `client_scope:${reason}`,
+        }),
+      ]);
+    },
+  );
 
   it("names the class conflict in the message", async () => {
     const h = await harness();

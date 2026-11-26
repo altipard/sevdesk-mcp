@@ -150,12 +150,18 @@ export interface GateEnv {
  * request is sent; a failing audit sink still denies.
  */
 export function createScopeGate(env: GateEnv): RequestGate {
-  const deny = (method: string, reason: string, operationId: OperationId | undefined): void => {
+  const deny = (
+    method: string,
+    reason: string,
+    operationId: OperationId | undefined,
+    attemptedClass: OperationClass | undefined,
+  ): void => {
     env.logger.warn("sevdesk request outside the tool scope", {
       tool: env.scope.tool,
       stage: env.scope.stage,
       method,
       operationId,
+      attemptedClass,
       reason,
     });
     try {
@@ -164,6 +170,7 @@ export function createScopeGate(env: GateEnv): RequestGate {
         tool: env.scope.tool,
         operationId,
         class: env.scope.class,
+        attemptedClass,
         outcome: "denied",
         reason: `client_scope:${env.scope.stage === "preview" ? "preview:" : ""}${reason}`,
       });
@@ -181,11 +188,11 @@ export function createScopeGate(env: GateEnv): RequestGate {
         request.url,
       );
       if (decision.ok) return;
-      deny(request.method, decision.reason, decision.operationId);
+      deny(request.method, decision.reason, decision.operationId, decision.class);
       throw new SevdeskError("policy", denialMessage(env.scope, request.method, decision));
     },
     callRefused(method, reason) {
-      deny(method, reason, undefined);
+      deny(method, reason, undefined, undefined);
     },
   };
 }
