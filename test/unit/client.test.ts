@@ -1,6 +1,7 @@
 import { delay, HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { createLogger } from "../../src/logger.js";
 import { createSevdeskClient, type SevdeskClientOptions } from "../../src/sevdesk/client.js";
 import { SevdeskError, type SevdeskErrorKind } from "../../src/sevdesk/errors.js";
 import { USER_AGENT } from "../../src/version.js";
@@ -714,5 +715,77 @@ describe("timeouts and deadline", () => {
         client.api.DELETE("/Contact/{contactId}", { params: { path: { contactId: 1 } } }),
       ),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("aborting during a retry wait", () => {
+  const retryAfter503 = (seconds: string) => {
+    let calls = 0;
+    server.use(
+      http.get(url("/Voucher"), () => {
+        calls++;
+        return HttpResponse.json({}, { status: 503, headers: { "Retry-After": seconds } });
+      }),
+    );
+    return () => calls;
+  };
+
+  it("ends a real Retry-After wait shortly before the deadline at once", async () => {
+    // The 5 s wait just fits the 6.1 s deadline, so the client would sleep.
+    const calls = retryAfter503("5");
+    const client = createSevdeskClient({
+      baseUrl: MOCK_BASE_URL,
+      token: TEST_TOKEN,
+      timeoutMs: 1000,
+      deadlineMs: 6100,
+    });
+    const controller = new AbortController();
+    const started = Date.now();
+    const pending = client.call(client.api.GET("/Voucher", { signal: controller.signal }));
+    setTimeout(() => controller.abort(), 50);
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(calls()).toBe(1);
+  });
+
+  it("hands the caller's signal to the sleep and stops waiting when it aborts", async () => {
+    const calls = retryAfter503("1");
+    const controller = new AbortController();
+    const signals: Array<AbortSignal | undefined> = [];
+    const { client } = setup({
+      sleep: (_ms, signal) => {
+        signals.push(signal);
+        controller.abort();
+        return new Promise(() => {});
+      },
+    });
+
+    await expect(
+      client.call(client.api.GET("/Voucher", { signal: controller.signal })),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(true);
+    expect(calls()).toBe(1);
+  });
+
+  it("does not start the wait when the caller aborted before it", async () => {
+    const calls = retryAfter503("1");
+    const controller = new AbortController();
+    // The retry warning is logged right before the wait; abort there.
+    const logger = createLogger({
+      level: "debug",
+      redact: [TEST_TOKEN],
+      write: (line) => {
+        if (line.includes("retrying")) controller.abort();
+      },
+    });
+    const { client, sleeps } = setup({ logger });
+
+    await expect(
+      client.call(client.api.GET("/Voucher", { signal: controller.signal })),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(sleeps).toEqual([]);
+    expect(calls()).toBe(1);
   });
 });

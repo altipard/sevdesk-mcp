@@ -26,8 +26,11 @@ export interface SevdeskClientOptions {
   maxResponseBytes?: number;
   retry?: Partial<RetryOptions>;
   logger?: Logger;
-  /** Injected in tests so retries do not wait in real time. */
-  sleep?: (ms: number) => Promise<void>;
+  /**
+   * Injected in tests so retries do not wait in real time. The signal
+   * aborts with the caller's request; the wait is abandoned either way.
+   */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Clock for the deadline, injected in tests together with `sleep`. */
   now?: () => number;
 }
@@ -55,7 +58,17 @@ export const DEFAULT_DEADLINE_MS = 60_000;
 export const DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_RETRY: RetryOptions = { maxRetries: 3, baseDelayMs: 500, maxDelayMs: 10_000 };
 
-const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+/** Waits `ms`; an abort clears the timer, so it does not outlive the call. */
+const realSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve) => {
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  });
 
 // 500 is left out on purpose: sevdesk answers some invalid input with 500,
 // and repeating that only multiplies the failure.
@@ -118,7 +131,7 @@ interface FetchPolicy {
   deadlineMs: number;
   retry: RetryOptions;
   logger: Logger;
-  sleep: (ms: number) => Promise<void>;
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   now: () => number;
 }
 
@@ -181,6 +194,19 @@ async function readFully(
     offset += chunk.byteLength;
   }
   return new Response(body, init);
+}
+
+/**
+ * The pause before a retry. A caller that aborts before or during it gets
+ * its abort at once instead of after the full Retry-After or backoff.
+ */
+async function waitUnlessAborted(
+  policy: FetchPolicy,
+  delayMs: number,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted) throw signal.reason;
+  await untilAborted(policy.sleep(delayMs, signal), signal);
 }
 
 /**
@@ -254,7 +280,7 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
             kind,
             delayMs: delay,
           });
-          await policy.sleep(delay);
+          await waitUnlessAborted(policy, delay, request.signal);
           continue;
         }
         // A write may have reached sevdesk before the connection failed, so
@@ -313,7 +339,7 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
         status: response.status,
         delayMs: delay,
       });
-      await policy.sleep(delay);
+      await waitUnlessAborted(policy, delay, request.signal);
     }
   };
 }
