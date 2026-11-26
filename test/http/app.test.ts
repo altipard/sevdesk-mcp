@@ -126,6 +126,8 @@ describe("token validation at the bearer gate (spike point 1)", () => {
       await signToken(fx.iss, server.resourceUrl.href),
     );
     expect(response.status).toBe(500);
+    // The bare 500 says nothing; the log names the cause.
+    expect(server.logLines.join("")).toContain('"msg":"token verification failed"');
   });
 
   it("a token from another issuer with its own keys: 401", async () => {

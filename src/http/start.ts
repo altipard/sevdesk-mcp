@@ -1,6 +1,7 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { toNodeHandler } from "@modelcontextprotocol/node";
+import { OAuthError, type OAuthTokenVerifier } from "@modelcontextprotocol/server";
 import { createRemoteJWKSet } from "jose";
 import {
   type Config,
@@ -137,12 +138,24 @@ export async function startHttpServer(options: StartHttpOptions = {}): Promise<R
     const sevdesk =
       options.sevdesk ??
       createSevdeskClient({ baseUrl: config.baseUrl, token: config.sevdeskApiToken, logger });
-    const verifier = createJwtVerifier({
+    const jwt = createJwtVerifier({
       issuer: http.issuer,
       resource: http.resourceUrl,
       keys: createRemoteJWKSet(http.jwksUrl),
       algorithms: http.algorithms,
     });
+    // The gate answers anything but an OAuthError with a bare 500 (e.g. the
+    // issuer's keys cannot be fetched); log the cause for the operator.
+    const verifier: OAuthTokenVerifier = {
+      verifyAccessToken: async (token) => {
+        try {
+          return await jwt.verifyAccessToken(token);
+        } catch (error) {
+          if (!(error instanceof OAuthError)) logger.error("token verification failed", { error });
+          throw error;
+        }
+      },
+    };
     app = createHttpApp({
       resourceUrl: http.resourceUrl,
       allowedHosts: http.allowedHosts,
