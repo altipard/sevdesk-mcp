@@ -211,7 +211,7 @@ jobs:
         run: |
           mkdir -p out/pack
           npm pack --pack-destination out/pack
-          set -- out/pack/*.tgz
+          set -- ./out/pack/*.tgz
           if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
             echo "::error::expected exactly one tarball, found: $*"
             exit 1
@@ -262,10 +262,11 @@ jobs:
           path: pack
 
       # The tarball must be the one the pack job built, for this package and this version.
+      # The path keeps its ./ prefix: npm reads "pack/x.tgz" as a GitHub user/repo shorthand.
       - name: check the tarball
         id: tarball
         run: |
-          set -- pack/*.tgz
+          set -- ./pack/*.tgz
           if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
             echo "::error::expected exactly one tarball, found: $*"
             exit 1
