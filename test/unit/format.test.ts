@@ -122,6 +122,28 @@ describe("untrusted text", () => {
     expect(text("​ \u0000")).toBeNull();
   });
 
+  it.each([
+    ["Unicode tag block (ASCII smuggling)", "\u{E0041}\u{E0042}\u{E007F}"],
+    ["variation selectors", "\uFE00\uFE0F\u{E0100}\u{E01EF}"],
+    ["Mongolian vowel separator", "\u180E"],
+    ["Arabic letter mark", "\u061C"],
+    ["combining grapheme joiner", "\u034F"],
+    ["Hangul fillers", "\u115F\u1160\u3164\uFFA0"],
+    ["format characters (Cf)", "\u200B\u200D\u2066\u00AD\uFEFF"],
+    ["line and paragraph separators", "\u2028\u2029"],
+    ["control characters (Cc)", "\u0000\u001B\u007F\u0085"],
+    ["private use (Co)", "\uE000\u{F0000}"],
+    ["unassigned and noncharacters (Cn)", "\uFDD0\uFFFF"],
+  ])("drops %s", (_name, hidden) => {
+    expect(text(`a${hidden}b`)).toBe("ab");
+    expect(text(hidden)).toBeNull();
+  });
+
+  it("keeps umlauts, accents, euro signs, CJK and emoji", () => {
+    const visible = "Müller & Söhne – größer 12,50 € café 日本語 \u{1F600} \u{1F4B6}";
+    expect(text(visible)).toBe(visible);
+  });
+
   it("caps long texts with a mark and leaves short ones alone", () => {
     const capped = text("a".repeat(MAX_TEXT_LENGTH + 1)) ?? "";
     expect(capped).toHaveLength(MAX_TEXT_LENGTH);
