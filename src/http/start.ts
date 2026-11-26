@@ -170,9 +170,11 @@ export async function startHttpServer(options: StartHttpOptions = {}): Promise<R
     throw error;
   }
 
-  // Requests other than GET are tool calls and other exchanges that should
-  // finish on shutdown; GET holds long-lived listen streams, which the MCP
-  // handler aborts when it closes.
+  // Shutdown waits for requests other than GET: tool calls and the like. A
+  // 2026-07-28 subscriptions/listen stream is a POST as well and never ends
+  // by itself, so with an open subscription the wait runs into the timeout;
+  // closing the MCP handler then ends the stream gracefully. GET carries
+  // only the legacy standalone stream, which that close ends too.
   let inFlight = 0;
   let idle: (() => void) | undefined;
   const handle = toNodeHandler(app, {

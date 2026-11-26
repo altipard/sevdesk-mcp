@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { httpFixture, rawPost, signToken } from "./support.js";
+import { httpFixture, READ, rawPost, signToken } from "./support.js";
 
 const fx = httpFixture();
 const tick = (ms = 50) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -21,9 +21,9 @@ describe("graceful shutdown", () => {
     const server = await fx.server({}, { shutdownTimeoutMs: 5000 });
     const token = await signToken(fx.iss, server.resourceUrl.href);
     // The gate waits for the issuer's keys, so the request stays in flight.
-    const release = fx.iss.hold();
+    const { release, arrived } = fx.iss.hold();
     const pending = rawPost(server.resourceUrl, token);
-    await tick();
+    await arrived;
 
     let stopped = false;
     const stopping = server.shutdown("SIGTERM").then((result) => {
@@ -45,13 +45,13 @@ describe("graceful shutdown", () => {
   it("cuts connections that are still busy after the timeout", async () => {
     const server = await fx.server({}, { shutdownTimeoutMs: 200 });
     const token = await signToken(fx.iss, server.resourceUrl.href);
-    const release = fx.iss.hold();
+    const { release, arrived } = fx.iss.hold();
     try {
       const pending = rawPost(server.resourceUrl, token).then(
         (r) => r.status,
         () => "cut",
       );
-      await tick();
+      await arrived;
       const started = Date.now();
       expect(await server.shutdown("SIGTERM")).toEqual({ forced: true });
       expect(Date.now() - started).toBeLessThan(2000);
@@ -89,5 +89,29 @@ describe("graceful shutdown", () => {
       }),
     );
     expect(mcp.status).toBe(503);
+  });
+
+  it("ends an open subscriptions/listen stream gracefully once the timeout is reached", async () => {
+    const server = await fx.server({}, { shutdownTimeoutMs: 300 });
+    const token = await signToken(fx.iss, server.resourceUrl.href, { scope: READ });
+    const { client } = await fx.client(server.resourceUrl, token);
+    const subscription = await client.listen({ toolsListChanged: true });
+    const started = Date.now();
+    expect(await server.shutdown("SIGTERM")).toEqual({ forced: false });
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(await subscription.closed).toBe("graceful");
+  });
+});
+
+describe("secrets in the environment", () => {
+  it("are removed from the environment the server was started with", async () => {
+    const server = await fx.server();
+    for (const name of ["SEVDESK_API_TOKEN", "SEVDESK_CONFIRM_SECRET", "REDIS_URL"]) {
+      expect(server.env, name).not.toHaveProperty(name);
+    }
+    // Everything else stays.
+    expect(server.env.MCP_RESOURCE_URL).toBe(server.resourceUrl.href);
+    // And the server still works with the values it loaded.
+    expect((await fetch(`${server.resourceUrl.origin}/healthz`)).status).toBe(200);
   });
 });

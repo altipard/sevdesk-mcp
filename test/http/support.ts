@@ -53,8 +53,10 @@ export function close(server: Server): Promise<void> {
 export async function startIssuer() {
   const key = await makeKey("test-key-1");
   let gate: Promise<void> | undefined;
+  let arrived: (() => void) | undefined;
   const server = createServer(async (req, res) => {
     if (req.url === "/jwks") {
+      arrived?.();
       await gate;
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ keys: [key.publicJwk] }));
@@ -67,15 +69,25 @@ export async function startIssuer() {
     issuer,
     jwksUrl: `${issuer}/jwks`,
     key,
-    /** Holds JWKS answers until the returned function is called. */
-    hold(): () => void {
+    /**
+     * Holds JWKS answers until `release` is called. `arrived` resolves when
+     * the first held request reaches the issuer, i.e. a gate is waiting.
+     */
+    hold(): { release: () => void; arrived: Promise<void> } {
       let release = () => {};
       gate = new Promise<void>((resolve) => {
         release = resolve;
       });
-      return () => {
-        gate = undefined;
-        release();
+      const reached = new Promise<void>((resolve) => {
+        arrived = resolve;
+      });
+      return {
+        arrived: reached,
+        release: () => {
+          gate = undefined;
+          arrived = undefined;
+          release();
+        },
       };
     },
     close: () => close(server),
@@ -156,6 +168,8 @@ export interface TestServer extends RunningHttpServer {
   readonly resourceUrl: URL;
   readonly redis: FakeRedis;
   readonly logLines: string[];
+  /** The environment object the server was started with. */
+  readonly env: Record<string, string | undefined>;
   /** Whether shutdown closed the nonce store connection. */
   redisClosed(): boolean;
   /** Parsed audit events written so far. */
@@ -184,6 +198,20 @@ export async function startTestServer(
   const redis = new FakeRedis();
   const logLines: string[] = [];
   let redisClosed = false;
+  const serverEnv: Record<string, string | undefined> = {
+    PORT: port,
+    SEVDESK_API_TOKEN: TEST_TOKEN,
+    SEVDESK_BASE_URL: sevdesk.baseUrl,
+    SEVDESK_CONFIRM_SECRET: CONFIRM_SECRET,
+    SEVDESK_MODE: "write",
+    LOG_LEVEL: "debug",
+    MCP_RESOURCE_URL: `http://127.0.0.1:${port}/mcp`,
+    OAUTH_ISSUER: iss.issuer,
+    OAUTH_JWKS_URL: iss.jwksUrl,
+    OAUTH_ALLOW_INSECURE_HTTP: "true",
+    REDIS_URL: "redis://:redis-password@redis.test:6379",
+    ...env,
+  };
   const running = await startHttpServer({
     host: "127.0.0.1",
     writeLine: (line) => logLines.push(line),
@@ -194,25 +222,13 @@ export async function startTestServer(
       },
     }),
     ...options,
-    env: {
-      PORT: port,
-      SEVDESK_API_TOKEN: TEST_TOKEN,
-      SEVDESK_BASE_URL: sevdesk.baseUrl,
-      SEVDESK_CONFIRM_SECRET: CONFIRM_SECRET,
-      SEVDESK_MODE: "write",
-      LOG_LEVEL: "debug",
-      MCP_RESOURCE_URL: `http://127.0.0.1:${port}/mcp`,
-      OAUTH_ISSUER: iss.issuer,
-      OAUTH_JWKS_URL: iss.jwksUrl,
-      OAUTH_ALLOW_INSECURE_HTTP: "true",
-      REDIS_URL: "redis://:redis-password@redis.test:6379",
-      ...env,
-    },
+    env: serverEnv,
   });
   return Object.assign(running, {
     resourceUrl: new URL(env.MCP_RESOURCE_URL ?? `http://127.0.0.1:${port}/mcp`),
     redis,
     logLines,
+    env: serverEnv,
     redisClosed: () => redisClosed,
     audit: () =>
       logLines
