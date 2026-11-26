@@ -305,6 +305,9 @@ const typeTotalsSchema = totalsSchema.extend({
   invoiceTypeName: z.string().nullable(),
 });
 
+/** totalsByType bucket for invoices without an invoiceType. */
+const OTHER_TYPE = "other";
+
 const INVOICE_TYPE_CODES = Object.keys(INVOICE_TYPE) as [string, ...string[]];
 
 /**
@@ -399,6 +402,11 @@ export const listOpenReceivables = defineTool({
   async handler(args, call) {
     const asOf = todayIso();
     const types = new Set<string>(args.invoiceTypes);
+    // Invoices sevdesk sent without a type are receivables like any other
+    // under the default filter; an explicit type list stays exact.
+    const untypedIncluded =
+      types.size === DEFAULT_RECEIVABLE_TYPES.length &&
+      DEFAULT_RECEIVABLE_TYPES.every((type) => types.has(type));
     const open = await scanStatus(call, 200, args.contactId);
     const partial = await scanStatus(call, 750, args.contactId);
     const truncated = open.truncated || partial.truncated;
@@ -410,7 +418,9 @@ export const listOpenReceivables = defineTool({
         return { ...invoice, overdue: days > 0, daysOverdue: Math.max(0, days) };
       })
       .filter((invoice) => !args.overdueOnly || invoice.overdue)
-      .filter((invoice) => invoice.invoiceType !== null && types.has(invoice.invoiceType))
+      .filter((invoice) =>
+        invoice.invoiceType === null ? untypedIncluded : types.has(invoice.invoiceType),
+      )
       .sort((a, b) => (a.dueDate ?? "9999").localeCompare(b.dueDate ?? "9999") || a.id - b.id);
 
     const totals = new Map<string, Totals>();
@@ -420,10 +430,10 @@ export const listOpenReceivables = defineTool({
       const entry = totals.get(key) ?? emptyTotals(invoice.currency);
       addTo(entry, invoice);
       totals.set(key, entry);
-      const typeKey = `${invoice.invoiceType}\u0000${key}`;
+      const typeKey = `${invoice.invoiceType ?? OTHER_TYPE}\u0000${key}`;
       const typeEntry = byType.get(typeKey) ?? {
-        invoiceType: invoice.invoiceType,
-        invoiceTypeName: invoice.invoiceTypeName,
+        invoiceType: invoice.invoiceType ?? OTHER_TYPE,
+        invoiceTypeName: invoice.invoiceTypeName ?? OTHER_TYPE,
         ...emptyTotals(invoice.currency),
       };
       addTo(typeEntry, invoice);
