@@ -29,8 +29,8 @@ export type OperationClass = (typeof OPERATION_CLASSES)[number];
  *
  * Parameters that would lift an operation into a higher class are pinned by
  * the fallback instead (FORCED_PARAMS in src/tools/generic.ts): getPdf always
- * runs with preventSendBy=true, so it is R here, and the DATEV exports always
- * run with enshrine/enshrineDocuments=false.
+ * runs with preventSendBy=true, so it is R here, and the DATEV exports never
+ * send enshrine/enshrineDocuments=true.
  */
 export const CLASSIFICATION = {
   // Basics

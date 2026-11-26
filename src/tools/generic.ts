@@ -78,11 +78,12 @@ export const DEFAULT_API_ALLOW: readonly OperationId[] = [
 ];
 
 /**
- * Parameters the server always sets itself, because the other value would
- * lift the operation into a higher class: getPdf without preventSendBy marks
- * the document as sent (W+), the DATEV exports with enshrine/enshrineDocuments
+ * Parameters the server pins, because the other value would lift the
+ * operation into a higher class: getPdf without preventSendBy marks the
+ * document as sent (W+), the DATEV exports with enshrine/enshrineDocuments
  * enshrine every exported record (X). A caller asking for the other value
- * gets an error instead of a silent override.
+ * gets an error. `true` is sent explicitly; `false` is sent by leaving the
+ * parameter out, so nothing depends on how sevdesk parses the string "false".
  */
 export const FORCED_PARAMS: Readonly<Record<string, boolean>> = {
   preventSendBy: true,
@@ -232,6 +233,8 @@ export function buildRequest(
       if (value !== undefined && value !== forced && value !== String(forced)) {
         fail(`${spec.name} is always ${forced} on this server`);
       }
+      // Omitted means off for these flags; see FORCED_PARAMS.
+      if (!forced) continue;
       value = forced;
     }
     if (value === undefined && spec.name === "limit" && spec.in === "query") {

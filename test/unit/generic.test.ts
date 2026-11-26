@@ -171,7 +171,11 @@ describe("buildRequest", () => {
 
   it("never lets a DATEV export enshrine documents", () => {
     const csv = build("exportDatevCSV", { startDate: 1, endDate: 2, scope: "EXRN" });
-    expect(csv.path).toContain("enshrineDocuments=false");
+    expect(csv.path).not.toContain("enshrine");
+    expect(
+      build("exportDatevCSV", { startDate: 1, endDate: 2, scope: "E", enshrineDocuments: false })
+        .path,
+    ).toBe(csv.path.replace("EXRN", "E"));
     rejects(
       "exportDatevCSV",
       { startDate: 1, endDate: 2, scope: "E", enshrineDocuments: true },
