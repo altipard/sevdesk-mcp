@@ -1,10 +1,18 @@
 import { type ToolDefinition, withOperations } from "../policy/registry.js";
 import { getAccountInfo } from "./account.js";
 import { listBankAccounts, searchTransactions } from "./banking.js";
+import { createContact, updateContact } from "./contact-writes.js";
 import { getContact, searchContacts } from "./contacts.js";
+import { createInvoiceDraft, createInvoiceFromOrder, createOrderDraft } from "./document-drafts.js";
 import { getDocumentPdf } from "./documents.js";
 import { GENERIC_TOOL_NAME } from "./generic.js";
 import { getTaxGuidance } from "./guidance.js";
+import {
+  bookInvoicePayment,
+  cancelInvoice,
+  markInvoiceSent,
+  sendInvoiceEmail,
+} from "./invoice-actions.js";
 import { getInvoice, listOpenReceivables, searchInvoices } from "./invoices.js";
 import { searchOrders } from "./orders.js";
 import { searchParts } from "./parts.js";
@@ -35,6 +43,15 @@ export const TOOLS: readonly ToolDefinition[] = [
   searchParts,
   withOperations(getTaxGuidance, ["forRevenue", "forExpense", "forAccountNumber", "forTaxRule"]),
   withOperations(getReport, ["reportOrder", "reportContact", "reportVoucher"]),
+  createContact,
+  updateContact,
+  createInvoiceDraft,
+  createOrderDraft,
+  createInvoiceFromOrder,
+  markInvoiceSent,
+  bookInvoicePayment,
+  sendInvoiceEmail,
+  cancelInvoice,
 ];
 
 /** Names valid in SEVDESK_ALLOWED_TOOLS, SEVDESK_DENIED_TOOLS and SEVDESK_ENABLE_TOOLS. */
