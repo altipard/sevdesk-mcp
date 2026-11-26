@@ -41,6 +41,10 @@ services:
   mcp:
     profiles: ["app"]
     build: .
+    # Shutdown waits up to 10 s for in-flight requests and exits at the
+    # latest after 15 s. Give it more than that before SIGKILL; on Kubernetes
+    # set terminationGracePeriodSeconds to at least 20 for the same reason.
+    stop_grace_period: 20s
     depends_on:
       redis:
         condition: service_healthy
