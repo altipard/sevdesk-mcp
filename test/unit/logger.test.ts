@@ -47,5 +47,6 @@ describe("createLogger", () => {
     const entry = JSON.parse(lines[0] ?? "");
     expect(entry).toMatchObject({ level: "warn", msg: "real message", extra: 1 });
     expect(entry.time).not.toBe("fake");
+    expect(Object.keys(entry)).toEqual(["time", "level", "msg", "extra"]);
   });
 });

@@ -44,8 +44,10 @@ export function createLogger(options: LoggerOptions): Logger {
 
   const log = (level: LogLevel, msg: string, fields?: LogFields): void => {
     if (LOG_LEVELS.indexOf(level) < threshold) return;
-    // Fields first: a field named time, level or msg must not hide the real ones.
-    const entry = { ...fields, time: new Date().toISOString(), level, msg };
+    // time, level and msg lead every line. Fields with those names are
+    // dropped, so they can neither hide the real values nor duplicate keys.
+    const { time: _time, level: _level, msg: _msg, ...rest } = fields ?? {};
+    const entry = { time: new Date().toISOString(), level, msg, ...rest };
     let line: string;
     try {
       line = JSON.stringify(entry, replacer);
