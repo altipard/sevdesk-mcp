@@ -12,6 +12,8 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     mode: "read",
     baseUrl: MOCK_BASE_URL,
     logLevel: "debug",
+    deniedTools: [],
+    confirmTtlSeconds: 300,
     ...overrides,
   };
 }

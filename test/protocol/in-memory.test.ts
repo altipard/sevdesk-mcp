@@ -43,7 +43,7 @@ describe("MCP protocol over the in-memory transport", () => {
         type: "object",
         properties: {
           bookkeepingSystemVersion: { type: "string" },
-          mode: { enum: ["read", "write"] },
+          mode: { enum: ["read", "write", "full"] },
         },
         required: ["bookkeepingSystemVersion", "mode"],
       });
