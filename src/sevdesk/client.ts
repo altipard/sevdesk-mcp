@@ -17,11 +17,16 @@ export interface SevdeskClientOptions {
   baseUrl: string;
   token: string;
   userAgent?: string;
+  /** Per attempt, covering headers and body. */
   timeoutMs?: number;
+  /** Upper bound for one call including all retries and waits. */
+  deadlineMs?: number;
   retry?: Partial<RetryOptions>;
   logger?: Logger;
   /** Injected in tests so retries do not wait in real time. */
   sleep?: (ms: number) => Promise<void>;
+  /** Clock for the deadline, injected in tests together with `sleep`. */
+  now?: () => number;
 }
 
 export type SevdeskApi = Client<paths>;
@@ -37,6 +42,7 @@ type ApiResult<T> =
   | { data?: never; error: unknown; response: Response };
 
 export const DEFAULT_TIMEOUT_MS = 30_000;
+export const DEFAULT_DEADLINE_MS = 60_000;
 export const DEFAULT_RETRY: RetryOptions = { maxRetries: 3, baseDelayMs: 500, maxDelayMs: 10_000 };
 
 const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -84,36 +90,62 @@ function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 
 interface FetchPolicy {
   timeoutMs: number;
+  deadlineMs: number;
   retry: RetryOptions;
   logger: Logger;
   sleep: (ms: number) => Promise<void>;
+  now: () => number;
+}
+
+const NULL_BODY_STATUS = new Set([204, 205, 304]);
+
+/**
+ * Reads the whole body within the attempt, so a stalled body hits the same
+ * timeout and retry handling as stalled headers instead of surfacing later
+ * as a raw DOMException in openapi-fetch.
+ */
+async function readFully(response: Response, signal: AbortSignal): Promise<Response> {
+  const init = {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  };
+  if (NULL_BODY_STATUS.has(response.status)) {
+    await response.body?.cancel();
+    return new Response(null, init);
+  }
+  return new Response(await untilAborted(response.arrayBuffer(), signal), init);
 }
 
 /**
- * fetch with a per-attempt timeout and retries. Retries happen only for
- * GET: sevdesk sometimes answers 500 to bad input, and repeating a write
- * could create or send something twice.
+ * fetch with a per-attempt timeout, an overall deadline and retries.
+ * Retries happen only for GET: repeating a write could create or send
+ * something twice.
  */
 function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<Response> {
   return async (request) => {
     const method = request.method.toUpperCase();
     const maxAttempts = method === "GET" ? policy.retry.maxRetries + 1 : 1;
     const path = new URL(request.url).pathname;
+    const deadline = policy.now() + policy.deadlineMs;
+    const fitsDeadline = (delayMs: number) => policy.now() + delayMs < deadline;
 
     for (let attempt = 1; ; attempt++) {
-      const timeout = AbortSignal.timeout(policy.timeoutMs);
+      const attemptTimeoutMs = Math.max(1, Math.min(policy.timeoutMs, deadline - policy.now()));
+      const timeout = AbortSignal.timeout(attemptTimeoutMs);
+      const signal = AbortSignal.any([request.signal, timeout]);
       const started = performance.now();
       const canRetry = attempt < maxAttempts;
       let response: Response;
 
       try {
-        const signal = AbortSignal.any([request.signal, timeout]);
-        response = await untilAborted(fetch(new Request(request, { signal })), signal);
+        const raw = await untilAborted(fetch(new Request(request, { signal })), signal);
+        response = await readFully(raw, signal);
       } catch (error) {
         if (request.signal.aborted) throw error;
         const kind = timeout.aborted ? "timeout" : "network";
-        if (canRetry) {
-          const delay = backoffDelay(attempt, policy.retry);
+        const delay = backoffDelay(attempt, policy.retry);
+        if (canRetry && fitsDeadline(delay)) {
           policy.logger.warn("sevdesk request failed, retrying", {
             method,
             path,
@@ -127,7 +159,7 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
         if (kind === "timeout") {
           throw new SevdeskError(
             "timeout",
-            `sevdesk did not answer within ${policy.timeoutMs} ms.`,
+            `sevdesk did not answer within ${attemptTimeoutMs} ms.`,
           );
         }
         const code = networkErrorCode(error);
@@ -150,11 +182,10 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
         retryAfter === undefined
           ? backoffDelay(attempt, policy.retry)
           : Math.max(policy.retry.baseDelayMs, retryAfter);
-      // A server asking for a longer pause than we are willing to wait gets
-      // the error passed through, including its Retry-After hint.
-      if (delay > policy.retry.maxDelayMs) return response;
+      // A server asking for a longer pause than we are willing to wait, or
+      // one past the deadline, gets its error passed through as is.
+      if (delay > policy.retry.maxDelayMs || !fitsDeadline(delay)) return response;
 
-      await response.body?.cancel();
       policy.logger.warn("sevdesk request failed, retrying", {
         method,
         path,
@@ -171,9 +202,11 @@ export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClien
   const redact: Redactor = createRedactor([options.token]);
   const policy: FetchPolicy = {
     timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    deadlineMs: options.deadlineMs ?? DEFAULT_DEADLINE_MS,
     retry: { ...DEFAULT_RETRY, ...options.retry },
     logger: options.logger ?? silentLogger,
     sleep: options.sleep ?? realSleep,
+    now: options.now ?? Date.now,
   };
 
   const api = createClient<paths>({
@@ -198,6 +231,12 @@ export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClien
         // that is not JSON surfaces here as a SyntaxError.
         if (error instanceof SyntaxError) {
           throw new SevdeskError("http_error", "sevdesk sent a response that is not valid JSON.");
+        }
+        // Bodies are read inside the fetch policy, so this is a safety net
+        // for a timeout that still escapes. A caller's own abort (AbortError)
+        // is passed through unchanged.
+        if (error instanceof Error && error.name === "TimeoutError") {
+          throw new SevdeskError("timeout", "sevdesk did not answer in time.");
         }
         throw error;
       }

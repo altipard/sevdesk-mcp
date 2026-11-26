@@ -387,3 +387,58 @@ describe("token never leaks", () => {
     expect(logLines.join("")).not.toContain(TEST_TOKEN);
   });
 });
+
+describe("timeouts and deadline", () => {
+  it("stops retrying when the next wait would pass the deadline", async () => {
+    let clock = 0;
+    let calls = 0;
+    const waits: number[] = [];
+    server.use(
+      http.get(url("/Voucher"), () => {
+        calls++;
+        return HttpResponse.json({}, { status: 503, headers: { "Retry-After": "0" } });
+      }),
+    );
+    const { client } = setup({
+      deadlineMs: 1000,
+      retry: { maxRetries: 10, baseDelayMs: 300 },
+      now: () => clock,
+      sleep: async (ms) => {
+        waits.push(ms);
+        clock += ms;
+      },
+    });
+
+    const error = await captureError(client.call(client.api.GET("/Voucher")));
+
+    expect(error.kind).toBe("server_error");
+    expect(waits).toEqual([300, 300, 300]);
+    expect(calls).toBe(4);
+  });
+
+  it("shortens the attempt timeout to the remaining deadline", async () => {
+    server.use(
+      http.get(url("/Part"), async () => {
+        await delay(500);
+        return HttpResponse.json({ objects: [] });
+      }),
+    );
+    const { client } = setup({ timeoutMs: 10_000, deadlineMs: 40, now: () => 0 });
+
+    const error = await captureError(client.call(client.api.GET("/Part")));
+
+    expect(error.kind).toBe("timeout");
+    expect(error.message).toBe("sevdesk did not answer within 40 ms.");
+  });
+
+  it("passes a 204 through without a body", async () => {
+    server.use(http.delete(url("/Contact/:id"), () => new HttpResponse(null, { status: 204 })));
+    const { client } = setup();
+
+    await expect(
+      client.call(
+        client.api.DELETE("/Contact/{contactId}", { params: { path: { contactId: 1 } } }),
+      ),
+    ).resolves.toBeUndefined();
+  });
+});
