@@ -4,7 +4,7 @@ import { type Logger, silentLogger } from "../logger.js";
 import { enforceRequestPins, PinViolation } from "../policy/pins.js";
 import { createRedactor, type Redactor } from "../redact.js";
 import { USER_AGENT } from "../version.js";
-import { mapHttpError, parseRetryAfter, SevdeskError } from "./errors.js";
+import { mapHttpError, OUTCOME_UNKNOWN, parseRetryAfter, SevdeskError } from "./errors.js";
 
 export interface RetryOptions {
   /** Additional attempts after the first one. Only GET requests are retried. */
@@ -97,6 +97,11 @@ function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 
 interface FetchPolicy {
   baseUrl: string;
+  /**
+   * The request may have a side effect even if it is a GET (single-attempt
+   * client). Failures then carry the "outcome unknown" warning.
+   */
+  sideEffects: boolean;
   timeoutMs: number;
   deadlineMs: number;
   retry: RetryOptions;
@@ -104,6 +109,9 @@ interface FetchPolicy {
   sleep: (ms: number) => Promise<void>;
   now: () => number;
 }
+
+/** Internal marker on responses whose request may have had an effect. */
+const OUTCOME_HEADER = "x-sevdesk-mcp-outcome";
 
 const NULL_BODY_STATUS = new Set([204, 205, 304]);
 
@@ -142,6 +150,7 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
       throw error;
     }
     const method = request.method.toUpperCase();
+    const mayHaveSideEffect = method !== "GET" || policy.sideEffects;
     const maxAttempts = method === "GET" ? policy.retry.maxRetries + 1 : 1;
     const path = new URL(request.url).pathname;
     const deadline = policy.now() + policy.deadlineMs;
@@ -180,8 +189,7 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
         }
         // A write may have reached sevdesk before the connection failed, so
         // the caller must not simply repeat it.
-        const unknownOutcome =
-          method === "GET" ? "" : " The outcome is unknown: check sevdesk before retrying.";
+        const unknownOutcome = mayHaveSideEffect ? ` ${OUTCOME_UNKNOWN}` : "";
         if (kind === "timeout") {
           const within = deadlineHit
             ? `within the ${policy.deadlineMs} ms deadline`
@@ -203,6 +211,18 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
         attempt,
         durationMs: Math.round(performance.now() - started),
       });
+
+      // A server error on a request with side effects does not prove that
+      // nothing happened; mark it so the error message says so.
+      if (mayHaveSideEffect && response.status >= 500) {
+        const headers = new Headers(response.headers);
+        headers.set(OUTCOME_HEADER, "unknown");
+        response = new Response(response.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers,
+        });
+      }
 
       if (!canRetry || !isRetryableStatus(response.status)) return response;
 
@@ -232,6 +252,7 @@ export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClien
   const redact: Redactor = createRedactor([options.token]);
   const policy: FetchPolicy = {
     baseUrl: options.baseUrl,
+    sideEffects: false,
     timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     deadlineMs: options.deadlineMs ?? DEFAULT_DEADLINE_MS,
     retry: { ...DEFAULT_RETRY, ...options.retry },
@@ -252,7 +273,11 @@ export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClien
       fetch: createPolicyFetch(fetchPolicy),
     });
   const api = clientFor(policy);
-  const apiSingleAttempt = clientFor({ ...policy, retry: { ...policy.retry, maxRetries: 0 } });
+  const apiSingleAttempt = clientFor({
+    ...policy,
+    sideEffects: true,
+    retry: { ...policy.retry, maxRetries: 0 },
+  });
 
   return {
     api,
@@ -278,6 +303,7 @@ export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClien
       const { data, error, response } = result;
       if (response.ok) return data as T;
       throw mapHttpError({
+        outcomeUnknown: response.headers.get(OUTCOME_HEADER) === "unknown",
         status: response.status,
         body: error,
         retryAfter: response.headers.get("retry-after"),

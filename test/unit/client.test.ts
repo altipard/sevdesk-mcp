@@ -606,6 +606,44 @@ describe("timeouts and deadline", () => {
     expect(sleeps).toEqual([]);
   });
 
+  it("warns about an unknown outcome when a write gets a server error", async () => {
+    server.use(
+      http.post(url("/Contact"), () => HttpResponse.json({}, { status: 503 })),
+      http.get(url("/Contact"), () => HttpResponse.json({}, { status: 503 })),
+    );
+    const { client } = setup({ retry: { maxRetries: 0 } });
+
+    const write = await captureError(
+      client.call(client.api.POST("/Contact", { body: {} as never })),
+    );
+    expect(write.message).toBe(
+      "sevdesk server error (503) The outcome is unknown: check sevdesk before retrying.",
+    );
+
+    const read = await captureError(client.call(client.api.GET("/Contact")));
+    expect(read.message).toBe("sevdesk server error (503)");
+  });
+
+  it("warns about an unknown outcome for single-attempt GETs", async () => {
+    server.use(
+      http.get(url("/Part"), () => HttpResponse.json({}, { status: 502 })),
+      http.get(url("/Voucher"), async () => {
+        await delay(500);
+        return HttpResponse.json({});
+      }),
+    );
+    const { client } = setup({ timeoutMs: 20 });
+
+    const status = await captureError(client.call(client.apiSingleAttempt.GET("/Part")));
+    expect(status.message).toBe(
+      "sevdesk server error (502) The outcome is unknown: check sevdesk before retrying.",
+    );
+    const timeout = await captureError(client.call(client.apiSingleAttempt.GET("/Voucher")));
+    expect(timeout.message).toBe(
+      "sevdesk did not answer within 20 ms. The outcome is unknown: check sevdesk before retrying.",
+    );
+  });
+
   it("passes a 204 through without a body", async () => {
     server.use(http.delete(url("/Contact/:id"), () => new HttpResponse(null, { status: 204 })));
     const { client } = setup();
