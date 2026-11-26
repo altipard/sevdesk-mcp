@@ -317,6 +317,25 @@ describe("sevdesk_api_request class rules", () => {
     });
   });
 
+  it("treats SEVDESK_API_ALLOW as the operator's release for X when the client cannot ask", async () => {
+    api.use(http.delete(`${MOCK_BASE_URL}/Tag/3`, () => HttpResponse.json({ objects: [null] })));
+    // No elicitation capability and no answer handler: nobody can be asked.
+    const c = await open({ mode: "full", apiAllow: ["deleteTag"] });
+    const args = { operationId: "deleteTag", params: { tagId: 3 } };
+    const first = await call(c, args);
+    expect(body(first).status).toBe("confirmation_required");
+    expect(seen).toEqual([]);
+
+    const done = await call(c, { ...args, confirmation_token: body(first).confirmation_token });
+
+    expect(done.isError).toBeFalsy();
+    expect(body(done)).toMatchObject({ operationId: "deleteTag" });
+    expect(seen.map((r) => `${r.method} ${new URL(r.url).pathname}`)).toEqual([
+      "DELETE /api/v1/Tag/3",
+    ]);
+    expect(c.audit().map((e) => e.outcome)).toEqual(["confirmation_issued", "ok"]);
+  });
+
   it("does not run X when the user declines", async () => {
     const c = await open({ mode: "full", apiAllow: ["deleteTag"] }, "decline");
     const args = { operationId: "deleteTag", params: { tagId: 3 } };
