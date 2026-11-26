@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">sevdesk-mcp logo: owl bookkeeper with spectacles</title>
+  <!-- feet -->
+  <path d="M100 222 h20 v14 h-20 Z M136 222 h20 v14 h-20 Z" fill="#f2c94c" stroke="#1d1730" stroke-width="6" stroke-linejoin="round"/>
+  <!-- body with ear tufts -->
+  <path d="M64 88 L58 34 L104 66 Q128 60 152 66 L198 34 L192 88 Q214 136 200 180 Q182 228 128 228 Q74 228 56 180 Q42 136 64 88 Z" fill="#6b4fa0" stroke="#1d1730" stroke-width="8" stroke-linejoin="round"/>
+  <!-- belly -->
+  <path d="M128 148 C164 148 182 172 176 196 C170 216 150 222 128 222 C106 222 86 216 80 196 C74 172 92 148 128 148 Z" fill="#f7f3ea"/>
+  <path d="M104 178 l8 8 l8 -8 M136 178 l8 8 l8 -8 M120 202 l8 8 l8 -8" fill="none" stroke="#a58bd8" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- spectacles -->
+  <path d="M116 112 H140" stroke="#1d1730" stroke-width="12"/>
+  <circle cx="90" cy="112" r="30" fill="#f7f3ea" stroke="#1d1730" stroke-width="8"/>
+  <circle cx="166" cy="112" r="30" fill="#f7f3ea" stroke="#1d1730" stroke-width="8"/>
+  <circle cx="98" cy="116" r="14" fill="#1d1730"/>
+  <circle cx="158" cy="116" r="14" fill="#1d1730"/>
+  <!-- beak -->
+  <path d="M116 142 H140 L128 162 Z" fill="#f2c94c" stroke="#1d1730" stroke-width="6" stroke-linejoin="round"/>
+</svg>
