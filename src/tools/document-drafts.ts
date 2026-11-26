@@ -6,6 +6,7 @@ import {
   asRecord,
   badInput,
   entityId,
+  FOREIGN_DATA_NOTE,
   integer,
   isoDate,
   isoDateOf,
@@ -184,7 +185,8 @@ export const createInvoiceDraft = defineTool({
     "from the contact (its invoice address, else its first address). Tax rule and position " +
     "tax rates are checked against sevdesk's documented rules and the account's tax guidance " +
     "before anything is sent. The draft gets no invoice number and is not sent; use " +
-    "mark_invoice_sent or send_invoice_email for that. Every call creates a new draft.",
+    "mark_invoice_sent or send_invoice_email for that. Every call creates a new draft." +
+    FOREIGN_DATA_NOTE,
   class: "W",
   operationId: "createInvoiceByFactory",
   operations: ["getContactById", "getPartById", "getInvoices", "getOrders", "forRevenue"],
@@ -297,7 +299,8 @@ export const createOrderDraft = defineTool({
   description:
     "Creates an estimate (Angebot, type AN) or an order confirmation (AB) as draft in sevdesk, " +
     "with the same positions, address and tax checks as create_invoice_draft. It is not sent. " +
-    "Turn it into an invoice later with create_invoice_from_order. Every call creates a new draft.",
+    "Turn it into an invoice later with create_invoice_from_order. Every call creates a new draft." +
+    FOREIGN_DATA_NOTE,
   class: "W",
   operationId: "createOrder",
   operations: ["getContactById", "getPartById", "getInvoices", "getOrders", "forRevenue"],
@@ -373,7 +376,8 @@ export const createInvoiceFromOrder = defineTool({
     "Turns an estimate (AN) or order confirmation (AB) into an invoice draft with its " +
     "positions. partialType RE (default) invoices the whole order; TR (partial) and AR " +
     "(advance) need amountType and amount. Delivery notes (LI) cannot be invoiced. The new " +
-    "invoice is not sent; check it with get_invoice. Every call creates another invoice.",
+    "invoice is not sent; check it with get_invoice. Every call creates another invoice." +
+    FOREIGN_DATA_NOTE,
   class: "W",
   operationId: "createInvoiceFromOrder",
   operations: ["getOrderById"],

@@ -7,6 +7,7 @@ import {
   CONTACT_STATUS,
   codeFor,
   entityId,
+  FOREIGN_DATA_NOTE,
   integer,
   objectsOf,
   type Raw,
@@ -397,7 +398,8 @@ export const updateContact = defineTool({
     "or communication entry is only changed when it is unambiguous: without an ID, the " +
     "contact's single entry is changed, a missing one is created (reported as created), and " +
     "with several entries the call fails with their IDs so you can pick one. All of this is " +
-    "checked before anything is written. Use get_contact to see the current values.",
+    "checked before anything is written. Use get_contact to see the current values." +
+    FOREIGN_DATA_NOTE,
   class: "W",
   operationId: "updateContact",
   operations: [

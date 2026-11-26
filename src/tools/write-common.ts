@@ -16,6 +16,7 @@ import {
   refId,
   statusOf,
   text,
+  totalOf,
 } from "./format.js";
 
 /**
@@ -379,17 +380,25 @@ export function positionBody(position: ResolvedPosition, objectName: string, ind
   };
 }
 
-/** Net sum of the positions, rounded to cents. */
+/** Net sum of the positions: each position rounded to whole cents, then added in cents. */
 export function netSum(positions: readonly ResolvedPosition[]): number {
-  return cents(positions.reduce((sum, p) => sum + p.quantity * p.priceNet, 0));
+  const totalCents = positions.reduce(
+    (sum, p) => sum + Math.round(p.quantity * p.priceNet * 100),
+    0,
+  );
+  return totalCents / 100;
 }
 
-/** Warning if sevdesk's net sum differs from ours (e.g. prices read as gross). */
+/** Differences up to one cent are rounding, not a mismatch. */
+export const SUM_TOLERANCE = 0.01;
+
+/** Warning if sevdesk's net sum differs from ours by more than a cent. */
 export function sumWarning(expected: number, actual: number | null): string | undefined {
-  if (actual === null || Math.abs(actual - expected) < 0.005) return undefined;
+  if (actual === null || cents(Math.abs(actual - expected)) <= SUM_TOLERANCE) return undefined;
   return (
-    `sevdesk reports a net sum of ${actual}, but the positions add up to ${expected} net. ` +
-    "The account may treat prices as gross; check the draft in sevdesk before sending it."
+    `Sum mismatch: sevdesk reports a net sum of ${actual}, the positions add up to ${expected}. ` +
+    "A possible cause is that the account reads prices as gross instead of net; check the " +
+    "draft in sevdesk before sending it."
   );
 }
 
@@ -478,7 +487,8 @@ export const contactPersonInput = entityId
   .optional()
   .describe(
     "sevdesk user shown as contact person on the document. Default: the contact person of " +
-      "the first invoice (or order) sevdesk lists; the answer says which one was used.",
+      "the newest invoice (or order), i.e. the last one sevdesk lists; the answer says which " +
+      "one was used.",
   );
 
 /** Readable form for summaries: "3001 (from invoice 1001)". */
@@ -499,24 +509,45 @@ export async function resolveContactPerson(
   prefer: "invoice" | "order",
 ): Promise<ContactPerson> {
   if (given !== undefined) return { id: given, source: "input" };
-  const fromInvoice = async (): Promise<ContactPerson | undefined> => {
-    const body = await sevdesk.call(
-      sevdesk.api.GET("/Invoice", { params: { query: { limit: 1, offset: 0 } } }),
-    );
-    const raw = objectsOf(body)[0];
+  // The spec documents no sort order or sort parameter for these lists.
+  // Assumed: sevdesk lists by creation, oldest first, so the newest is the
+  // last entry. One call for the total, one for the entry at total - 1.
+  const newest = async (
+    page: (offset: number, countAll: boolean) => Promise<unknown>,
+  ): Promise<Raw | undefined> => {
+    const first = await page(0, true);
+    const total = totalOf(first);
+    if (total === null || total <= 1) return objectsOf(first)[0];
+    return objectsOf(await page(total - 1, false))[0] ?? objectsOf(first)[0];
+  };
+  const personOf = (raw: Raw | undefined, source: "invoice" | "order") => {
     const id = raw ? refId(raw.contactPerson) : null;
     return raw && id !== null
-      ? { id, source: "invoice", sourceId: integer(raw.id) ?? 0 }
+      ? ({ id, source, sourceId: integer(raw.id) ?? 0 } satisfies ContactPerson)
       : undefined;
   };
-  const fromOrder = async (): Promise<ContactPerson | undefined> => {
-    const body = await sevdesk.call(
-      sevdesk.api.GET("/Order", { params: { query: { limit: 1, offset: 0 } } }),
+  const fromInvoice = async () =>
+    personOf(
+      await newest((offset, countAll) =>
+        sevdesk.call(
+          sevdesk.api.GET("/Invoice", {
+            params: { query: { limit: 1, offset, ...(countAll && { countAll: true }) } },
+          }),
+        ),
+      ),
+      "invoice",
     );
-    const raw = objectsOf(body)[0];
-    const id = raw ? refId(raw.contactPerson) : null;
-    return raw && id !== null ? { id, source: "order", sourceId: integer(raw.id) ?? 0 } : undefined;
-  };
+  const fromOrder = async () =>
+    personOf(
+      await newest((offset, countAll) =>
+        sevdesk.call(
+          sevdesk.api.GET("/Order", {
+            params: { query: { limit: 1, offset, ...(countAll && { countAll: true }) } },
+          }),
+        ),
+      ),
+      "order",
+    );
   const order = prefer === "invoice" ? [fromInvoice, fromOrder] : [fromOrder, fromInvoice];
   for (const find of order) {
     const found = await find();

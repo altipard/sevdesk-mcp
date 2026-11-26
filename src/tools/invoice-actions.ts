@@ -3,8 +3,10 @@ import type { Logger } from "../logger.js";
 import { defineTool, type StrictToolAnnotations } from "../policy/registry.js";
 import { SevdeskError } from "../sevdesk/errors.js";
 import {
+  badInput,
   cents,
   entityId,
+  FOREIGN_DATA_NOTE,
   integer,
   isoDate,
   objectsOf,
@@ -77,6 +79,18 @@ function invoiceFacts(invoice: InvoiceState, contactName: string | null) {
   };
 }
 
+/** One line of free text for the approval question; line breaks could fake extra lines. */
+const oneLine = (value: string | null, max = 200): string => {
+  const flat = (value ?? "").replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+};
+
+/** "RE-1001 (ID 1001) for Muster GmbH, gross 119 EUR" from the preview's read. */
+function invoiceLine(invoice: InvoiceState, contactName: string | null): string {
+  const customer = contactName ? ` for ${oneLine(contactName, 100)}` : "";
+  return `${oneLine(invoiceLabel(invoice), 120)}${customer}, gross ${money(invoice.sumGross, invoice.currency)}`;
+}
+
 // ---------------------------------------------------------------------------
 // mark_invoice_sent
 
@@ -103,7 +117,8 @@ export const markInvoiceSent = defineTool({
     "its invoice number; it can be reset to draft in sevdesk. The first call returns a " +
     "preview with invoice number, contact, amount and status before/after plus a " +
     "confirmation_token; repeat the call with that token to execute. To e-mail the invoice " +
-    "through sevdesk use send_invoice_email instead.",
+    "through sevdesk use send_invoice_email instead." +
+    FOREIGN_DATA_NOTE,
   class: "W+",
   operationId: "invoiceSendBy",
   operations: ["getInvoiceById", "getContactById"],
@@ -186,36 +201,65 @@ const bookOutput = z.object({
   logId: z.number().int().nullable().describe("ID of sevdesk's booking log entry."),
 });
 
-/** FULL_PAYMENT when the amount settles the invoice exactly, else N (partial). */
-function paymentTypeFor(given: PaymentType | undefined, amount: number, open: number | null) {
-  if (given !== undefined) return given;
-  return open !== null && Math.abs(open - amount) < 0.005 ? "FULL_PAYMENT" : "N";
-}
+/** Whether the amount has at most two decimals (whole cents). */
+const wholeCents = (value: number) => Math.abs(value * 100 - Math.round(value * 100)) < 1e-6;
 
 const openOf = (invoice: InvoiceState) => invoice.openAmount;
+const bookable = (invoice: InvoiceState) => invoice.status === 200 || invoice.status === 750;
+
+/**
+ * Hint when the chosen type does not fit the amount and the open amount.
+ * Only a warning: which type is right is the bookkeeper's decision.
+ */
+function typeMismatch(type: PaymentType, amount: number, open: number | null): string | undefined {
+  if (open === null) return undefined;
+  const diff = cents(amount - open);
+  if (type === "FULL_PAYMENT" && diff !== 0) {
+    return `FULL_PAYMENT expects the open amount (${open}), not ${amount}; use N for a partial payment, CB, MTC or O for a reduced amount, OF for reminder fees.`;
+  }
+  if (type === "N" && diff >= 0) {
+    return `N books a partial payment, but ${amount} covers the open amount of ${open}; FULL_PAYMENT may fit better.`;
+  }
+  if ((type === "CB" || type === "MTC") && diff >= 0) {
+    return `${type} is for a payment below the open amount (${open}), not ${amount}.`;
+  }
+  if (type === "OF" && diff <= 0) {
+    return `OF is for a payment above the open amount (${open}) because of reminder fees, not ${amount}.`;
+  }
+  return undefined;
+}
 
 export const bookInvoicePayment = defineTool({
   name: "book_invoice_payment",
   title: "Book a payment on a sevdesk invoice",
   description:
     "Books a payment on an open or partially paid invoice (bookAmount) to a check account " +
-    "(list_bank_accounts). paymentType: FULL_PAYMENT, N partial, CB discount (Skonto), O other " +
-    "difference, OF reminder fees, MTC bank charges; default FULL_PAYMENT when the amount " +
-    "equals the open amount, otherwise N. Reversible in sevdesk (reset to open) unless the " +
-    "invoice is enshrined. The first call returns a preview with the open amount before and " +
-    "after and warns about overpayment, plus a confirmation_token; repeat the call with that " +
-    "token to book. Every confirmed call books again.",
+    "(list_bank_accounts). paymentType is required: FULL_PAYMENT when the amount equals the " +
+    "open amount; N for a partial payment, the rest stays open; CB when the customer paid less " +
+    "because of a cash discount (Skonto), MTC less because of bank charges, O less or more for " +
+    "another reason (these three settle the invoice); OF more because of reminder fees. " +
+    "Reversible in sevdesk (reset to open) unless the invoice is enshrined. The first call " +
+    "returns a preview with the open amount before and after, warns about overpayment and a " +
+    "type that does not fit, plus a confirmation_token; repeat the call with that token to " +
+    "book. Every confirmed call books again." +
+    FOREIGN_DATA_NOTE,
   class: "W+",
   operationId: "bookInvoice",
   operations: ["getInvoiceById", "getContactById", "getCheckAccountById"],
   inputSchema: z.object({
     invoiceId: invoiceIdInput,
-    amount: z.number().positive().max(1_000_000_000).describe("Amount paid, in invoice currency."),
-    // Defaulted in the schema, so the date is part of the token-bound arguments.
+    amount: z
+      .number()
+      .positive()
+      .max(1_000_000_000)
+      .refine(wholeCents, { error: "must have at most two decimal places" })
+      .describe("Amount paid, in invoice currency, at most two decimals."),
     date: isoDate
-      .default(() => todayIso())
-      .describe("Payment date YYYY-MM-DD; default today (German time)."),
-    paymentType: z.enum(PAYMENT_TYPES).optional(),
+      .optional()
+      .describe("Payment date YYYY-MM-DD; default today (German time), shown in the preview."),
+    paymentType: z
+      .enum(PAYMENT_TYPES)
+      .describe("FULL_PAYMENT, N partial, CB Skonto, MTC bank charges, O other, OF reminder fees."),
     checkAccountId: entityId.describe("sevdesk check account the money arrived on."),
     checkAccountTransactionId: entityId
       .optional()
@@ -223,23 +267,27 @@ export const bookInvoicePayment = defineTool({
   }),
   annotations: { ...STATUS_CHANGE_ANNOTATIONS, idempotentHint: false },
   summary: (args) =>
-    `Book a payment of ${args.amount} on invoice ${args.invoiceId} to check account ${args.checkAccountId}.`,
+    `Book a payment of ${args.amount} (${args.paymentType}) on invoice ${args.invoiceId} to ` +
+    `check account ${args.checkAccountId}.`,
   async preview(args, call) {
     const invoice = mapInvoiceState(await readInvoice(call, args.invoiceId));
     const open = openOf(invoice);
     const warnings: string[] = [];
-    if (invoice.status !== 200 && invoice.status !== 750) {
+    if (!bookable(invoice)) {
       warnings.push(
         `The invoice is ${statusText(invoice)}; sevdesk only books payments on open or ` +
-          "partially paid invoices.",
+          "partially paid invoices, so the booking will be refused.",
       );
     }
     const overpayment = open === null ? 0 : Math.max(0, cents(args.amount - open));
-    if (overpayment > 0) {
+    // OF (reminder fees) and O (other difference) are meant for a higher amount.
+    if (overpayment > 0 && args.paymentType !== "OF" && args.paymentType !== "O") {
       warnings.push(
         `Overpayment: ${args.amount} is ${overpayment} more than the open amount of ${open}.`,
       );
     }
+    const mismatch = typeMismatch(args.paymentType, args.amount, open);
+    if (mismatch) warnings.push(mismatch);
     let checkAccount: { id: number; name: string | null } = { id: args.checkAccountId, name: null };
     const { sevdesk } = call;
     const accountBody = await sevdesk.call(
@@ -256,8 +304,8 @@ export const bookInvoicePayment = defineTool({
     return {
       ...invoiceFacts(invoice, await contactNameOf(call, invoice.contactId)),
       amount: args.amount,
-      date: args.date,
-      paymentType: paymentTypeFor(args.paymentType, args.amount, open),
+      date: args.date ?? todayIso(),
+      paymentType: args.paymentType,
       checkAccount,
       ...(args.checkAccountTransactionId !== undefined && {
         checkAccountTransactionId: args.checkAccountTransactionId,
@@ -270,9 +318,17 @@ export const bookInvoicePayment = defineTool({
   },
   async handler(args, call) {
     const invoice = mapInvoiceState(await readInvoice(call, args.invoiceId));
+    // Checked again: the invoice may have changed since the preview, and
+    // sevdesk refuses bookings on drafts, paid or cancelled invoices.
+    if (!bookable(invoice)) {
+      throw badInput(
+        `Invoice ${args.invoiceId} is ${statusText(invoice)} now, so sevdesk would refuse the ` +
+          "booking. Nothing was booked; call the tool again without confirmation_token for a " +
+          "new preview.",
+      );
+    }
     const open = openOf(invoice);
-    const paymentType = paymentTypeFor(args.paymentType, args.amount, open);
-    const date = args.date;
+    const date = args.date ?? todayIso();
     const { sevdesk } = call;
     const body = await sevdesk.call(
       sevdesk.api.PUT("/Invoice/{invoiceId}/bookAmount", {
@@ -280,7 +336,7 @@ export const bookInvoicePayment = defineTool({
         body: {
           amount: args.amount,
           date: unixSeconds(date),
-          type: paymentType,
+          type: args.paymentType,
           checkAccount: ref(args.checkAccountId, "CheckAccount"),
           ...(args.checkAccountTransactionId !== undefined && {
             checkAccountTransaction: ref(args.checkAccountTransactionId, "CheckAccountTransaction"),
@@ -296,7 +352,7 @@ export const bookInvoicePayment = defineTool({
         invoiceNumber: invoice.invoiceNumber,
         bookedAmount: args.amount,
         date,
-        paymentType,
+        paymentType: args.paymentType,
         checkAccountId: args.checkAccountId,
         openBefore: open,
         openAfterExpected: open === null ? null : Math.max(0, cents(open - args.amount)),
@@ -308,7 +364,7 @@ export const bookInvoicePayment = defineTool({
     );
     return present(output, {
       summary:
-        `Booked ${money(args.amount, invoice.currency)} (${paymentType}) on invoice ` +
+        `Booked ${money(args.amount, invoice.currency)} (${args.paymentType}) on invoice ` +
         `${invoiceLabel(invoice)}; open ${output.openBefore ?? "unknown"} -> ` +
         `${output.openAfterExpected ?? "unknown"}${overpayment > 0 ? `, overpaid by ${overpayment}` : ""}.`,
     });
@@ -342,7 +398,8 @@ export const sendInvoiceEmail = defineTool({
     "lists it in SEVDESK_ENABLE_TOOLS. Recipient, subject and text are always given " +
     "explicitly. The first call returns a preview (recipient, subject, invoice number, " +
     "amount) and a confirmation_token; the call with the token asks the user for approval " +
-    "where the client supports it. Runs at most once per invoice within 24 hours.",
+    "where the client supports it. Runs at most once per invoice within 24 hours." +
+    FOREIGN_DATA_NOTE,
   class: "X",
   operationId: "sendInvoiceViaEMail",
   operations: ["getInvoiceById", "getContactById", "getCommunicationWays"],
@@ -399,8 +456,18 @@ export const sendInvoiceEmail = defineTool({
           `${known.length > 0 ? ` (known: ${known.join(", ")})` : ""}.`,
       );
     }
+    const contactName = await contactNameOf(call, invoice.contactId);
+    const copies = [
+      args.ccEmail?.length ? `cc ${args.ccEmail.join(", ")}` : "",
+      args.bccEmail?.length ? `bcc ${args.bccEmail.join(", ")}` : "",
+    ].filter(Boolean);
     return {
-      ...invoiceFacts(invoice, await contactNameOf(call, invoice.contactId)),
+      approval:
+        `Send invoice ${invoiceLine(invoice, contactName)}, by e-mail to ${args.toEmail}` +
+        `${copies.length > 0 ? ` (${copies.join("; ")})` : ""}. Subject: "${oneLine(args.subject)}". ` +
+        `Text: "${oneLine(args.text, 160)}". Attachment: ${args.sendXml ? "e-invoice XML" : "PDF"}.` +
+        `${warnings.length > 0 ? ` Warnings: ${warnings.map((w) => oneLine(w, 300)).join(" ")}` : ""}`,
+      ...invoiceFacts(invoice, contactName),
       toEmail: args.toEmail,
       ccEmail: args.ccEmail ?? [],
       bccEmail: args.bccEmail ?? [],
@@ -473,7 +540,8 @@ export const cancelInvoice = defineTool({
     "Off unless the operator lists it in SEVDESK_ENABLE_TOOLS. The first call returns a " +
     "preview (invoice number, contact, amount, status) and a confirmation_token; the call " +
     "with the token asks the user for approval where the client supports it. Runs at most " +
-    "once per invoice within 24 hours.",
+    "once per invoice within 24 hours." +
+    FOREIGN_DATA_NOTE,
   class: "X",
   operationId: "cancelInvoice",
   operations: ["getInvoiceById", "getContactById"],
@@ -491,8 +559,13 @@ export const cancelInvoice = defineTool({
     if (invoice.invoiceType === "SR") {
       warnings.push("This is already a cancellation invoice (SR).");
     }
+    const contactName = await contactNameOf(call, invoice.contactId);
     return {
-      ...invoiceFacts(invoice, await contactNameOf(call, invoice.contactId)),
+      approval:
+        `Cancel invoice ${invoiceLine(invoice, contactName)}: sevdesk creates a numbered ` +
+        "cancellation invoice (SR) over the full amount." +
+        `${warnings.length > 0 ? ` Warnings: ${warnings.join(" ")}` : ""}`,
+      ...invoiceFacts(invoice, contactName),
       effect: "A cancellation invoice (SR) over the full amount is created and marked as paid.",
       warnings,
     };

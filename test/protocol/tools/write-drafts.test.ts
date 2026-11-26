@@ -98,7 +98,7 @@ describe("create_invoice_draft", () => {
       "POST createInvoiceByFactory",
     ]);
     expect(queryOf(api.requests[2])).toEqual({ embed: "addresses" });
-    expect(queryOf(api.requests[3])).toEqual({ limit: "1", offset: "0" });
+    expect(queryOf(api.requests[3])).toEqual({ limit: "1", offset: "0", countAll: "true" });
     expect(await bodyOf(api, "createInvoiceByFactory")).toEqual({
       invoice: {
         objectName: "Invoice",
@@ -306,6 +306,80 @@ describe("create_invoice_draft", () => {
     expect(textOf(unknown)).toContain("The outcome is unknown: check sevdesk before retrying.");
     expect(c.audit().map((e) => e.outcome)).toEqual(["error", "error"]);
   });
+});
+
+describe("contact person and sums", () => {
+  it("takes the contact person of the newest invoice: the last one sevdesk lists", async () => {
+    api.server.use(
+      guidance(STANDARD_GUIDANCE),
+      contactWith([address()]),
+      http.get(sevdeskUrl("/Invoice"), ({ request }) => {
+        const offset = new URL(request.url).searchParams.get("offset");
+        return offset === "2"
+          ? HttpResponse.json(
+              list([invoice({ id: "1003", contactPerson: { id: "3009", objectName: "SevUser" } })]),
+            )
+          : HttpResponse.json(list([invoice()], 3));
+      }),
+      savedInvoice({ sumNet: "10" }),
+    );
+    const c = await connectWrites({ config: { mode: "write" } });
+    const result = await c.call("create_invoice_draft", {
+      contactId: 2001,
+      positions: [{ name: "X", quantity: 1, priceNet: 10, taxRate: 19 }],
+    });
+    const data = structured<{ contactPerson: unknown }>(result);
+    const lists = api.requests.filter((r) => new URL(r.url).pathname.endsWith("/Invoice"));
+    expect(lists.map(queryOf)).toEqual([
+      { limit: "1", offset: "0", countAll: "true" },
+      { limit: "1", offset: "2" },
+    ]);
+    expect(data.contactPerson).toEqual({ id: 3009, source: "invoice", sourceId: 1003 });
+    expect(textOf(result).split("\n")[0]).toContain("contact person 3009 (from invoice 1003)");
+    const body = (await bodyOf(api, "createInvoiceByFactory")) as {
+      invoice: { contactPerson: unknown };
+    };
+    expect(body.invoice.contactPerson).toEqual({ id: 3009, objectName: "SevUser" });
+  });
+
+  it.each([
+    ["1.39", false],
+    ["1.40", false],
+    ["1.38", false],
+    ["1.41", true],
+    ["1.37", true],
+  ])(
+    "rounds each position to cents (1.39) and warns about sevdesk's sum %s: %s",
+    async (sumNet, warns) => {
+      api.server.use(
+        guidance(STANDARD_GUIDANCE),
+        contactWith([address()]),
+        latestInvoice,
+        savedInvoice({ sumNet }),
+      );
+      const c = await connectWrites({ config: { mode: "write" } });
+      const data = structured<{ expectedSumNet: number; warnings: string[] }>(
+        await c.call("create_invoice_draft", {
+          contactId: 2001,
+          positions: [
+            { name: "A", quantity: 7, priceNet: 0.125, taxRate: 19 },
+            { name: "B", quantity: 0.5, priceNet: 0.01, taxRate: 19 },
+            { name: "C", quantity: 1.5, priceNet: 0.33, taxRate: 19 },
+          ],
+        }),
+      );
+      // 0.875 + 0.005 + 0.495 = 1.375 unrounded; per position 0.88 + 0.01 + 0.50.
+      expect(data.expectedSumNet).toBe(1.39);
+      expect(data.warnings.length > 0).toBe(warns);
+      if (warns) {
+        expect(data.warnings[0]).toBe(
+          `Sum mismatch: sevdesk reports a net sum of ${Number(sumNet)}, the positions add up to ` +
+            "1.39. A possible cause is that the account reads prices as gross instead of net; " +
+            "check the draft in sevdesk before sending it.",
+        );
+      }
+    },
+  );
 });
 
 describe("create_order_draft", () => {
