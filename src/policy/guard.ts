@@ -10,6 +10,7 @@ import {
 } from "@modelcontextprotocol/server";
 import type { Logger } from "../logger.js";
 import { SevdeskError } from "../sevdesk/errors.js";
+import { text } from "../tools/format.js";
 import { errorResult, okResult } from "../tools/result.js";
 import type { AuditOutcome } from "./audit.js";
 import type { OperationClass } from "./classification.js";
@@ -29,6 +30,15 @@ import type { RequestPolicy } from "./runtime.js";
 export const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 /** Key of the approval question in elicitation input requests/responses. */
 export const APPROVAL_KEY = "approve";
+/**
+ * Field of a preview that holds the facts for the approval question
+ * (invoice number, customer, amount, recipient). The preview reads them
+ * from sevdesk, so the user approves what will actually be acted on, not
+ * only the arguments.
+ */
+export const APPROVAL_FACTS_KEY = "approval";
+/** Upper bound of the facts shown in the approval question. */
+export const MAX_APPROVAL_FACTS_LENGTH = 1000;
 
 export const CONFIRMATION_TOKEN_DESCRIPTION =
   "Leave empty on the first call: it returns a preview and a confirmation_token. " +
@@ -153,6 +163,20 @@ function isDefiniteRejection(error: unknown): boolean {
   return error.status !== undefined && error.status >= 400 && error.status < 500;
 }
 
+/** Marks an X target whose last attempt ended with an unknown outcome. */
+const unknownOutcomeKey = (idempotencyKey: string) => `${idempotencyKey}:outcome_unknown`;
+
+/**
+ * The approval facts of a preview, cleaned like tool output (hidden
+ * characters removed, length capped), or undefined if it has none.
+ */
+export function approvalFacts(preview: ToolOutput): string | undefined {
+  const facts = preview[APPROVAL_FACTS_KEY];
+  if (typeof facts !== "string") return undefined;
+  const cleaned = text(facts.slice(0, MAX_APPROVAL_FACTS_LENGTH));
+  return cleaned ?? undefined;
+}
+
 /**
  * Runs one tool call under the policy: rights, confirmation token, human
  * approval, single use, idempotency and audit, depending on the class.
@@ -251,11 +275,21 @@ export async function runGuarded(
     if (clientSupportsElicitation(env.server, ctx)) {
       const state = approvalState(ctx);
       if (state === "pending") {
+        // The question is built from a fresh read-only preview, so it shows
+        // what sevdesk holds now (number, customer, amount), not only the
+        // arguments the token is bound to.
+        let facts: string | undefined;
+        try {
+          facts = approvalFacts((await action.preview?.()) ?? {});
+        } catch (error) {
+          audit("error", { reason: "preview_failed" });
+          return errorResult(action.tool, error, logger);
+        }
         audit("approval_requested");
         return inputRequired({
           inputRequests: {
             [APPROVAL_KEY]: inputRequired.elicit({
-              message: `${action.summary} This cannot be undone. Execute it?`,
+              message: `${facts ?? action.summary} This cannot be undone. Execute it?`,
               requestedSchema: {
                 type: "object",
                 properties: {
@@ -305,10 +339,19 @@ export async function runGuarded(
       );
     }
     if (idempotencyKey && !(await runtime.nonces.consume(idempotencyKey, IDEMPOTENCY_TTL_MS))) {
-      audit("denied", { reason: "duplicate" });
+      // The store has no lookup: probing the marker creates it if absent,
+      // so a fresh one is removed again right away.
+      const marker = unknownOutcomeKey(idempotencyKey);
+      const unknown = !(await runtime.nonces.consume(marker, IDEMPOTENCY_TTL_MS));
+      if (!unknown) await runtime.nonces.release(marker);
+      audit("denied", { reason: unknown ? "duplicate_outcome_unknown" : "duplicate" });
       return failure(
-        `${action.tool} already ran for this target within the last 24 hours. ` +
-          "Check the result in sevdesk; it is not repeated automatically.",
+        unknown
+          ? `${action.tool} may already have run for this target: an attempt within the last ` +
+              "24 hours ended with an unknown outcome. Check the status in sevdesk; it is not " +
+              "repeated automatically."
+          : `${action.tool} already ran for this target within the last 24 hours. ` +
+              "Check the result in sevdesk; it is not repeated automatically.",
       );
     }
   } catch (error) {
@@ -320,11 +363,16 @@ export async function runGuarded(
   }
 
   return execute(async (error) => {
-    if (idempotencyKey === undefined || !isDefiniteRejection(error)) return;
+    if (idempotencyKey === undefined) return;
     try {
-      await runtime.nonces.release(idempotencyKey);
-    } catch (releaseError) {
-      logger.warn("could not release idempotency key", { tool: action.tool, error: releaseError });
+      if (isDefiniteRejection(error)) {
+        await runtime.nonces.release(idempotencyKey);
+      } else {
+        // The lock stays; the marker lets the next attempt say why.
+        await runtime.nonces.consume(unknownOutcomeKey(idempotencyKey), IDEMPOTENCY_TTL_MS);
+      }
+    } catch (storeError) {
+      logger.warn("could not update idempotency state", { tool: action.tool, error: storeError });
     }
   });
 }
