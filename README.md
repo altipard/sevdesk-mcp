@@ -36,6 +36,7 @@ with compact answers, plus a guarded fallback for everything else.
 - [Connect your MCP client](#connect-your-mcp-client)
 - [What it can do](#what-it-can-do)
 - [Security model](#security-model)
+- [Remote (HTTP)](#remote-http)
 - [Configuration](#configuration)
 - [Status](#status)
 - [Development](#development)
@@ -150,7 +151,8 @@ the client's `env` block.
 
 ## Connect your MCP client
 
-All clients start the server as a local process over stdio. The installer's setup writes
+All clients below start the server as a local process over stdio; to run it as a shared
+service instead, see [Remote (HTTP)](#remote-http). The installer's setup writes
 these entries for you; the snippets below are for doing it by hand. Replace
 `/Users/you/.local/bin/sevdesk-mcp` with the absolute path of your binary (`echo
 ~/.local/bin/sevdesk-mcp`).
@@ -285,10 +287,12 @@ Other settings from [Configuration](#configuration), for example
 
 ## What it can do
 
-The server currently ships **read-only** tools; there are no curated write tools yet.
-Each one wraps one or a few sevdesk API calls and returns a short text plus compact
+Each tool wraps one or a few sevdesk API calls and returns a short text plus compact
 structured JSON. `get_document_pdf` and `get_report` return the file as an embedded
-resource.
+resource. Which tools are registered depends on the mode (see
+[Security model](#security-model)): `read` offers only the read tools.
+
+**Read tools** (class `R`, available in every mode):
 
 | Tool | What it does |
 | --- | --- |
@@ -309,15 +313,42 @@ resource.
 | `get_report` | sevdesk's rendered list report (usually a PDF) of invoices, orders, contacts or vouchers. |
 | `sevdesk_api_request` | Guarded fallback: calls one sevdesk operation without a dedicated tool by `operationId`. |
 
+**Write tools.** Class `W` runs directly from `SEVDESK_MODE=write` on. Class `W+` also
+needs `write` and runs in two steps with a confirmation token. Class `X` needs `full`, is
+off until the operator lists it in `SEVDESK_ENABLE_TOOLS`, and needs a confirmation token
+plus human approval.
+
+| Tool | Class | What it does |
+| --- | --- | --- |
+| `create_contact` | W | Creates an organisation or person, by default as customer with the next free customer number, optionally with invoice address, e-mail and phone. |
+| `update_contact` | W | Changes master data of a contact and, where unambiguous, its address, e-mail or phone; with several entries it fails and lists their IDs. |
+| `create_invoice_draft` | W | Creates an invoice draft (RE) with free-text or article positions; tax rule and rates are checked first. No invoice number, not sent. |
+| `create_order_draft` | W | Creates an estimate (AN) or order confirmation (AB) as draft, with the same checks. Not sent. |
+| `create_invoice_from_order` | W | Turns an estimate or order confirmation into an invoice draft: whole (RE), partial (TR) or advance (AR). |
+| `create_voucher` | W | Creates a voucher (Beleg) as draft, optionally with the receipt file attached; accounts, tax rule and rates are checked first. |
+| `tag_document` | W | Sets a tag by name on an invoice, voucher, order or credit note; sevdesk creates the tag if it does not exist. |
+| `mark_invoice_sent` | W+ | Marks an invoice as sent (printed, by post, by e-mail outside sevdesk, downloaded) without sending anything; a draft gets its invoice number. |
+| `book_invoice_payment` | W+ | Books a payment on an open or partially paid invoice to a payment account, with an explicit payment type (full, partial, Skonto, bank charges, other, reminder fees). |
+| `book_voucher_payment` | W+ | Books a payment on an unpaid or partially paid voucher, with the same payment types. |
+| `reset_document_status` | W+ | Resets an invoice, credit note or voucher to draft or to open; linked payments are unlinked. Enshrined documents are refused. |
+| `send_invoice_email` | X | Sends an invoice to the customer by e-mail through sevdesk, with explicit recipient, subject and text. |
+| `cancel_invoice` | X | Cancels an invoice by creating a numbered cancellation invoice (Stornorechnung). |
+| `enshrine_document` | X | Enshrines (festschreiben) an invoice, credit note or voucher; afterwards it can never be changed, reset or deleted (GoBD). |
+
+`create_voucher` attaches a receipt as PDF, PNG or JPEG up to 10 MiB, passed as base64.
+The draft tools create a new object on every call, and the payment tools book again on
+every confirmed call.
+
+> [!CAUTION]
+> **Try write tools on test data first.** They are tested against the sevdesk OpenAPI spec
+> and a mocked API, but the spec is incomplete and some request shapes can only be
+> verified against a live account. Start with a test contact and a test draft, check the
+> result in sevdesk, and only then use them on real bookkeeping data.
+
 `sevdesk_api_request` only accepts operations on its allowlist. By default that is a
 curated list of side-effect-free reads; `SEVDESK_API_ALLOW` replaces it. Every listed
-operation still has to fit the mode and goes through the confirmation rules below.
-Today `SEVDESK_MODE=write` or `full` only has an effect on `sevdesk_api_request`, and only
-for operations listed in `SEVDESK_API_ALLOW`.
-
-**Planned:** curated write tools (drafts, master data, status changes) and a remote
-HTTP transport with OAuth. The policy layer for both is already in place, see
-[Security model](#security-model).
+operation still has to fit the mode and goes through the same confirmation rules as the
+tools.
 
 > [!NOTE]
 > Everything a tool reads (customer names, IBANs, amounts, PDFs) goes to your MCP client
@@ -330,58 +361,180 @@ strict and every relaxation is an explicit setting.
 
 - **Mode.** `SEVDESK_MODE` sets the ceiling: `read` (default) allows only reads, `write`
   adds drafts, master data and status changes, `full` adds irreversible actions (sending
-  e-mail, cancellation, enshrining, deleting). No other setting can lift an operation above
-  the mode. With no curated write tools yet, this applies to `sevdesk_api_request`.
+  e-mail, cancellation, enshrining, deleting). Tools above the mode are not registered,
+  and no other setting can lift an operation above it.
 - **Risk classes.** Every sevdesk operation is classified: `R` plain read, `R+` bulk
   export, `W` correctable change, `W+` status or booking change, `X` irreversible. An
-  operation without a class is refused everywhere.
+  operation without a class is refused everywhere. Each tool declares the operations it
+  uses; a request outside that list or above the tool's class is refused before it leaves
+  the server.
 - **Tool lists.** `SEVDESK_ALLOWED_TOOLS` narrows the tool set to the names listed,
   `SEVDESK_DENIED_TOOLS` removes tools and always wins, `SEVDESK_ENABLE_TOOLS` switches on
   tools that are off by default (bulk exports and every irreversible tool), still capped by
   the mode. Unknown tool names stop the server at startup.
-- **Confirmation tokens.** `W` changes run directly, within the mode and allowlist.
-  `W+` and `X` actions run in two steps: the first call returns a
-  preview and a signed confirmation token bound to exactly that action, the second call
-  with the token executes it. Every token is valid exactly once and expires
-  (`SEVDESK_CONFIRM_TTL_SECONDS`).
-- **Irreversible actions** additionally run at most once per target within 24 hours in the
-  same server process, and require human approval: the client asks the user (MCP elicitation), or, for
-  clients that cannot ask, the operator's explicit listing in `SEVDESK_ENABLE_TOOLS` or
-  `SEVDESK_API_ALLOW` counts as the release.
-- **Audit log.** Every write attempt is logged to stderr as a JSON line, whatever
-  `LOG_LEVEL` says: who, which tool or operation, which object, and the outcome. Arguments,
-  bodies and tokens are never logged; the API token and confirmation secret are redacted
-  from log lines, audit entries and error text.
+- **Two-step calls for `W+` and `X`.** `W` changes run directly, within the mode and
+  allowlist. For `W+` and `X` the first call only reads: it returns a preview with the
+  facts read from sevdesk (number, contact, amount, status before and after, warnings) and
+  a confirmation token. The second call with the same arguments and the token executes
+  the action. The token is an HMAC bound to the tool, the exact arguments and the caller,
+  is valid exactly once and expires (`SEVDESK_CONFIRM_TTL_SECONDS`).
+- **Human approval for `X`.** On the second call the server asks the user through the
+  client (MCP elicitation). The question shows the facts read for the preview, for
+  example invoice number, customer, amount and recipient, so the user approves what will
+  actually be acted on, not only the arguments. For clients that cannot ask, the
+  operator's explicit listing in `SEVDESK_ENABLE_TOOLS` (or of the operation in
+  `SEVDESK_API_ALLOW`) counts as the release; then no human sees the action before it runs.
+- **Once per target.** Each irreversible action runs at most once per target within 24
+  hours, for example one e-mail per invoice. Over stdio the lock lives in the server
+  process; over HTTP it lives in Redis and is shared by all instances.
+- **Audit log.** Every write attempt is logged as a JSON line, whatever `LOG_LEVEL` says:
+  who, which tool or operation, which object, and the outcome. Arguments, bodies and
+  tokens are never logged; the API token and confirmation secret are redacted from log
+  lines, audit entries and error text.
 - **Text from sevdesk.** Names, descriptions and payment references are marked as data,
   not instructions, and hidden characters are stripped. A model can still be misled by
   such text, so review what it proposes.
 
-## Configuration
+> [!IMPORTANT]
+> **What holds against a manipulated model.** A confirmation token proves that a preview
+> was fetched for exactly these arguments, not that a human read it: a model following
+> injected instructions can make both calls itself. Elicitation only helps where the
+> client actually asks a human, and an operator release in `SEVDESK_ENABLE_TOOLS` skips
+> that question. The hard limits are the mode and, over HTTP, the token's scopes. Give
+> the server no more than the work needs.
 
-All configuration comes from environment variables; see [`.env.example`](.env.example).
-Empty values count as unset.
+## Remote (HTTP)
+
+Besides stdio the server can run as a shared service over the MCP Streamable HTTP
+transport, for example for a team or a hosted client. It acts as an OAuth 2.1 resource
+server: it does not log anyone in, it only validates access tokens issued by your
+authorization server (identity provider).
+
+- **Endpoint.** The MCP endpoint is the path of `MCP_RESOURCE_URL` (for example `/mcp`).
+  `/healthz` answers liveness probes without authentication. Protected Resource Metadata
+  ([RFC 9728](https://www.rfc-editor.org/rfc/rfc9728)) is served under
+  `/.well-known/oauth-protected-resource/<path>` and names the authorization server and the
+  supported scopes, so clients can discover where to get a token.
+- **Tokens.** JWT access tokens (`typ: at+jwt`,
+  [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068)) signed with an asymmetric algorithm,
+  with `iss` equal to `OAUTH_ISSUER`, `aud` equal to `MCP_RESOURCE_URL`, a `sub` and a
+  client ID (`client_id` or `azp`). Keys come from `OAUTH_JWKS_URL`.
+- **Scopes.** `sevdesk:read`, `sevdesk:write`, `sevdesk:irreversible`. They form a ladder
+  without implied steps: each level needs its own scope and every scope below it, so issue
+  `sevdesk:write` only together with `sevdesk:read`. A token without `sevdesk:read` gets
+  no rights at all.
+- **Effective rights = min(mode, scopes).** `SEVDESK_MODE` caps the instance, the token's
+  scopes cap each caller. A call to a tool above the token's scopes gets HTTP 403
+  `insufficient_scope` naming the scopes it needs, so the client can request them.
+  Confirmation tokens are bound to the caller (`sub`, else client ID).
+- **sevdesk token.** The server uses one sevdesk API token for all callers, taken from
+  `SEVDESK_API_TOKEN` only (no keychain lookup). Everyone with a valid access token acts as
+  that sevdesk user, within their scopes.
+- **Host and Origin.** `MCP_ALLOWED_HOSTS` is the allowlist for the `Host` header (DNS
+  rebinding protection) and for the `Origin` header of the MCP endpoint; it defaults to the
+  host of `MCP_RESOURCE_URL`. Requests without `Origin` (CLI and desktop clients,
+  server-side SDKs) are not affected. A request whose `Origin` names another host, or that
+  sends `Origin: null`, gets HTTP 403. Add the host of a browser-based client to let it in.
+  The metadata under `/.well-known` is not restricted.
+- **Logs** go to stdout as JSON lines, audit events included.
+
+### Run it
+
+The image built from [`Dockerfile`](Dockerfile) runs the HTTP server and holds no
+secrets; configuration comes from the environment at run time.
+[`compose.yaml`](compose.yaml) runs it locally with a Redis set up as described below,
+ports bound to localhost only:
+
+```sh
+# Redis in a container, server from source (variables from .env.example in your shell)
+docker compose up -d redis
+npm run build && npm run start:http
+
+# or everything in containers
+docker compose --profile app up --build
+```
+
+Missing or invalid variables stop the server at startup with a configuration error that
+names them. Besides the [common variables](#configuration) the HTTP server reads:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SEVDESK_API_TOKEN` | keychain | sevdesk API token. Unset: read from the keychain (service `sevdesk-mcp`, account `api-token`); required if there is none. |
+| `PORT` | `3000` | Port to bind. |
+| `MCP_RESOURCE_URL` | required | Public URL of the MCP endpoint as clients reach it, and the audience (`aud`) tokens must carry. https; http only for localhost. No query; the path must not be `/healthz` or under `/.well-known/`. |
+| `MCP_ALLOWED_HOSTS` | host of `MCP_RESOURCE_URL` | Comma-separated host names allowed in `Host` and `Origin`, for example behind a reverse proxy. |
+| `OAUTH_ISSUER` | required | Expected `iss` claim, compared as an exact string. https. |
+| `OAUTH_JWKS_URL` | required | Public keys of the authorization server. https. |
+| `OAUTH_ALGORITHMS` | `RS256` | Comma-separated JWS algorithms, asymmetric only (RS, PS, ES and EdDSA families). |
+| `OAUTH_ALLOW_INSECURE_HTTP` | `false` | `true` accepts plain http for `OAUTH_ISSUER` and `OAUTH_JWKS_URL`. Local development only. |
+| `REDIS_URL` | required | `redis://` or `rediss://` URL of the store for confirmation nonces and once-per-target locks. Can carry a password; treat it as a secret. |
+| `SEVDESK_API_TOKEN` | required | As for stdio, but from the environment only. |
+| `SEVDESK_CONFIRM_SECRET` | required | As for stdio, but required: all instances and restarts must accept each other's tokens. |
+
+### Redis
+
+Redis holds the single-use confirmation nonces and the once-per-target locks of
+irreversible actions. If it forgets them, a used confirmation can become valid again.
+Run it like this:
+
+- **Persistence via AOF:** `appendonly yes` with `appendfsync always`, or accept that a
+  crash can forget the last second of writes with `everysec`.
+- **`maxmemory-policy noeviction`,** so nonces are never evicted. Under memory pressure
+  Redis then refuses writes and the server fails closed.
+- **A Redis of its own,** not a shared cache that others flush or evict.
+
+At startup the server warns if `maxmemory-policy` is not `noeviction` (on managed Redis
+without `CONFIG GET` it only logs that it could not check). It also writes a sentinel key;
+if that disappears or changes while the server runs, confirmations (`W+` and `X`) are
+refused until a restart.
+
+The sentinel has limits. It only detects a total loss (`FLUSHALL`, Redis restarted empty)
+while the server is running. It does not detect a partial loss (single keys evicted or
+lost in the last fsync window), and it does not detect a loss that happened while the
+server was down: a restart simply writes a new sentinel. Persistence and `noeviction` are
+the actual protection.
+
+**Recovery after "redis lost its data":** fix persistence, wait at least
+`SEVDESK_CONFIRM_TTL_SECONDS` + 60 seconds so every confirmation token issued before the
+loss has expired, then restart. Check in sevdesk the irreversible actions (e-mails,
+cancellations, enshrining, deletes) of the last 24 hours: their once-per-target lock was
+lost as well.
+
+### Shutdown
+
+On `SIGTERM` the server stops accepting MCP requests (they get HTTP 503, `/healthz`
+reports draining), waits up to 10 seconds for in-flight requests and exits at the latest
+after about 15 seconds. Give it more time than that before `SIGKILL`:
+`stop_grace_period: 20s` in compose (already set) and `terminationGracePeriodSeconds` of
+at least 20 on Kubernetes.
+
+## Configuration
+
+All configuration comes from environment variables; see [`.env.example`](.env.example).
+Empty values count as unset. The variables below apply to both transports; the HTTP
+server needs [a few more](#run-it).
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SEVDESK_API_TOKEN` | keychain | sevdesk API token. Unset: read from the keychain (service `sevdesk-mcp`, account `api-token`); required if there is none. HTTP: environment only. |
 | `SEVDESK_MODE` | `read` | `read`, `write` or `full`. |
-| `SEVDESK_ALLOWED_TOOLS` | all tools | Comma-separated whitelist of tool names. Only narrows. |
-| `SEVDESK_DENIED_TOOLS` | none | Comma-separated tool names that are never registered. |
-| `SEVDESK_ENABLE_TOOLS` | none | Comma-separated tools that are off by default to switch on. |
-| `SEVDESK_API_ALLOW` | curated reads | Comma-separated `operationId`s for `sevdesk_api_request`. |
-| `SEVDESK_CONFIRM_SECRET` | random per process | HMAC key for confirmation tokens, at least 32 characters. |
+| `SEVDESK_ALLOWED_TOOLS` | all tools | Comma-separated whitelist of tool names. Only narrows; never switches on a tool that is off by default. |
+| `SEVDESK_DENIED_TOOLS` | none | Comma-separated tool names that are never registered. Always wins. |
+| `SEVDESK_ENABLE_TOOLS` | none | Comma-separated tools that are off by default to switch on (every `X` tool, bulk exports), still capped by the mode. For `X` it counts as the release for clients without elicitation. |
+| `SEVDESK_API_ALLOW` | curated reads | Comma-separated `operationId`s for `sevdesk_api_request`. Unknown or unclassified IDs stop the server at startup. |
+| `SEVDESK_CONFIRM_SECRET` | random per process | HMAC key for confirmation tokens, at least 32 characters. Required for HTTP. |
 | `SEVDESK_CONFIRM_TTL_SECONDS` | `300` | Lifetime of a confirmation token, 30 to 3600 seconds. |
 | `SEVDESK_BASE_URL` | `https://my.sevdesk.de/api/v1` | API base URL. https only, http only for localhost. |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Logs go to stderr as JSON lines. |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. JSON lines on stderr (stdio) or stdout (HTTP); audit events are written at every level. |
 | `SEVDESK_LIVE_TEST_TOKEN` | unset | Live smoke only: token of a sevdesk test account; unset skips the smoke. |
 | `SEVDESK_LIVE_BASE_URL` | `SEVDESK_BASE_URL` default | Live smoke only: https on sevdesk.de or a subdomain. |
 
 ## Status
 
-Early release. The read tools, the policy layer and the fallback are covered by unit and
-protocol tests against a mocked sevdesk API; a manual, read-only smoke test can run them
-against a real sevdesk test account. Write tools and the HTTP transport are next. Issues and
-feedback are welcome.
+Early release. Read tools, write tools, the policy layer, the fallback and the HTTP
+transport are covered by unit and protocol tests against a mocked sevdesk API; a manual,
+read-only smoke test can run the read tools against a real sevdesk test account. Not
+every write tool has been verified live yet, see the note under
+[What it can do](#what-it-can-do). Issues and feedback are welcome.
 
 ## Development
 
