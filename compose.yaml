@@ -12,8 +12,24 @@
 services:
   redis:
     image: redis:8.2.3-alpine@sha256:08ad0b1d280850169a790dba1393ff7a90aef951fc19632cf4d3ce4f78e679ba
-    # Nonces only need to outlive their TTL; no persistence for local use.
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    # Same rules as in production (see REDIS_URL in .env.example):
+    # - persistence via AOF, fsync on every write: a Redis that forgets a
+    #   used nonce on restart makes a still valid confirmation usable again;
+    # - maxmemory-policy noeviction: under memory pressure Redis must refuse
+    #   writes (the server then fails closed), never drop nonces;
+    # - a Redis of its own, not a shared cache that others flush or evict.
+    # The server also detects lost data via a sentinel key and then refuses
+    # confirmations until it is restarted.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - always
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redis-data:/data
     ports:
       - "127.0.0.1:6379:6379"
     healthcheck:
@@ -45,3 +61,6 @@ services:
       OAUTH_ALGORITHMS: ${OAUTH_ALGORITHMS:-RS256}
       OAUTH_ALLOW_INSECURE_HTTP: ${OAUTH_ALLOW_INSECURE_HTTP:-false}
       REDIS_URL: redis://redis:6379
+
+volumes:
+  redis-data:

@@ -220,4 +220,39 @@ describe("the token subject flows into confirmation tokens and the audit trail",
       reason: "nonce_store_unavailable",
     });
   });
+
+  it("fails closed when Redis stops answering, within the store timeout", async () => {
+    const s = await server("write");
+    const { client } = await fx.client(s.resourceUrl, await token(s.resourceUrl, READ_WRITE));
+    const preview = JSON.parse(textOf(await client.callTool(update())));
+    s.redis.hang = true;
+    const started = Date.now();
+    const result = await client.callTool(update(preview.confirmation_token));
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("replay protection store is unavailable");
+    expect(fx.sevdesk.seen.filter((r) => r.method === "PUT")).toEqual([]);
+  });
+
+  it("refuses W+ after Redis lost its data and logs why; reads keep working", async () => {
+    const s = await server("write");
+    const { client } = await fx.client(s.resourceUrl, await token(s.resourceUrl, READ_WRITE));
+    const first = JSON.parse(textOf(await client.callTool(update())));
+    expect(textOf(await client.callTool(update(first.confirmation_token)))).not.toContain(
+      "unavailable",
+    );
+    // A Redis restart without persistence: the used nonce is gone, so the
+    // same confirmation would work again without the sentinel check.
+    s.redis.flush();
+    const replay = await client.callTool(update(first.confirmation_token));
+    expect(replay.isError).toBe(true);
+    expect(textOf(replay)).toContain("replay protection store is unavailable");
+    expect(fx.sevdesk.seen.filter((r) => r.method === "PUT")).toHaveLength(1);
+    const log = s.logLines.join("");
+    expect(log).toContain("NonceStoreStateLostError");
+    expect(log).toContain("until the server is restarted");
+    expect(textOf(await client.callTool({ name: "get_account_info", arguments: {} }))).toContain(
+      "2.0",
+    );
+  });
 });

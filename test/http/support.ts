@@ -215,12 +215,16 @@ export async function startTestServer(
   const running = await startHttpServer({
     host: "127.0.0.1",
     writeLine: (line) => logLines.push(line),
-    connectNonceStore: async () => ({
-      store: new RedisNonceStore(redis),
-      close: async () => {
-        redisClosed = true;
-      },
-    }),
+    connectNonceStore: async () => {
+      const store = new RedisNonceStore(redis, { operationTimeoutMs: 200 });
+      await store.initialize();
+      return {
+        store,
+        close: async () => {
+          redisClosed = true;
+        },
+      };
+    },
     ...options,
     env: serverEnv,
   });

@@ -2,9 +2,16 @@ import { createClient } from "redis";
 import type { Logger } from "../logger.js";
 import { type RedisCommands, RedisNonceStore } from "../policy/redis-nonce-store.js";
 
-/** Upper bound for one command; a slow Redis must not hold a tool call. */
+/**
+ * Upper bound for one command; a slow Redis must not hold a tool call.
+ * Passed to node-redis and enforced again by the store, because the client
+ * option does not cover commands already sent. No socketTimeout: it would
+ * also drop healthy idle connections.
+ */
 export const REDIS_COMMAND_TIMEOUT_MS = 2000;
 export const REDIS_CONNECT_TIMEOUT_MS = 5000;
+/** Upper bound for closing the connection on shutdown. */
+export const REDIS_CLOSE_TIMEOUT_MS = 1000;
 /** Failed connection attempts at startup before the server gives up. */
 export const REDIS_STARTUP_RETRIES = 5;
 
@@ -20,6 +27,7 @@ export type ConnectNonceStore = (url: string, logger: Logger) => Promise<RedisNo
  *
  * Startup fails if Redis cannot be reached after a few attempts, so a wrong
  * URL or password shows up at once instead of at the first confirmation.
+ * It also writes the sentinel key that detects later data loss.
  * Once connected, the client reconnects in the background without limit;
  * while it is disconnected, commands are not queued but fail at once, and
  * the store rejects: confirmations fail closed, reading tools keep working.
@@ -48,15 +56,35 @@ export const connectRedisNonceStore: ConnectNonceStore = async (url, logger) => 
   await client.connect();
   connected = true;
 
-  return {
-    store: new RedisNonceStore(client as unknown as RedisCommands),
-    close: async () => {
-      if (!client.isOpen) return;
-      try {
-        await client.close();
-      } catch {
-        client.destroy();
-      }
-    },
+  const store = new RedisNonceStore(client as unknown as RedisCommands, {
+    operationTimeoutMs: REDIS_COMMAND_TIMEOUT_MS,
+    onStateLost: () =>
+      logger.error("redis lost its data: confirmations refused until restart", {
+        hint: "check appendonly yes and maxmemory-policy noeviction, then restart the server",
+      }),
+  });
+  const close = async () => {
+    if (!client.isOpen) return;
+    // QUIT waits for pending replies; a Redis that stopped answering must
+    // not hold the shutdown.
+    let timer: NodeJS.Timeout | undefined;
+    const closed = await Promise.race([
+      client.close().then(
+        () => true,
+        () => false,
+      ),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), REDIS_CLOSE_TIMEOUT_MS);
+      }),
+    ]);
+    clearTimeout(timer);
+    if (!closed) client.destroy();
   };
+  try {
+    await store.initialize();
+  } catch (error) {
+    await close();
+    throw error;
+  }
+  return { store, close };
 };
