@@ -149,7 +149,7 @@ describe("validateToolNames", () => {
   it("accepts known names and reports unknown ones", () => {
     expect(() =>
       validateToolNames(
-        testConfig({ allowedTools: ["get_account_info"], deniedTools: ["get_account_info"] }),
+        testConfig({ allowedTools: ["get_account_info"], deniedTools: ["sevdesk_api_request"] }),
         TOOL_NAMES,
       ),
     ).not.toThrow();

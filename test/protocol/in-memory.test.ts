@@ -36,7 +36,7 @@ describe("MCP protocol over the in-memory transport", () => {
     try {
       const { tools } = await client.listTools();
 
-      expect(tools.map((tool) => tool.name)).toEqual(["get_account_info"]);
+      expect(tools.map((tool) => tool.name)).toEqual(["get_account_info", "sevdesk_api_request"]);
       const tool = tools.find((t) => t.name === "get_account_info");
       expect(tool?.inputSchema.type).toBe("object");
       expect(tool?.outputSchema).toMatchObject({

@@ -4,6 +4,7 @@ import { createLogger, type Logger } from "./logger.js";
 import { registerTools, validateToolNames } from "./policy/registry.js";
 import { createPolicyRuntime, type PolicyRuntime, requestPolicy } from "./policy/runtime.js";
 import { createSevdeskClient, type SevdeskClient } from "./sevdesk/client.js";
+import { registerGenericTool } from "./tools/generic.js";
 import { TOOL_NAMES, TOOLS } from "./tools/index.js";
 import { SERVER_NAME, VERSION } from "./version.js";
 
@@ -42,6 +43,7 @@ export function createServer(config: Config, deps: ServerDeps = {}): McpServer {
 
   const env = { server, policy, deps: { config, sevdesk, logger } };
   registerTools(env, TOOLS);
+  registerGenericTool(env);
 
   return server;
 }

@@ -34,6 +34,12 @@ export type SevdeskApi = Client<paths>;
 export interface SevdeskClient {
   /** Typed openapi-fetch client. Pass its promise to `call` to get data or a SevdeskError. */
   readonly api: SevdeskApi;
+  /**
+   * Same client without retries, also for GET. For operations with side
+   * effects behind a GET (export jobs, sendByWithRender): repeating them
+   * after a timeout could run them twice.
+   */
+  readonly apiSingleAttempt: SevdeskApi;
   call<T>(request: Promise<ApiResult<T>>): Promise<T>;
 }
 
@@ -222,19 +228,23 @@ export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClien
     now: options.now ?? Date.now,
   };
 
-  const api = createClient<paths>({
-    baseUrl: options.baseUrl.replace(/\/+$/, ""),
-    headers: {
-      // sevdesk expects the raw token, without a "Bearer" prefix.
-      Authorization: options.token,
-      "User-Agent": options.userAgent ?? USER_AGENT,
-      Accept: "application/json",
-    },
-    fetch: createPolicyFetch(policy),
-  });
+  const clientFor = (fetchPolicy: FetchPolicy) =>
+    createClient<paths>({
+      baseUrl: options.baseUrl.replace(/\/+$/, ""),
+      headers: {
+        // sevdesk expects the raw token, without a "Bearer" prefix.
+        Authorization: options.token,
+        "User-Agent": options.userAgent ?? USER_AGENT,
+        Accept: "application/json",
+      },
+      fetch: createPolicyFetch(fetchPolicy),
+    });
+  const api = clientFor(policy);
+  const apiSingleAttempt = clientFor({ ...policy, retry: { ...policy.retry, maxRetries: 0 } });
 
   return {
     api,
+    apiSingleAttempt,
     async call<T>(request: Promise<ApiResult<T>>): Promise<T> {
       let result: ApiResult<T>;
       try {

@@ -589,6 +589,23 @@ describe("timeouts and deadline", () => {
     );
   });
 
+  it("never retries through the single-attempt client, also for GET", async () => {
+    let calls = 0;
+    server.use(
+      http.get(url("/Part"), () => {
+        calls++;
+        return HttpResponse.json({}, { status: 503 });
+      }),
+    );
+    const { client, sleeps } = setup();
+
+    const error = await captureError(client.call(client.apiSingleAttempt.GET("/Part")));
+
+    expect(error.kind).toBe("server_error");
+    expect(calls).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
   it("passes a 204 through without a body", async () => {
     server.use(http.delete(url("/Contact/:id"), () => new HttpResponse(null, { status: 204 })));
     const { client } = setup();

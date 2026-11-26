@@ -189,7 +189,7 @@ describe("registration by mode", () => {
     try {
       const { tools } = await client.listTools();
       for (const tool of tools) expect(tool.annotations?.readOnlyHint).toBe(true);
-      expect(tools.map((t) => t.name)).toEqual(["get_account_info"]);
+      expect(tools.map((t) => t.name)).toEqual(["get_account_info", "sevdesk_api_request"]);
     } finally {
       await client.close();
       await server.close();
