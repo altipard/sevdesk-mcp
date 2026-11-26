@@ -1,0 +1,163 @@
+overlay: 1.0.0
+info:
+  title: sevdesk-mcp corrections to the sevdesk OpenAPI spec
+  version: 1.0.0
+# Applied by `npm run gen` on top of openapi/sevdesk.openapi.yaml.
+# Every action must match at least one node, otherwise gen fails:
+# that is how drift in the upstream spec gets noticed.
+actions:
+  # Shared building blocks. The upstream spec has no components.parameters
+  # or components.responses at all.
+  - target: "$.components"
+    description: Pagination/embed parameters and error responses documented but not declared upstream
+    update:
+      parameters:
+        limit:
+          name: limit
+          in: query
+          description: Maximum number of objects to return (1-1000).
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+        offset:
+          name: offset
+          in: query
+          description: Number of objects to skip.
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+        countAll:
+          name: countAll
+          in: query
+          description: Adds the total number of matching objects to the response.
+          required: false
+          schema:
+            type: boolean
+        embed:
+          name: embed
+          in: query
+          description: Comma-separated names of nested resources to embed, e.g. "contact,positions".
+          required: false
+          schema:
+            type: string
+      responses:
+        BadRequest:
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        Unauthorized:
+          description: Authentication required or token invalid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        Forbidden:
+          description: Token lacks permission for this resource
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        NotFound:
+          description: Resource not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        TooManyRequests:
+          description: Rate limit exceeded (limits are not documented by sevdesk)
+          headers:
+            Retry-After:
+              description: Seconds to wait or an HTTP date, if sent.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        ServerError:
+          description: Internal server error (sevdesk sometimes answers 500 where 400 is meant)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  - target: "$.components.schemas"
+    description: Common error body, same shape as validationError
+    update:
+      ErrorResponse:
+        type: object
+        properties:
+          error:
+            type: object
+            properties:
+              message:
+                type: string
+              exceptionUUID:
+                type: string
+                description: Identifier of this exact problem for the sevdesk support.
+
+  # List endpoints: limit/offset/countAll/embed are documented as generic
+  # but not declared on these operations.
+  - target: "$.paths['/Contact','/Invoice','/Order','/Voucher','/CheckAccountTransaction','/Part'].get.parameters"
+    description: Pagination and embed on list endpoints with an existing parameter list
+    update:
+      - $ref: "#/components/parameters/limit"
+      - $ref: "#/components/parameters/offset"
+      - $ref: "#/components/parameters/countAll"
+      - $ref: "#/components/parameters/embed"
+
+  - target: "$.paths['/CheckAccount'].get"
+    description: Pagination and embed on GET /CheckAccount, which has no parameter list upstream
+    update:
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/offset"
+        - $ref: "#/components/parameters/countAll"
+        - $ref: "#/components/parameters/embed"
+
+  - target: "$.paths['/Contact/{contactId}','/Invoice/{invoiceId}','/Order/{orderId}','/Voucher/{voucherId}','/CheckAccount/{checkAccountId}','/CheckAccountTransaction/{checkAccountTransactionId}','/Part/{partId}'].get.parameters"
+    description: embed on single-object endpoints
+    update:
+      - $ref: "#/components/parameters/embed"
+
+  # Error responses. Upstream declares 400/401/500 without a body and no
+  # 403/404/429. Remove the body-less entries first so the update does not
+  # merge a $ref next to a description.
+  - target: "$.paths['/Contact','/Invoice','/Order','/Voucher','/CheckAccount','/CheckAccountTransaction','/Part','/Contact/{contactId}','/Invoice/{invoiceId}','/Order/{orderId}','/Voucher/{voucherId}','/CheckAccount/{checkAccountId}','/CheckAccountTransaction/{checkAccountTransactionId}','/Part/{partId}','/Tools/bookkeepingSystemVersion'].get.responses['400','401','500']"
+    description: Drop body-less error responses before replacing them
+    remove: true
+
+  - target: "$.paths['/Contact','/Invoice','/Order','/Voucher','/CheckAccount','/CheckAccountTransaction','/Part','/Tools/bookkeepingSystemVersion'].get.responses"
+    description: Error responses on list and account endpoints
+    update:
+      "400":
+        $ref: "#/components/responses/BadRequest"
+      "401":
+        $ref: "#/components/responses/Unauthorized"
+      "403":
+        $ref: "#/components/responses/Forbidden"
+      "429":
+        $ref: "#/components/responses/TooManyRequests"
+      "500":
+        $ref: "#/components/responses/ServerError"
+
+  - target: "$.paths['/Contact/{contactId}','/Invoice/{invoiceId}','/Order/{orderId}','/Voucher/{voucherId}','/CheckAccount/{checkAccountId}','/CheckAccountTransaction/{checkAccountTransactionId}','/Part/{partId}'].get.responses"
+    description: Error responses on single-object endpoints
+    update:
+      "400":
+        $ref: "#/components/responses/BadRequest"
+      "401":
+        $ref: "#/components/responses/Unauthorized"
+      "403":
+        $ref: "#/components/responses/Forbidden"
+      "404":
+        $ref: "#/components/responses/NotFound"
+      "429":
+        $ref: "#/components/responses/TooManyRequests"
+      "500":
+        $ref: "#/components/responses/ServerError"
