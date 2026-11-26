@@ -193,7 +193,14 @@ describe("get_tax_guidance", () => {
     const all = structured<{ accounts: Array<Record<string, unknown>>; page: unknown }>(
       await c.call("get_tax_guidance", { limit: 10, offset: 20 }),
     );
-    expect(all.page).toEqual({ offset: 20, limit: 10, count: 10, total: 30, hasMore: false });
+    expect(all.page).toEqual({
+      offset: 20,
+      limit: 10,
+      count: 10,
+      total: 30,
+      hasMore: false,
+      nextOffset: null,
+    });
     expect(all.accounts[0]).toEqual({
       accountDatevId: 21,
       accountNumber: "4400",

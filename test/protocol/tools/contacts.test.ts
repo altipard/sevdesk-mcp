@@ -57,7 +57,14 @@ describe("search_contacts", () => {
         organisationId: 2001,
       }),
     ]);
-    expect(data.page).toEqual({ offset: 0, limit: 25, count: 2, total: 2, hasMore: false });
+    expect(data.page).toEqual({
+      offset: 0,
+      limit: 25,
+      count: 2,
+      total: 2,
+      hasMore: false,
+      nextOffset: null,
+    });
     expect(data.scan).toBeUndefined();
   });
 
@@ -119,7 +126,14 @@ describe("search_contacts", () => {
     expect(String(data.scan?.note)).toContain("more matching contacts may exist beyond them");
     expect(String(data.scan?.note)).toContain("a longer part of the name");
     // Contacts beyond the scan may match too, so the total is unknown.
-    expect(data.page).toEqual({ offset: 0, limit: 5, count: 5, total: null, hasMore: true });
+    expect(data.page).toEqual({
+      offset: 0,
+      limit: 5,
+      count: 5,
+      total: null,
+      hasMore: true,
+      nextOffset: 5,
+    });
   });
 
   /** 500 contacts named "Firma n", of which only id 3 matches "muster". */
@@ -174,7 +188,14 @@ describe("search_contacts", () => {
       await c.call("search_contacts", { query: "muster", limit: 1, offset: 2 }),
     );
     expect(past.contacts).toEqual([]);
-    expect(past.page).toEqual({ offset: 2, limit: 1, count: 0, total: null, hasMore: false });
+    expect(past.page).toEqual({
+      offset: 2,
+      limit: 1,
+      count: 0,
+      total: null,
+      hasMore: false,
+      nextOffset: null,
+    });
     expect(past.scan).toMatchObject({ truncated: true });
   });
 
@@ -386,7 +407,14 @@ describe("search_contacts", () => {
           await c.call("search_contacts", { query: "@muster", includePersons, limit: 3 }),
         );
         expect(first.contacts.map((x) => x.id)).toEqual([3000, 3001, 3002]);
-        expect(first.page).toEqual({ offset: 0, limit: 3, count: 3, total: null, hasMore: true });
+        expect(first.page).toEqual({
+          offset: 0,
+          limit: 3,
+          count: 3,
+          total: null,
+          hasMore: true,
+          nextOffset: 3,
+        });
         expect(first.scan).toMatchObject({ mode: "email", truncated: true });
 
         const past = structured<Search>(
@@ -429,7 +457,7 @@ describe("search_contacts", () => {
         );
         pages.push(data.page);
         if (!data.page.hasMore) return pages;
-        offset = (data.page.offset as number) + (data.page.limit as number);
+        offset = data.page.nextOffset as number;
       }
       throw new Error(`still more after 5 pages: ${JSON.stringify(pages)}`);
     }
@@ -438,8 +466,8 @@ describe("search_contacts", () => {
       mockMatches((i) => i < 25);
       const c = await connect();
       expect(await walk(c)).toEqual([
-        { offset: 0, limit: 25, count: 0, total: 30, hasMore: true },
-        { offset: 25, limit: 25, count: 5, total: 30, hasMore: false },
+        { offset: 0, limit: 25, count: 0, total: 30, hasMore: true, nextOffset: 25 },
+        { offset: 25, limit: 25, count: 5, total: 30, hasMore: false, nextOffset: null },
       ]);
     });
 
@@ -447,8 +475,8 @@ describe("search_contacts", () => {
       mockMatches((i) => i >= 25);
       const c = await connect();
       expect(await walk(c)).toEqual([
-        { offset: 0, limit: 25, count: 25, total: 30, hasMore: true },
-        { offset: 25, limit: 25, count: 0, total: 30, hasMore: false },
+        { offset: 0, limit: 25, count: 25, total: 30, hasMore: true, nextOffset: 25 },
+        { offset: 25, limit: 25, count: 0, total: 30, hasMore: false, nextOffset: null },
       ]);
     });
   });

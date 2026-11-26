@@ -9,6 +9,7 @@ import {
   integer,
   isoDate,
   isoDateOf,
+  MAX_OFFSET,
   MAX_TEXT_LENGTH,
   objectsOf,
   pageOf,
@@ -111,6 +112,23 @@ describe("lists", () => {
     expect(pageOf(50, 25, 7, 57).hasMore).toBe(false);
     expect(pageOf(0, 25, 25, null).hasMore).toBe(true);
     expect(pageOf(0, 25, 3, null).hasMore).toBe(false);
+  });
+
+  it("offers nextOffset after the requested range, not after the results", () => {
+    expect(pageOf(25, 25, 25, 57).nextOffset).toBe(50);
+    // A page thinned out (filter, vanished objects) still moves on by limit.
+    expect(pageOf(25, 25, 4, 57, true).nextOffset).toBe(50);
+    expect(pageOf(0, 25, 0, null, true).nextOffset).toBe(25);
+    expect(pageOf(50, 25, 7, 57).nextOffset).toBeNull();
+    expect(pageOf(0, 25, 25, 25).nextOffset).toBeNull();
+    expect(pageOf(0, 25, 25, null, false).nextOffset).toBeNull();
+  });
+
+  it("gives no nextOffset beyond the highest offset the tools accept", () => {
+    expect(pageOf(MAX_OFFSET - 25, 25, 25, null).nextOffset).toBe(MAX_OFFSET);
+    const last = pageOf(MAX_OFFSET - 10, 25, 25, null);
+    expect(last.hasMore).toBe(true);
+    expect(last.nextOffset).toBeNull();
   });
 });
 

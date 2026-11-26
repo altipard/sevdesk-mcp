@@ -39,11 +39,11 @@ describe("okResult size budget", () => {
     const data = present(
       {
         items: entries(100),
-        page: { offset: 0, limit: 100, count: 100, total: 250, hasMore: true },
+        page: { offset: 50, limit: 100, count: 100, total: 250, hasMore: true, nextOffset: 150 },
         truncated: false,
         note: "Earlier note.",
       },
-      { summary: "100 of 250 items (offset 0, more available)." },
+      { summary: "100 of 250 items (offset 50, more available)." },
     );
     const result = okResult(data);
     const text = textOf(result);
@@ -59,6 +59,8 @@ describe("okResult size budget", () => {
     expect(json.truncated).toBe(true);
     expect(json.note.startsWith("Earlier note. Answer cut")).toBe(true);
     expect(json.page).toMatchObject({ count: json.items.length, hasMore: true, total: 250 });
+    // The next page starts after the entries kept, so the cut ones are not skipped.
+    expect(json.page.nextOffset).toBe(50 + json.items.length);
     expect(json.items.map((i) => i.id)).toEqual(json.items.map((_, i) => i));
   });
 

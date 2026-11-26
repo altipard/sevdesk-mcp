@@ -1,6 +1,7 @@
 import type { CallToolResult, ContentBlock } from "@modelcontextprotocol/server";
 import type { Logger } from "../logger.js";
 import { SevdeskError } from "../sevdesk/errors.js";
+import { MAX_OFFSET } from "./format.js";
 
 export interface Presentation {
   /** One line for the reader, put in front of the JSON text. */
@@ -73,7 +74,9 @@ interface Cut {
 
 /**
  * Marks a cut answer: `truncated` and a note (appended to an existing one),
- * and for the list a page describes, the page's count and hasMore.
+ * and for the list a page describes, the page's count, hasMore and
+ * nextOffset. The next page then starts after the entries kept, so the cut
+ * ones are not skipped.
  */
 function markCut(data: Record<string, unknown>, cuts: readonly Cut[]): Record<string, unknown> {
   const parts = cuts.map(
@@ -90,7 +93,17 @@ function markCut(data: Record<string, unknown>, cuts: readonly Cut[]): Record<st
   const page = data.page;
   if (isPlainObject(page) && typeof page.count === "number") {
     const listed = cuts.find((cut) => cut.total === page.count);
-    if (listed) marked.page = { ...page, count: listed.kept, hasMore: true };
+    if (listed) {
+      const next = typeof page.offset === "number" ? page.offset + listed.kept : null;
+      marked.page = {
+        ...page,
+        count: listed.kept,
+        hasMore: true,
+        ...("nextOffset" in page && {
+          nextOffset: next !== null && next <= MAX_OFFSET ? next : null,
+        }),
+      };
+    }
   }
   return marked;
 }
