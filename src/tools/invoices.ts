@@ -10,6 +10,7 @@ import {
   daysBetween,
   enshrinedOf,
   entityId,
+  FOREIGN_DATA_NOTE,
   INVOICE_STATUS,
   INVOICE_TYPE,
   integer,
@@ -137,7 +138,8 @@ export const searchInvoices = defineTool({
     "Lists invoices in sevdesk's order, filtered by status, invoice date range, " +
     "contact or invoice number. Returns a compact summary per invoice (amounts, due date, open " +
     "amount). Use get_invoice for positions and details, list_open_receivables for what " +
-    "customers still owe, and search_contacts first to find a contactId.",
+    "customers still owe, and search_contacts first to find a contactId." +
+    FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "getInvoices",
   inputSchema: z.object({
@@ -205,7 +207,8 @@ export const getInvoice = defineTool({
   title: "Get a sevdesk invoice",
   description:
     "Returns one invoice by its sevdesk ID with all positions (up to 100), amounts, dates and " +
-    "status. Find the ID with search_invoices. Use get_document_pdf for the rendered PDF.",
+    "status. Find the ID with search_invoices. Use get_document_pdf for the rendered PDF." +
+    FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "getInvoiceById",
   inputSchema: z.object({ invoiceId: entityId.describe("sevdesk ID of the invoice.") }),
@@ -247,7 +250,7 @@ export const getInvoice = defineTool({
       { invoice, positions, positionsTruncated: truncated },
       {
         summary:
-          `Invoice ${invoice.invoiceNumber ?? invoice.id} (${invoice.statusName ?? "unknown status"}), ` +
+          `Invoice ${invoice.id} (${invoice.statusName ?? "unknown status"}), ` +
           `${positions.length}${truncated ? "+" : ""} positions.`,
       },
     );
@@ -307,7 +310,8 @@ export const listOpenReceivables = defineTool({
   description:
     "Lists invoices customers still have to pay (status open or partially paid) with open " +
     "amount, due date and days overdue, sorted by due date, plus totals per currency. Use it " +
-    "for dunning and cash-flow questions; use search_invoices for any other invoice search.",
+    "for dunning and cash-flow questions; use search_invoices for any other invoice search." +
+    FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "getInvoices",
   inputSchema: z.object({

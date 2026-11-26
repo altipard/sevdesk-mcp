@@ -167,7 +167,7 @@ describe("get_voucher", () => {
         comment: null,
       },
     ]);
-    expect(textOf(result).split("\n")[0]).toBe("Voucher Druckerpapier (paid), 1 positions.");
+    expect(textOf(result).split("\n")[0]).toBe("Voucher 8001 (paid), 1 positions.");
   });
 
   it("treats an empty answer as not found", async () => {

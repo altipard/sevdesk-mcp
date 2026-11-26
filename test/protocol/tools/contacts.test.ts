@@ -290,9 +290,7 @@ describe("get_contact", () => {
       { id: 6003, type: "PHONE", value: "+49 30 000000", main: false },
     ]);
     expect(data.note).toBeUndefined();
-    expect(textOf(result).split("\n")[0]).toBe(
-      "Contact Muster GmbH: 1 addresses, 2 communication ways.",
-    );
+    expect(textOf(result).split("\n")[0]).toBe("Contact 2001: 1 addresses, 2 communication ways.");
   });
 
   it("treats an empty answer as not found", async () => {

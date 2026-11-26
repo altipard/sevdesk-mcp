@@ -3,6 +3,7 @@ import { defineTool } from "../policy/registry.js";
 import {
   asRecord,
   badInput,
+  FOREIGN_DATA_NOTE,
   integer,
   objectsOf,
   pageInput,
@@ -42,7 +43,8 @@ export const getTaxGuidance = defineTool({
     "Lists which booking accounts, tax rules and tax rates sevdesk allows together " +
     "(ReceiptGuidance, bookkeeping 2.0). scope revenue or expense narrows to income or cost " +
     "accounts, account to one account number, tax_rule to the accounts allowed for one tax " +
-    "rule. Use it before suggesting an account or tax rule for a voucher or invoice.",
+    "rule. Use it before suggesting an account or tax rule for a voucher or invoice." +
+    FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "forAllAccounts",
   inputSchema: z.object({

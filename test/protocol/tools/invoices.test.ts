@@ -182,7 +182,7 @@ describe("get_invoice", () => {
       discount: null,
     });
     expect(data.positionsTruncated).toBe(false);
-    expect(textOf(result).split("\n")[0]).toBe("Invoice RE-1001 (open), 2 positions.");
+    expect(textOf(result).split("\n")[0]).toBe("Invoice 1001 (open), 2 positions.");
   });
 
   it("flags positions beyond the first 100", async () => {
@@ -197,7 +197,7 @@ describe("get_invoice", () => {
     const c = await connect();
     const result = await c.call("get_invoice", { invoiceId: 1001 });
     expect(structured<{ positionsTruncated: boolean }>(result).positionsTruncated).toBe(true);
-    expect(textOf(result).split("\n")[0]).toBe("Invoice RE-1001 (open), 100+ positions.");
+    expect(textOf(result).split("\n")[0]).toBe("Invoice 1001 (open), 100+ positions.");
   });
 
   it("treats an empty answer as not found", async () => {

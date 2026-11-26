@@ -56,7 +56,7 @@ describe("list_bank_accounts", () => {
     });
     expect(data.accounts[1]).toMatchObject({ statusName: "archived", balance: null });
     expect(textOf(result).split("\n")[0]).toBe(
-      "2 of 2 accounts (offset 0). Geschäftskonto: 12345.67 EUR.",
+      "2 of 2 accounts (offset 0). account 9001: 12345.67 EUR.",
     );
   });
 

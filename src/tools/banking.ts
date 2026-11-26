@@ -8,6 +8,7 @@ import {
   dateRangeInput,
   enshrinedOf,
   entityId,
+  FOREIGN_DATA_NOTE,
   flag,
   integer,
   isoDateOf,
@@ -64,7 +65,8 @@ export const listBankAccounts = defineTool({
   title: "List sevdesk bank accounts",
   description:
     "Lists the payment accounts (bank accounts, cash registers, clearing accounts) with " +
-    "balance, IBAN and status. Use the returned id as checkAccountId in search_transactions.",
+    "balance, IBAN and status. Use the returned id as checkAccountId in search_transactions." +
+    FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "getCheckAccounts",
   inputSchema: z.object({ ...pageInput }),
@@ -78,7 +80,7 @@ export const listBankAccounts = defineTool({
     const page = pageOf(args.offset, args.limit, accounts.length, totalOf(body));
     const balances = accounts
       .filter((a) => a.balance !== null)
-      .map((a) => `${a.name ?? a.id}: ${a.balance} ${a.currency ?? ""}`.trim())
+      .map((a) => `account ${a.id}: ${a.balance} ${a.currency ?? ""}`.trim())
       .join("; ");
     return present(
       { accounts, page },
@@ -110,7 +112,8 @@ export const searchTransactions = defineTool({
   description:
     "Lists bank transactions, filtered by account, value date range, payment reference, " +
     "payer/payee name, booked or open, and incoming or outgoing. Use it to check whether a " +
-    "payment arrived; find account IDs with list_bank_accounts.",
+    "payment arrived; find account IDs with list_bank_accounts." +
+    FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "getTransactions",
   inputSchema: z.object({

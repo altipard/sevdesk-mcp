@@ -2,7 +2,15 @@ import type { ContentBlock } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { defineTool } from "../policy/registry.js";
 import { SevdeskError } from "../sevdesk/errors.js";
-import { asRecord, entityId, flag, type Raw, READ_ANNOTATIONS, text } from "./format.js";
+import {
+  asRecord,
+  entityId,
+  FOREIGN_DATA_NOTE,
+  flag,
+  type Raw,
+  READ_ANNOTATIONS,
+  text,
+} from "./format.js";
 import { present } from "./result.js";
 
 /** Upper bound for a decoded file handed to the client (5 MiB). */
@@ -78,7 +86,8 @@ export const getDocumentPdf = defineTool({
     "Returns the rendered PDF of an invoice, credit note or order (estimate) as an embedded " +
     "resource (base64, application/pdf), plus file name and size. Fetching never marks the " +
     `document as sent: the server always sets preventSendBy. Files over ${MAX_FILE_BYTES} ` +
-    "bytes are refused. Use get_invoice for the data itself.",
+    "bytes are refused. Use get_invoice for the data itself." +
+    FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "invoiceGetPdf",
   inputSchema: z.object({
@@ -122,7 +131,7 @@ export const getDocumentPdf = defineTool({
         resourceUri,
       },
       {
-        summary: `PDF of ${documentType} ${documentId}: ${file.filename ?? "unnamed"}, ${file.sizeBytes} bytes.`,
+        summary: `PDF of ${documentType} ${documentId}, ${file.sizeBytes} bytes.`,
         content: [fileContent(resourceUri, file)],
       },
     );

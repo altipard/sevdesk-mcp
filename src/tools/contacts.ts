@@ -6,6 +6,7 @@ import {
   badInput,
   CONTACT_STATUS,
   entityId,
+  FOREIGN_DATA_NOTE,
   flag,
   integer,
   isoDateOf,
@@ -261,7 +262,8 @@ export const searchContacts = defineTool({
     `${MAX_EMAILS_SCANNED} e-mail addresses and says when it stopped early. ` +
     "Without filters it lists contacts page by page. Use get_contact for addresses and " +
     "communication details, and the returned id as contactId in the invoice, order and " +
-    "voucher searches.",
+    "voucher searches." +
+    FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "getContacts",
   inputSchema: z.object({
@@ -393,7 +395,8 @@ export const getContact = defineTool({
   title: "Get a sevdesk contact",
   description:
     "Returns one contact by its sevdesk ID with master data, addresses and communication " +
-    "ways (e-mail, phone, web). Find the ID with search_contacts.",
+    "ways (e-mail, phone, web). Find the ID with search_contacts." +
+    FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "getContactById",
   inputSchema: z.object({ contactId: entityId.describe("sevdesk ID of the contact.") }),
@@ -460,7 +463,7 @@ export const getContact = defineTool({
       },
       {
         summary:
-          `Contact ${contact.name ?? contact.id}: ${addresses.length} addresses, ` +
+          `Contact ${contact.id}: ${addresses.length} addresses, ` +
           `${communicationWays.length} communication ways.`,
       },
     );

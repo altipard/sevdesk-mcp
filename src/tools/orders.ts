@@ -6,6 +6,7 @@ import {
   codeFor,
   dateRangeInput,
   entityId,
+  FOREIGN_DATA_NOTE,
   integer,
   isoDateOf,
   ORDER_STATUS,
@@ -74,7 +75,8 @@ export const searchOrders = defineTool({
   description:
     "Lists estimates (Angebote), order confirmations and delivery notes, filtered by status, " +
     "order date range, contact or order number. Each result names its orderType. Use " +
-    "search_invoices for invoices and get_document_pdf (documentType order) for the PDF.",
+    "search_invoices for invoices and get_document_pdf (documentType order) for the PDF." +
+    FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "getOrders",
   inputSchema: z.object({

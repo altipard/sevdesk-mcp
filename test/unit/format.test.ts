@@ -9,9 +9,12 @@ import {
   integer,
   isoDate,
   isoDateOf,
+  MAX_TEXT_LENGTH,
   objectsOf,
   pageOf,
   statusOf,
+  TRUNCATION_MARK,
+  text,
   todayIso,
   totalOf,
   unixSeconds,
@@ -108,5 +111,21 @@ describe("lists", () => {
     expect(pageOf(50, 25, 7, 57).hasMore).toBe(false);
     expect(pageOf(0, 25, 25, null).hasMore).toBe(true);
     expect(pageOf(0, 25, 3, null).hasMore).toBe(false);
+  });
+});
+
+describe("untrusted text", () => {
+  it("keeps tabs and newlines, drops control and invisible characters", () => {
+    expect(text("a\tb\nc")).toBe("a\tb\nc");
+    expect(text("a\r\nb\rc")).toBe("a\nb\nc");
+    expect(text("x\u0000\u0007\u001b\u007f\u0085­​‎ ‮⁦﻿y")).toBe("xy");
+    expect(text("​ \u0000")).toBeNull();
+  });
+
+  it("caps long texts with a mark and leaves short ones alone", () => {
+    const capped = text("a".repeat(MAX_TEXT_LENGTH + 1)) ?? "";
+    expect(capped).toHaveLength(MAX_TEXT_LENGTH);
+    expect(capped.endsWith(TRUNCATION_MARK)).toBe(true);
+    expect(text("a".repeat(MAX_TEXT_LENGTH))).toHaveLength(MAX_TEXT_LENGTH);
   });
 });

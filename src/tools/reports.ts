@@ -7,6 +7,7 @@ import {
   berlinDateTime,
   dateRangeInput,
   entityId,
+  FOREIGN_DATA_NOTE,
   READ_ANNOTATIONS,
   rangeProblem,
 } from "./format.js";
@@ -36,7 +37,8 @@ export const getReport = defineTool({
     "vouchers as an embedded resource, optionally limited to a date range and a contact " +
     "(not for contacts) or, for orders, an order type. It is a document for people, not data: " +
     "use the search_* tools to work with the entries. " +
-    `Files over ${MAX_FILE_BYTES} bytes are refused.`,
+    `Files over ${MAX_FILE_BYTES} bytes are refused.` +
+    FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "reportInvoice",
   inputSchema: z.object({
@@ -96,7 +98,7 @@ export const getReport = defineTool({
         resourceUri,
       },
       {
-        summary: `${args.report} report: ${file.filename ?? "unnamed"}, ${file.sizeBytes} bytes.`,
+        summary: `${args.report} report, ${file.sizeBytes} bytes.`,
         content: [fileContent(resourceUri, file)],
       },
     );

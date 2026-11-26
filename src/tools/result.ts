@@ -9,6 +9,9 @@ export interface Presentation {
   readonly content?: readonly ContentBlock[];
 }
 
+/** Upper bound of the summary line; summaries carry IDs and counts, not free text. */
+export const MAX_SUMMARY_LENGTH = 300;
+
 // Keyed by the output object the handler returns: the guard hands that very
 // object to okResult, so tools can shape their result without the guard
 // knowing about it, and structuredContent stays exactly the schema'd data.
@@ -28,9 +31,11 @@ export function present<T extends Record<string, unknown>>(data: T, presentation
 export function okResult<T extends Record<string, unknown>>(data: T): CallToolResult {
   const presentation = presentations.get(data);
   const json = JSON.stringify(data);
+  // One line, so the JSON is always the second line, whatever a summary holds.
+  const summary = presentation?.summary.replace(/\s+/g, " ").trim().slice(0, MAX_SUMMARY_LENGTH);
   return {
     content: [
-      { type: "text", text: presentation ? `${presentation.summary}\n${json}` : json },
+      { type: "text", text: summary ? `${summary}\n${json}` : json },
       ...(presentation?.content ?? []),
     ],
     structuredContent: data,

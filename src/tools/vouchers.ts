@@ -8,6 +8,7 @@ import {
   dateRangeInput,
   enshrinedOf,
   entityId,
+  FOREIGN_DATA_NOTE,
   flag,
   integer,
   isoDateOf,
@@ -92,7 +93,8 @@ export const searchVouchers = defineTool({
   description:
     "Lists vouchers (Belege: incoming invoices, receipts) filtered by status, voucher date " +
     "range, text in the description, debit/credit or supplier contact. Use get_voucher for " +
-    "the positions with booking accounts and get_tax_guidance for allowed accounts and tax rules.",
+    "the positions with booking accounts and get_tax_guidance for allowed accounts and tax rules." +
+    FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "getVouchers",
   inputSchema: z.object({
@@ -159,7 +161,8 @@ export const getVoucher = defineTool({
   title: "Get a sevdesk voucher",
   description:
     "Returns one voucher by its sevdesk ID with its positions (booking account, tax rate, " +
-    "amounts). Find the ID with search_vouchers.",
+    "amounts). Find the ID with search_vouchers." +
+    FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "getVoucherById",
   inputSchema: z.object({ voucherId: entityId.describe("sevdesk ID of the voucher.") }),
@@ -210,7 +213,7 @@ export const getVoucher = defineTool({
       { voucher, positions },
       {
         summary:
-          `Voucher ${voucher.description ?? voucher.id} (${voucher.statusName ?? "unknown status"}), ` +
+          `Voucher ${voucher.id} (${voucher.statusName ?? "unknown status"}), ` +
           `${positions.length} positions.`,
       },
     );
