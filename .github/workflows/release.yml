@@ -1,0 +1,186 @@
+# Release from main: commitizen computes the next version from the commits since the last tag
+# (fix -> patch, feat -> minor, breaking -> major; other types release nothing). Tags carry
+# the version without a "v" (.cz.toml). Nothing is committed back to main: the version is
+# stamped into package.json inside each job, before the binaries are built and before the
+# npm package is published.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet commitizen==4.8.3
+
+      - id: next
+        # .cz.toml reads the current version from package.json, which stays at its committed
+        # value; start from the latest release tag instead. Accept only a version-looking line.
+        run: |
+          latest=$(git tag --list --sort=-v:refname '[0-9]*.[0-9]*.[0-9]*' | head -n 1)
+          if [ -n "$latest" ]; then
+            npm version --no-git-tag-version --allow-same-version "$latest" >/dev/null
+          fi
+          VERSION=$(cz bump --get-next --yes 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | tail -n 1 || true)
+          if [ -n "$VERSION" ] && git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+            echo "tag $VERSION already exists; nothing to release"
+            VERSION=""
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "last release: ${latest:-none}, next: ${VERSION:-none (no release-relevant commits)}"
+
+  check:
+    needs: version
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run check
+
+  binaries:
+    needs: [version, check]
+    if: needs.version.outputs.version != ''
+    strategy:
+      matrix:
+        include:
+          - { os: macos-latest, target: darwin-arm64, smoke: true }
+          # Cross-compiled on the arm64 runner; it cannot run x64 code reliably.
+          - { os: macos-latest, target: darwin-x64, smoke: false }
+          - { os: ubuntu-24.04, target: linux-x64, smoke: true }
+          - { os: ubuntu-24.04-arm, target: linux-arm64, smoke: true }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm version --no-git-tag-version --allow-same-version "$VERSION"
+
+      - run: npm install --global bun@1.4.4
+
+      - run: bun scripts/build-bin.mjs "$TARGET"
+
+      # Also checks that the binary reports the release version.
+      - if: matrix.smoke
+        run: node scripts/smoke-bin.mjs "out/bin/sevdesk-mcp-$TARGET"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sevdesk-mcp-${{ matrix.target }}
+          path: out/bin/sevdesk-mcp-${{ matrix.target }}
+          if-no-files-found: error
+
+  github-release:
+    needs: [version, binaries]
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: assets
+          pattern: sevdesk-mcp-*
+          merge-multiple: true
+
+      - name: checksums
+        run: |
+          cd assets
+          sha256sum sevdesk-mcp-darwin-arm64 sevdesk-mcp-darwin-x64 \
+            sevdesk-mcp-linux-x64 sevdesk-mcp-linux-arm64 > SHA256SUMS
+          cat SHA256SUMS
+
+      # gh creates the tag on the released commit through the API; no push from the runner.
+      - name: tag and release
+        run: |
+          gh release create "$VERSION" assets/* \
+            --target "$GITHUB_SHA" \
+            --title "$VERSION" \
+            --generate-notes
+
+  npm:
+    needs: [version, github-release]
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Trusted publishing: npm exchanges the OIDC token of this job for a short-lived publish
+    # token, so no npm token is stored in the repository. Provenance links the package to
+    # this workflow run.
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: npm supports trusted publishing
+        run: |
+          npm_version=$(npm --version)
+          if [ "$(printf '%s\n' 11.5.1 "$npm_version" | sort -V | head -n 1)" != 11.5.1 ]; then
+            echo "::error::npm $npm_version is too old for trusted publishing (needs 11.5.1)"
+            exit 1
+          fi
+
+      - run: npm ci
+
+      - run: npm version --no-git-tag-version --allow-same-version "$VERSION"
+
+      # prepack builds dist/ from the stamped package.json.
+      - run: npm publish --provenance --access public
