@@ -21,21 +21,61 @@ function sourceFiles(dir: string): string[] {
   });
 }
 
+/**
+ * Anything that can put a tool on a server or answer tools/call. Matches
+ * identifiers rather than call syntax, so destructuring
+ * (`const { registerTool } = server`), aliasing (`server["registerTool"]`,
+ * `.bind`) and a raw request handler for tools/call are caught too.
+ * `registerTools` and `registerGenericTool` are the guarded entry points
+ * and do not match.
+ */
+const REGISTRATION_PATTERNS: readonly RegExp[] = [
+  /\bregisterTool\b/,
+  /\.tool\s*\(/,
+  /\bsetRequestHandler\b/,
+  /["'`]tools\/call["'`]/,
+  /\bCallToolRequestSchema\b/,
+];
+
+function registersTools(source: string): boolean {
+  return REGISTRATION_PATTERNS.some((pattern) => pattern.test(source));
+}
+
 describe("tool registration paths", () => {
   it("registers tools only in the registry and the fallback", () => {
     const offenders = sourceFiles(SRC)
       .map((file) => relative(SRC, file).replaceAll("\\", "/"))
       .filter((file) => !ALLOWED.has(file))
-      .filter((file) =>
-        /\.registerTool\s*\(|\.tool\s*\(/.test(readFileSync(join(SRC, file), "utf8")),
-      );
+      .filter((file) => registersTools(readFileSync(join(SRC, file), "utf8")));
     expect(offenders).toEqual([]);
   });
 
   it("finds the allowed registration sites, so the scan itself works", () => {
     for (const file of ALLOWED) {
-      expect(readFileSync(join(SRC, file), "utf8")).toMatch(/\.registerTool\s*\(/);
+      expect(registersTools(readFileSync(join(SRC, file), "utf8")), file).toBe(true);
     }
+  });
+
+  it.each([
+    ["direct call", "server.registerTool('x', {}, handler);"],
+    ["destructured", "const { registerTool } = server;\nregisterTool('x', {}, h);"],
+    ["aliased", "const { registerTool: add } = server; add('x', {}, h);"],
+    ["bracket access", 'server["registerTool"]("x", {}, h);'],
+    ["bound", "const add = server.registerTool.bind(server);"],
+    ["legacy tool()", "server.tool('x', handler);"],
+    ["raw handler by method", "server.server.setRequestHandler('tools/call', h);"],
+    ["raw handler by schema", "low.setRequestHandler(CallToolRequestSchema, h);"],
+    ["method literal", "const method = `tools/call`;"],
+  ])("flags a %s", (_name, snippet) => {
+    expect(registersTools(snippet)).toBe(true);
+  });
+
+  it.each([
+    ["the guarded entry point", "registerTools(env, TOOLS);"],
+    ["the fallback entry point", "registerGenericTool(env);"],
+    ["unrelated code", "const tools = list.map((t) => t.name);"],
+  ])("does not flag %s", (_name, snippet) => {
+    expect(registersTools(snippet)).toBe(false);
   });
 });
 
