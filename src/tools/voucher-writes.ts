@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { defineTool } from "../policy/registry.js";
 import { SevdeskError } from "../sevdesk/errors.js";
-import { documentLabel, readDocument, statusText } from "./document-common.js";
+import { documentLabel, documentLine, readDocument, statusText } from "./document-common.js";
 import {
   amount,
   asRecord,
@@ -27,6 +27,7 @@ import {
   contactName,
   inputText,
   money,
+  oneLineText,
   PAYMENT_TYPES,
   paymentAmountInput,
   paymentTypeMismatch,
@@ -197,6 +198,20 @@ const createVoucherOutput = z.object({
 /** sevdesk's name for an uploaded file: a hash with an extension. */
 const SEVDESK_FILENAME = /^[A-Za-z0-9._-]{1,200}$/;
 
+/**
+ * Error for a failed upload. saveVoucher was not called, so no voucher can
+ * exist, whatever the upload's own outcome; the message says so instead of
+ * sending the caller to look for one.
+ */
+function uploadFailed(error: unknown): unknown {
+  if (!(error instanceof SevdeskError) || error.kind === "policy") return error;
+  return new SevdeskError(
+    error.kind,
+    `The file upload failed: ${error.message} No voucher was created.`,
+    error.status === undefined ? {} : { status: error.status },
+  );
+}
+
 /** Error for a saveVoucher that failed after the file was uploaded. */
 function afterUpload(error: unknown): unknown {
   if (!(error instanceof SevdeskError) || error.kind === "policy") return error;
@@ -299,12 +314,17 @@ export const createVoucher = defineTool({
         new Blob([new Uint8Array(fileBytes)], { type: args.file.mimeType }),
         args.file.filename,
       );
-      const uploaded = await sevdesk.call(
-        sevdesk.api.POST("/Voucher/Factory/uploadTempFile", {
-          body: form as never,
-          bodySerializer: (body: unknown) => body as FormData,
-        }),
-      );
+      let uploaded: unknown;
+      try {
+        uploaded = await sevdesk.call(
+          sevdesk.api.POST("/Voucher/Factory/uploadTempFile", {
+            body: form as never,
+            bodySerializer: (body: unknown) => body as FormData,
+          }),
+        );
+      } catch (error) {
+        throw uploadFailed(error);
+      }
       const name = text(objectsOf(uploaded)[0]?.filename);
       if (name === null || !SEVDESK_FILENAME.test(name)) {
         throw new SevdeskError(
@@ -499,6 +519,12 @@ export const bookVoucherPayment = defineTool({
       checkAccount = { id: args.checkAccountId, name: text(account.name) };
     }
     return {
+      approval:
+        `Book ${money(args.amount, voucher.currency)} (${args.paymentType}) dated ${args.date} on ` +
+        `${documentLine(voucher)} to check account ${args.checkAccountId}` +
+        `${checkAccount.name ? ` (${oneLineText(checkAccount.name, 100)})` : ""}; open ` +
+        `${open ?? "unknown"} -> ${open === null ? "unknown" : Math.max(0, cents(open - args.amount))}.` +
+        `${warnings.length > 0 ? ` Warnings: ${warnings.join(" ")}` : ""}`,
       voucher,
       amount: args.amount,
       date: args.date,

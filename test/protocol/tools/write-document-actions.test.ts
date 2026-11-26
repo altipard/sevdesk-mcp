@@ -392,6 +392,10 @@ describe("enshrine_document (X)", () => {
   );
 
   it("is off without SEVDESK_ENABLE_TOOLS and needs full mode", async () => {
+    const read = await connectWrites({ config: { mode: "read", ...ENABLE } });
+    expect((await read.client.listTools()).tools.map((t) => t.name)).not.toContain(
+      "enshrine_document",
+    );
     const off = await connectWrites({ config: { mode: "full" } });
     expect((await off.client.listTools()).tools.map((t) => t.name)).not.toContain(
       "enshrine_document",

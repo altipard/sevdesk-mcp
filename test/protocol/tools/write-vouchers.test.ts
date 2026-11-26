@@ -348,6 +348,31 @@ describe("create_voucher (W)", () => {
     });
   });
 
+  it("falls back with a warning when the guidance lists no accounts", async () => {
+    api.server.use(
+      readSupplier,
+      http.get(sevdeskUrl("/ReceiptGuidance/forExpense"), () => HttpResponse.json({ objects: [] })),
+      saved({ document: null }),
+    );
+    const c = await connectWrites({ config: { mode: "write" } });
+    const result = await c.call("create_voucher", base);
+    expect(structured(result)).toMatchObject({
+      taxRule: { checkedAgainst: "documented_rules" },
+      warnings: [
+        "sevdesk's tax guidance listed no expense accounts; tax rule and rates were checked " +
+          "against the documented sevdesk rules only, the booking accounts were not checked.",
+      ],
+    });
+  });
+
+  it("checks the account and rule but not the rate when the guidance names an unknown rate", async () => {
+    api.server.use(readSupplier, guidance(expenseGuide(["NINETEEN", "TWENTY_ONE"])), saved());
+    const c = await connectWrites({ config: { mode: "write" } });
+    const result = await c.call("create_voucher", base);
+    expect(result.isError, textOf(result)).toBeFalsy();
+    expect(structured(result)).toMatchObject({ taxRule: { checkedAgainst: "guidance" } });
+  });
+
   it("refuses an unknown supplier before uploading anything", async () => {
     api.server.use(
       http.get(sevdeskUrl("/Contact/2003"), () => HttpResponse.json({ objects: [] })),
@@ -398,10 +423,42 @@ describe("create_voucher (W)", () => {
     );
     const c = await connectWrites({ config: { mode: "write" } });
     const result = await c.call("create_voucher", { ...base, file: pdfFile });
-    expect(textOf(result)).toBe("sevdesk rejected the request (400): bad file");
+    expect(textOf(result)).toBe(
+      "The file upload failed: sevdesk rejected the request (400): bad file No voucher was created.",
+    );
     expect(operations(api).filter((op) => op.startsWith("POST"))).toEqual([
       "POST voucherUploadFile",
     ]);
+  });
+
+  it("says no voucher was created when the upload fails with a server error", async () => {
+    api.server.use(
+      readSupplier,
+      guidance(),
+      http.post(sevdeskUrl("/Voucher/Factory/uploadTempFile"), () => sevdeskError(503)),
+    );
+    const c = await connectWrites({ config: { mode: "write" } });
+    const result = await c.call("create_voucher", { ...base, file: pdfFile });
+    expect(textOf(result)).toMatch(/^The file upload failed: .*No voucher was created\.$/);
+    expect(operations(api)).not.toContain("POST voucherFactorySaveVoucher");
+  });
+
+  it.each([
+    [{ objects: {} }],
+    [{ objects: { filename: "../../etc/passwd" } }],
+    [{ objects: { filename: "a b.pdf" } }],
+  ])("does not save a voucher when the upload answers %j", async (answer) => {
+    api.server.use(
+      readSupplier,
+      guidance(),
+      http.post(sevdeskUrl("/Voucher/Factory/uploadTempFile"), () =>
+        HttpResponse.json(answer, { status: 201 }),
+      ),
+    );
+    const c = await connectWrites({ config: { mode: "write" } });
+    const result = await c.call("create_voucher", { ...base, file: pdfFile });
+    expect(textOf(result)).toContain("returned no usable file name. No voucher was created");
+    expect(operations(api)).not.toContain("POST voucherFactorySaveVoucher");
   });
 
   it("warns when sevdesk's sum or status differ from what was sent", async () => {
@@ -467,6 +524,10 @@ describe("book_voucher_payment (W+)", () => {
       overpayment: 0,
       warnings: [],
     });
+    expect(preview.approval).toBe(
+      "Book 40 EUR (FULL_PAYMENT) dated 2026-03-10 on voucher Druckerpapier (ID 8001) from " +
+        "Bürobedarf Beispiel KG, gross 50 EUR to check account 9001 (Geschäftskonto); open 40 -> 0.",
+    );
     const result = await c.call("book_voucher_payment", { ...args, confirmation_token: token });
     expect(structured(result)).toEqual({
       voucherId: 8001,
@@ -505,6 +566,9 @@ describe("book_voucher_payment (W+)", () => {
     api.server.use(readVoucher(unpaid), readSupplier, account);
     const c = await connectWrites({ config: { mode: "write" } });
     const over = await previewOf(c, "book_voucher_payment", { ...args, amount: 55 });
+    expect(over.preview.approval).toContain(
+      "Warnings: Overpayment: 55 is 15 more than the open amount of 40. FULL_PAYMENT expects",
+    );
     expect(over.preview.warnings).toEqual([
       "Overpayment: 55 is 15 more than the open amount of 40.",
       "FULL_PAYMENT expects the open amount (40), not 55; use N for a partial payment, CB, " +
