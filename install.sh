@@ -318,8 +318,9 @@ install_binary() { # downloaded-file
 # --- interactive setup ------------------------------------------------------------------------
 
 # The setup talks to /dev/tty: under `curl | sh` stdin is the script itself.
+# A failed redirection of a special builtin ends a POSIX shell, so probe in a subshell.
 has_tty() {
-    { : </dev/tty; } 2>/dev/null
+    (: </dev/tty) 2>/dev/null
 }
 
 # ask "question" default(y/n) -> exit 0 for yes
