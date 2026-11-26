@@ -10,7 +10,11 @@ export type SevdeskErrorKind =
   | "server_error"
   | "http_error"
   | "timeout"
-  | "network";
+  | "network"
+  /** Refused locally by a policy pin; nothing was sent. */
+  | "policy"
+  /** The response body exceeded the client's byte limit and was dropped. */
+  | "response_too_large";
 
 export interface SevdeskErrorDetails {
   status?: number;
@@ -89,14 +93,25 @@ export function parseRetryAfter(
   return Math.max(0, date - now);
 }
 
+/** Appended when a failed request may still have taken effect in sevdesk. */
+export const OUTCOME_UNKNOWN = "The outcome is unknown: check sevdesk before retrying.";
+
 export interface HttpErrorInput {
+  /** The request may have had a side effect (write, or single-attempt GET). */
+  outcomeUnknown?: boolean;
   status: number;
   body: unknown;
   retryAfter: string | null;
   redact: Redactor;
 }
 
-export function mapHttpError({ status, body, retryAfter, redact }: HttpErrorInput): SevdeskError {
+export function mapHttpError({
+  status,
+  body,
+  retryAfter,
+  redact,
+  outcomeUnknown = false,
+}: HttpErrorInput): SevdeskError {
   const upstream = readUpstreamError(body);
   const detail = upstream.message ? `: ${clean(upstream.message, redact)}` : "";
   const details: SevdeskErrorDetails = { status };
@@ -146,9 +161,10 @@ export function mapHttpError({ status, body, retryAfter, redact }: HttpErrorInpu
     }
     default:
       if (status >= 500) {
+        const unknown = outcomeUnknown ? ` ${OUTCOME_UNKNOWN}` : "";
         return new SevdeskError(
           "server_error",
-          `sevdesk server error (${status})${detail}`,
+          `sevdesk server error (${status})${detail}${unknown}`,
           details,
         );
       }

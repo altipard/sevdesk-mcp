@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { ConfigError, DEFAULT_BASE_URL, loadConfig } from "../../src/config.js";
+import {
+  ConfigError,
+  confirmSecretFor,
+  DEFAULT_BASE_URL,
+  DEFAULT_CONFIRM_TTL_SECONDS,
+  loadConfig,
+} from "../../src/config.js";
 import { errorRepresentations, TEST_TOKEN } from "../helpers.js";
 
 function configError(env: Record<string, string | undefined>): ConfigError {
@@ -19,6 +25,9 @@ describe("loadConfig", () => {
       mode: "read",
       baseUrl: DEFAULT_BASE_URL,
       logLevel: "info",
+      deniedTools: [],
+      enableTools: [],
+      confirmTtlSeconds: DEFAULT_CONFIRM_TTL_SECONDS,
     });
   });
 
@@ -35,6 +44,9 @@ describe("loadConfig", () => {
       mode: "write",
       baseUrl: "http://127.0.0.1:8080/api/v1",
       logLevel: "debug",
+      deniedTools: [],
+      enableTools: [],
+      confirmTtlSeconds: DEFAULT_CONFIRM_TTL_SECONDS,
     });
   });
 
@@ -62,13 +74,13 @@ describe("loadConfig", () => {
 
   it("reports every invalid variable at once", () => {
     const error = configError({
-      SEVDESK_MODE: "full",
+      SEVDESK_MODE: "admin",
       SEVDESK_BASE_URL: "ftp://example.com",
       LOG_LEVEL: "verbose",
     });
     expect(error.issues).toEqual([
       "SEVDESK_API_TOKEN: is required",
-      "SEVDESK_MODE: must be one of: read, write",
+      "SEVDESK_MODE: must be one of: read, write, full",
       "SEVDESK_BASE_URL: must be an absolute http(s) URL",
       "LOG_LEVEL: must be one of: debug, info, warn, error",
     ]);
@@ -139,5 +151,105 @@ describe("SEVDESK_BASE_URL", () => {
     const text = errorRepresentations(error);
     expect(text).not.toContain("s3cr3t-pw");
     expect(text).not.toContain(TEST_TOKEN);
+  });
+});
+
+describe("SEVDESK_MODE", () => {
+  it.each(["read", "write", "full"] as const)("accepts %s", (mode) => {
+    expect(loadConfig({ SEVDESK_API_TOKEN: TEST_TOKEN, SEVDESK_MODE: mode }).mode).toBe(mode);
+  });
+});
+
+describe("tool and operation lists", () => {
+  const load = (env: Record<string, string>) =>
+    loadConfig({ SEVDESK_API_TOKEN: TEST_TOKEN, ...env });
+
+  it("parses comma-separated lists, trims and drops duplicates", () => {
+    const config = load({
+      SEVDESK_ALLOWED_TOOLS: " get_account_info, sevdesk_api_request ,get_account_info,",
+      SEVDESK_DENIED_TOOLS: "sevdesk_api_request",
+      SEVDESK_ENABLE_TOOLS: "send_invoice_email",
+      SEVDESK_API_ALLOW: "getContacts,getInvoices",
+    });
+    expect(config.allowedTools).toEqual(["get_account_info", "sevdesk_api_request"]);
+    expect(config.deniedTools).toEqual(["sevdesk_api_request"]);
+    expect(config.enableTools).toEqual(["send_invoice_email"]);
+    expect(config.apiAllow).toEqual(["getContacts", "getInvoices"]);
+  });
+
+  it("leaves unset and blank lists undefined so the defaults apply", () => {
+    const config = load({ SEVDESK_ALLOWED_TOOLS: " ", SEVDESK_API_ALLOW: "" });
+    expect(config.allowedTools).toBeUndefined();
+    expect(config.apiAllow).toBeUndefined();
+    expect(config.deniedTools).toEqual([]);
+    expect(config.enableTools).toEqual([]);
+  });
+
+  it("rejects names with characters outside identifiers", () => {
+    const error = configError({ SEVDESK_API_TOKEN: TEST_TOKEN, SEVDESK_DENIED_TOOLS: "a b,c/d" });
+    expect(error.issues).toEqual(["SEVDESK_DENIED_TOOLS: contains an invalid tool name: a b"]);
+  });
+
+  it("rejects operationIds the classification does not know", () => {
+    const error = configError({
+      SEVDESK_API_TOKEN: TEST_TOKEN,
+      SEVDESK_API_ALLOW: "getContacts,dropDatabase",
+    });
+    expect(error.issues).toEqual([
+      "SEVDESK_API_ALLOW: unknown or unclassified operationId: dropDatabase",
+    ]);
+  });
+});
+
+describe("confirmation settings", () => {
+  const secret = "s".repeat(32);
+
+  it("accepts a secret of at least 32 characters and a TTL", () => {
+    const config = loadConfig({
+      SEVDESK_API_TOKEN: TEST_TOKEN,
+      SEVDESK_CONFIRM_SECRET: secret,
+      SEVDESK_CONFIRM_TTL_SECONDS: "120",
+    });
+    expect(config.confirmSecret).toBe(secret);
+    expect(config.confirmTtlSeconds).toBe(120);
+  });
+
+  it("rejects a short secret without echoing it", () => {
+    const error = configError({
+      SEVDESK_API_TOKEN: TEST_TOKEN,
+      SEVDESK_CONFIRM_SECRET: "short-secret",
+    });
+    expect(error.issues).toEqual(["SEVDESK_CONFIRM_SECRET: must be at least 32 characters"]);
+    expect(errorRepresentations(error)).not.toContain("short-secret");
+  });
+
+  it.each(["10", "4000", "1.5", "soon"])("rejects the TTL %s", (value) => {
+    const error = configError({
+      SEVDESK_API_TOKEN: TEST_TOKEN,
+      SEVDESK_CONFIRM_TTL_SECONDS: value,
+    });
+    expect(error.issues[0]).toMatch(/^SEVDESK_CONFIRM_TTL_SECONDS: must be/);
+  });
+
+  it("uses the configured secret on both transports", () => {
+    const config = loadConfig({ SEVDESK_API_TOKEN: TEST_TOKEN, SEVDESK_CONFIRM_SECRET: secret });
+    expect(confirmSecretFor(config, "stdio").toString()).toBe(secret);
+    expect(confirmSecretFor(config, "http").toString()).toBe(secret);
+  });
+
+  it("draws a random secret per call on stdio when none is configured", () => {
+    const config = loadConfig({ SEVDESK_API_TOKEN: TEST_TOKEN });
+    const a = confirmSecretFor(config, "stdio");
+    const b = confirmSecretFor(config, "stdio");
+    expect(a).toHaveLength(32);
+    expect(a.equals(b)).toBe(false);
+  });
+
+  it("requires the secret on HTTP", () => {
+    const config = loadConfig({ SEVDESK_API_TOKEN: TEST_TOKEN });
+    expect(() => confirmSecretFor(config, "http")).toThrow(ConfigError);
+    expect(() => confirmSecretFor(config, "http")).toThrow(
+      "SEVDESK_CONFIRM_SECRET: is required for the HTTP transport",
+    );
   });
 });

@@ -12,11 +12,31 @@ import { TEST_TOKEN } from "../helpers.js";
 let server: Server;
 let baseUrl: string;
 let requests = 0;
+let endlessBytes = 0;
+let endlessClosed = false;
 const open = new Set<ServerResponse>();
 
 beforeAll(async () => {
   server = createServer((req, res) => {
     requests++;
+    if (req.url?.endsWith("/endless")) {
+      // Streams without content-length until the client hangs up.
+      res.writeHead(200, { "content-type": "application/json" });
+      open.add(res);
+      const chunk = "x".repeat(1024);
+      const pump = () => {
+        if (res.destroyed || endlessBytes > 50 * 1024 * 1024) return;
+        endlessBytes += chunk.length;
+        if (res.write(chunk)) setImmediate(pump);
+        else res.once("drain", pump);
+      };
+      res.on("close", () => {
+        endlessClosed = true;
+        open.delete(res);
+      });
+      pump();
+      return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
     if (req.url?.endsWith("/stall-once") && requests > 1) {
       res.end(JSON.stringify({ objects: [] }));
@@ -41,7 +61,7 @@ function client(maxRetries: number) {
   const sevdesk = createSevdeskClient({
     baseUrl,
     token: TEST_TOKEN,
-    timeoutMs: 50,
+    timeoutMs: 250,
     retry: { maxRetries },
     sleep: async (ms) => {
       sleeps.push(ms);
@@ -64,7 +84,7 @@ describe("body that stalls after the headers", () => {
 
     expect(error).toBeInstanceOf(SevdeskError);
     expect((error as SevdeskError).kind).toBe("timeout");
-    expect((error as SevdeskError).message).toBe("sevdesk did not answer within 50 ms.");
+    expect((error as SevdeskError).message).toBe("sevdesk did not answer within 250 ms.");
   });
 
   it("is retried for GET", async () => {
@@ -75,5 +95,28 @@ describe("body that stalls after the headers", () => {
     await expect(sevdesk.call(get("/stall-once"))).resolves.toEqual({ objects: [] });
     expect(requests).toBe(2);
     expect(sleeps).toHaveLength(1);
+  });
+});
+
+describe("body larger than the byte limit", () => {
+  it("stops reading and frees the connection instead of buffering it all", async () => {
+    const sevdesk = createSevdeskClient({
+      baseUrl,
+      token: TEST_TOKEN,
+      timeoutMs: 5000,
+      maxResponseBytes: 64 * 1024,
+      retry: { maxRetries: 2 },
+      sleep: async () => {},
+    });
+    const get = sevdesk.api.GET as unknown as UntypedGet;
+    requests = 0;
+
+    const error = await sevdesk.call(get("/endless")).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(SevdeskError);
+    expect((error as SevdeskError).kind).toBe("response_too_large");
+    expect(requests).toBe(1);
+    await expect.poll(() => endlessClosed).toBe(true);
+    expect(endlessBytes).toBeLessThan(10 * 1024 * 1024);
   });
 });

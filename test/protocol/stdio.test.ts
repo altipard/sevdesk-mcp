@@ -113,8 +113,8 @@ describe("built stdio binary", () => {
 
     const list = await session.request(2, "tools/list");
     const tools = list.result?.tools as Array<{ name: string; annotations?: unknown }>;
-    expect(tools.map((tool) => tool.name)).toEqual(["get_account_info"]);
-    expect(tools[0]?.annotations).toMatchObject({ readOnlyHint: true });
+    expect(tools.map((tool) => tool.name)).toEqual(["get_account_info", "sevdesk_api_request"]);
+    for (const tool of tools) expect(tool.annotations).toMatchObject({ readOnlyHint: true });
 
     const call = await session.request(3, "tools/call", {
       name: "get_account_info",

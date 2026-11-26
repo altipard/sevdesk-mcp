@@ -1,6 +1,6 @@
 import { delay, HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createSevdeskClient, type SevdeskClientOptions } from "../../src/sevdesk/client.js";
 import { SevdeskError, type SevdeskErrorKind } from "../../src/sevdesk/errors.js";
 import { USER_AGENT } from "../../src/version.js";
@@ -466,6 +466,7 @@ describe("timeouts and deadline", () => {
       }),
     );
     const { client } = setup({
+      timeoutMs: 100,
       deadlineMs: 1000,
       retry: { maxRetries: 10, baseDelayMs: 300 },
       now: () => clock,
@@ -489,12 +490,184 @@ describe("timeouts and deadline", () => {
         return HttpResponse.json({ objects: [] });
       }),
     );
-    const { client } = setup({ timeoutMs: 10_000, deadlineMs: 40, now: () => 0 });
+    const { client } = setup({
+      timeoutMs: 10_000,
+      deadlineMs: 40,
+      retry: { maxRetries: 0 },
+      now: () => 0,
+    });
 
     const error = await captureError(client.call(client.api.GET("/Part")));
 
     expect(error.kind).toBe("timeout");
     expect(error.message).toBe("sevdesk did not answer within 40 ms.");
+  });
+
+  it("does not start a retry that would only get a sliver of the deadline", async () => {
+    let clock = 0;
+    let calls = 0;
+    server.use(
+      http.get(url("/Part"), async () => {
+        calls++;
+        await delay(500);
+        return HttpResponse.json({ objects: [] });
+      }),
+    );
+    const { client, sleeps } = setup({
+      timeoutMs: 20,
+      deadlineMs: 1000,
+      retry: { maxRetries: 5, baseDelayMs: 600, maxDelayMs: 600 },
+      now: () => clock,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+    });
+
+    // No jitter: every wait is exactly 600 ms.
+    const random = vi.spyOn(Math, "random").mockReturnValue(1);
+    const error = await captureError(client.call(client.api.GET("/Part"))).finally(() =>
+      random.mockRestore(),
+    );
+
+    // 600 ms wait + 20 ms attempt fit into 1000 ms once; a second wait would
+    // leave less than one attempt, so the client stops and names the deadline.
+    expect(error.kind).toBe("timeout");
+    expect(error.message).toBe("sevdesk did not answer within the 1000 ms deadline.");
+    expect(calls).toBe(2);
+    expect(sleeps).toEqual([600]);
+  });
+
+  it("names the deadline for a network failure it stopped retrying", async () => {
+    server.use(http.get(url("/Part"), () => HttpResponse.error()));
+    const { client } = setup({ timeoutMs: 5000, deadlineMs: 500, now: () => 0 });
+
+    const error = await captureError(client.call(client.api.GET("/Part")));
+
+    expect(error.kind).toBe("network");
+    expect(error.message).toBe("Could not reach sevdesk. Gave up within the 500 ms deadline.");
+  });
+
+  it("warns that a write that timed out may have happened", async () => {
+    let calls = 0;
+    server.use(
+      http.post(url("/Contact"), async () => {
+        calls++;
+        await delay(500);
+        return HttpResponse.json({ objects: {} });
+      }),
+    );
+    const { client } = setup({ timeoutMs: 20 });
+
+    const error = await captureError(
+      client.call(client.api.POST("/Contact", { body: {} as never })),
+    );
+
+    expect(error.kind).toBe("timeout");
+    expect(error.message).toBe(
+      "sevdesk did not answer within 20 ms. The outcome is unknown: check sevdesk before retrying.",
+    );
+    expect(calls).toBe(1);
+  });
+
+  it("warns that a write that hit a network error may have happened", async () => {
+    server.use(http.put(url("/Contact/:id"), () => HttpResponse.error()));
+    const { client } = setup();
+
+    const error = await captureError(
+      client.call(
+        client.api.PUT("/Contact/{contactId}", {
+          params: { path: { contactId: 1 } },
+          body: {} as never,
+        }),
+      ),
+    );
+
+    expect(error.kind).toBe("network");
+    expect(error.message).toBe(
+      "Could not reach sevdesk. The outcome is unknown: check sevdesk before retrying.",
+    );
+  });
+
+  it("never retries through the single-attempt client, also for GET", async () => {
+    let calls = 0;
+    server.use(
+      http.get(url("/Part"), () => {
+        calls++;
+        return HttpResponse.json({}, { status: 503 });
+      }),
+    );
+    const { client, sleeps } = setup();
+
+    const error = await captureError(client.call(client.apiSingleAttempt.GET("/Part")));
+
+    expect(error.kind).toBe("server_error");
+    expect(calls).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  it("warns about an unknown outcome when a write gets a server error", async () => {
+    server.use(
+      http.post(url("/Contact"), () => HttpResponse.json({}, { status: 503 })),
+      http.get(url("/Contact"), () => HttpResponse.json({}, { status: 503 })),
+    );
+    const { client } = setup({ retry: { maxRetries: 0 } });
+
+    const write = await captureError(
+      client.call(client.api.POST("/Contact", { body: {} as never })),
+    );
+    expect(write.message).toBe(
+      "sevdesk server error (503) The outcome is unknown: check sevdesk before retrying.",
+    );
+
+    const read = await captureError(client.call(client.api.GET("/Contact")));
+    expect(read.message).toBe("sevdesk server error (503)");
+  });
+
+  it("warns about an unknown outcome for single-attempt GETs", async () => {
+    server.use(
+      http.get(url("/Part"), () => HttpResponse.json({}, { status: 502 })),
+      http.get(url("/Voucher"), async () => {
+        await delay(500);
+        return HttpResponse.json({});
+      }),
+    );
+    const { client } = setup({ timeoutMs: 20 });
+
+    const status = await captureError(client.call(client.apiSingleAttempt.GET("/Part")));
+    expect(status.message).toBe(
+      "sevdesk server error (502) The outcome is unknown: check sevdesk before retrying.",
+    );
+    const timeout = await captureError(client.call(client.apiSingleAttempt.GET("/Voucher")));
+    expect(timeout.message).toBe(
+      "sevdesk did not answer within 20 ms. The outcome is unknown: check sevdesk before retrying.",
+    );
+  });
+
+  it("drops a response whose declared size exceeds the byte limit, without retrying", async () => {
+    let calls = 0;
+    server.use(
+      http.get(url("/Contact"), () => {
+        calls++;
+        return HttpResponse.json({ objects: [{ name: "x".repeat(2000) }] });
+      }),
+    );
+    const { client, sleeps } = setup({ maxResponseBytes: 1000 });
+
+    const error = await captureError(client.call(client.api.GET("/Contact")));
+
+    expect(error.kind).toBe("response_too_large");
+    expect(error.message).toBe(
+      "sevdesk sent more than 1000 bytes; the response was dropped. Narrow the request.",
+    );
+    expect(calls).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  it("accepts a response within the byte limit", async () => {
+    server.use(http.get(url("/Tag"), () => HttpResponse.json({ objects: [] })));
+    const { client } = setup({ maxResponseBytes: 1000 });
+    await expect(client.call(client.api.GET("/Tag"))).resolves.toEqual({ objects: [] });
   });
 
   it("passes a 204 through without a body", async () => {

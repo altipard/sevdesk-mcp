@@ -1,16 +1,40 @@
+import { randomBytes } from "node:crypto";
 import { z } from "zod";
 import { LOG_LEVELS, type LogLevel } from "./logger.js";
+import { classOf } from "./policy/classification.js";
 
-export const MODES = ["read", "write"] as const;
+/**
+ * read: only reading tools. write: also drafts, master data and status
+ * changes with confirmation. full: also irreversible actions (X).
+ */
+export const MODES = ["read", "write", "full"] as const;
 export type Mode = (typeof MODES)[number];
 
 export const DEFAULT_BASE_URL = "https://my.sevdesk.de/api/v1";
+export const DEFAULT_CONFIRM_TTL_SECONDS = 300;
+export const MIN_CONFIRM_SECRET_LENGTH = 32;
 
 export interface Config {
   sevdeskApiToken: string;
   mode: Mode;
   baseUrl: string;
   logLevel: LogLevel;
+  /** SEVDESK_ALLOWED_TOOLS. Optional whitelist; it only ever narrows the tool set. */
+  allowedTools?: readonly string[];
+  /** SEVDESK_DENIED_TOOLS. Blocks single tools; always wins. */
+  deniedTools: readonly string[];
+  /**
+   * SEVDESK_ENABLE_TOOLS. Switches on tools that are off by default: every
+   * X tool, R+ tools and tools marked defaultEnabled: false. For X tools the
+   * listing also counts as the operator's release for clients without
+   * elicitation.
+   */
+  enableTools: readonly string[];
+  /** SEVDESK_API_ALLOW. Undefined: the curated default list of the fallback. */
+  apiAllow?: readonly string[];
+  /** SEVDESK_CONFIRM_SECRET, HMAC key for confirmation tokens. */
+  confirmSecret?: string;
+  confirmTtlSeconds: number;
 }
 
 export class ConfigError extends Error {
@@ -64,6 +88,34 @@ export function checkBaseUrl(value: string): BaseUrlCheck {
   return { ok: true, url: `${url.origin}${url.pathname}`.replace(/\/+$/, "") };
 }
 
+const NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_]*$/;
+
+/** Comma-separated list; blank means unset, so the default applies. */
+const nameList = (what: string) =>
+  z.preprocess(
+    blankToUndefined,
+    z
+      .string({ error: "must be a comma-separated list" })
+      .transform((value, ctx) => {
+        const names = [
+          ...new Set(
+            value
+              .split(",")
+              .map((name) => name.trim())
+              .filter((name) => name !== ""),
+          ),
+        ];
+        for (const name of names) {
+          if (!NAME_PATTERN.test(name)) {
+            ctx.addIssue({ code: "custom", message: `contains an invalid ${what}: ${name}` });
+            return z.NEVER;
+          }
+        }
+        return names;
+      })
+      .optional(),
+  );
+
 // Every message is fixed text: zod must never echo the input, because for
 // SEVDESK_API_TOKEN the input is the secret.
 const envSchema = z.object({
@@ -94,6 +146,34 @@ const envSchema = z.object({
     blankToUndefined,
     z.enum(LOG_LEVELS, { error: `must be one of: ${LOG_LEVELS.join(", ")}` }).default("info"),
   ),
+  SEVDESK_ALLOWED_TOOLS: nameList("tool name"),
+  SEVDESK_DENIED_TOOLS: nameList("tool name"),
+  SEVDESK_ENABLE_TOOLS: nameList("tool name"),
+  SEVDESK_API_ALLOW: nameList("operationId").superRefine((ids, ctx) => {
+    for (const id of ids ?? []) {
+      if (classOf(id) === undefined) {
+        ctx.addIssue({ code: "custom", message: `unknown or unclassified operationId: ${id}` });
+      }
+    }
+  }),
+  SEVDESK_CONFIRM_SECRET: z.preprocess(
+    blankToUndefined,
+    z
+      .string({ error: "must be a string" })
+      .min(MIN_CONFIRM_SECRET_LENGTH, {
+        error: `must be at least ${MIN_CONFIRM_SECRET_LENGTH} characters`,
+      })
+      .optional(),
+  ),
+  SEVDESK_CONFIRM_TTL_SECONDS: z.preprocess(
+    blankToUndefined,
+    z.coerce
+      .number({ error: "must be a number of seconds" })
+      .int({ error: "must be a whole number of seconds" })
+      .min(30, { error: "must be between 30 and 3600" })
+      .max(3600, { error: "must be between 30 and 3600" })
+      .default(DEFAULT_CONFIRM_TTL_SECONDS),
+  ),
 });
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
@@ -109,5 +189,30 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     mode: data.SEVDESK_MODE,
     baseUrl: data.SEVDESK_BASE_URL,
     logLevel: data.LOG_LEVEL,
+    ...(data.SEVDESK_ALLOWED_TOOLS && { allowedTools: data.SEVDESK_ALLOWED_TOOLS }),
+    deniedTools: data.SEVDESK_DENIED_TOOLS ?? [],
+    enableTools: data.SEVDESK_ENABLE_TOOLS ?? [],
+    ...(data.SEVDESK_API_ALLOW && { apiAllow: data.SEVDESK_API_ALLOW }),
+    ...(data.SEVDESK_CONFIRM_SECRET && { confirmSecret: data.SEVDESK_CONFIRM_SECRET }),
+    confirmTtlSeconds: data.SEVDESK_CONFIRM_TTL_SECONDS,
   };
+}
+
+/**
+ * HMAC key for confirmation tokens.
+ *
+ * stdio: SEVDESK_CONFIRM_SECRET is optional. Without it every process draws
+ * a random key, so tokens die with the process; that is fine for a local
+ * single-user server and avoids a secret users would have to manage.
+ *
+ * http: required. Several instances or a restart behind a load balancer
+ * must accept each other's tokens, and a random per-process key would make
+ * confirmations fail at random. The HTTP entrypoint calls this at startup.
+ */
+export function confirmSecretFor(config: Config, transport: "stdio" | "http"): Buffer {
+  if (config.confirmSecret !== undefined) return Buffer.from(config.confirmSecret, "utf8");
+  if (transport === "http") {
+    throw new ConfigError(["SEVDESK_CONFIRM_SECRET: is required for the HTTP transport"]);
+  }
+  return randomBytes(32);
 }
