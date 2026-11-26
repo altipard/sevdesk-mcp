@@ -272,14 +272,16 @@ async function searchByEmail(
         matchedEmail: scan.byContact.get(contactId) as string,
       });
     }
+    // Counted by the end of the slice, not by the contacts returned: those
+    // that no longer exist are missing from the page, and offset + count
+    // would offer the same slice again.
+    const moreAfterSlice = args.offset + args.limit < ids.length;
     page = scan.truncated
-      ? truncatedPage(
-          args.offset,
-          args.limit,
-          contacts.length,
-          args.offset + contacts.length < ids.length,
-        )
-      : pageOf(args.offset, args.limit, contacts.length, ids.length);
+      ? truncatedPage(args.offset, args.limit, contacts.length, moreAfterSlice)
+      : {
+          ...pageOf(args.offset, args.limit, contacts.length, ids.length),
+          hasMore: moreAfterSlice,
+        };
   } else {
     // Whether a match is a person shows only on the contact itself: walk the
     // matches in order, skip persons, stop when the page is full or the

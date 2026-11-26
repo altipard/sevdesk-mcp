@@ -381,6 +381,61 @@ describe("search_contacts", () => {
     );
   });
 
+  describe("e-mail matches whose contacts are gone", () => {
+    // 30 matching addresses; the contacts for which `gone` holds answer 404.
+    function mockMatches(gone: (index: number) => boolean) {
+      api.server.use(
+        http.get(sevdeskUrl("/CommunicationWay"), () =>
+          HttpResponse.json(
+            list(
+              Array.from({ length: 30 }, (_, i) =>
+                communicationWay({ id: String(8000 + i), contact: { id: String(4000 + i) } }),
+              ),
+            ),
+          ),
+        ),
+        http.get(sevdeskUrl("/Contact/:id"), ({ params }) =>
+          gone(Number(params.id) - 4000)
+            ? HttpResponse.json({ error: { message: "not found" } }, { status: 404 })
+            : HttpResponse.json(list([contact({ id: String(params.id) })])),
+        ),
+      );
+    }
+
+    /** Pages like a client until hasMore is false, with a bound against loops. */
+    async function walk(c: Awaited<ReturnType<typeof connect>>) {
+      const pages: Search["page"][] = [];
+      let offset = 0;
+      for (let i = 0; i < 5; i++) {
+        const data = structured<Search>(
+          await c.call("search_contacts", { query: "@muster", limit: 25, offset }),
+        );
+        pages.push(data.page);
+        if (!data.page.hasMore) return pages;
+        offset = (data.page.offset as number) + (data.page.limit as number);
+      }
+      throw new Error(`still more after 5 pages: ${JSON.stringify(pages)}`);
+    }
+
+    it("offers the next slice after a page of only missing contacts", async () => {
+      mockMatches((i) => i < 25);
+      const c = await connect();
+      expect(await walk(c)).toEqual([
+        { offset: 0, limit: 25, count: 0, total: 30, hasMore: true },
+        { offset: 25, limit: 25, count: 5, total: 30, hasMore: false },
+      ]);
+    });
+
+    it("ends after a last page of only missing contacts", async () => {
+      mockMatches((i) => i >= 25);
+      const c = await connect();
+      expect(await walk(c)).toEqual([
+        { offset: 0, limit: 25, count: 25, total: 30, hasMore: true },
+        { offset: 25, limit: 25, count: 0, total: 30, hasMore: false },
+      ]);
+    });
+  });
+
   it("skips matches whose contact is gone instead of failing", async () => {
     api.server.use(
       http.get(sevdeskUrl("/CommunicationWay"), () =>
