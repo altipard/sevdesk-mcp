@@ -48,7 +48,7 @@ export interface RedisNonceStoreOptions {
  *
  * consume is `SET key 1 NX PX ttl`: Redis runs it atomically, so of two
  * concurrent calls with the same key across all instances exactly one gets
- * "OK". release is `DEL`. Every failure rejects (not connected, no answer
+ * "OK". has is `GET`, release is `DEL`. Every failure rejects (not connected, no answer
  * within the timeout, unexpected reply), and the guard then does not
  * execute: fail closed.
  *
@@ -105,6 +105,19 @@ export class RedisNonceStore implements NonceStore {
     if (reply === "OK") return true;
     if (reply === null) return false;
     throw new NonceStoreUnavailableError("unexpected reply from Redis to SET NX");
+  }
+
+  /**
+   * `GET key`: true while the key exists. Behind the same checks as
+   * consume, so a store whose state was lost answers nothing (fail closed).
+   */
+  async has(key: string): Promise<boolean> {
+    this.#assertReady();
+    await this.#assertStateKept();
+    const reply = await this.#bounded(this.#redis.get(`${this.#prefix}${key}`));
+    if (reply === null) return false;
+    if (typeof reply === "string") return true;
+    throw new NonceStoreUnavailableError("unexpected reply from Redis to GET");
   }
 
   async release(key: string): Promise<void> {

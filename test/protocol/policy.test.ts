@@ -5,7 +5,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { type Config, ConfigError } from "../../src/config.js";
 import { createAuditLog } from "../../src/policy/audit.js";
+import { STATE_LOST_TEXT } from "../../src/policy/guard.js";
 import { InMemoryNonceStore, type NonceStore } from "../../src/policy/nonce-store.js";
+import { NonceStoreStateLostError } from "../../src/policy/redis-nonce-store.js";
 import { defineTool, registerTools, type ToolDefinition } from "../../src/policy/registry.js";
 import {
   createPolicyRuntime,
@@ -310,6 +312,7 @@ describe("class W+ confirmation", () => {
     const broken: NonceStore = {
       shared: false,
       consume: () => Promise.reject(new Error("store down")),
+      has: () => Promise.reject(new Error("store down")),
       release: () => Promise.resolve(),
     };
     const h = await harness({ nonces: broken });
@@ -530,6 +533,7 @@ describe("class X single use and idempotency", () => {
     const broken: NonceStore = {
       shared: false,
       consume: () => Promise.reject(new Error("store down")),
+      has: () => Promise.reject(new Error("store down")),
       release: () => Promise.resolve(),
     };
     const h = await harness({ config: allowed, nonces: broken });
@@ -542,6 +546,84 @@ describe("class X single use and idempotency", () => {
     expect(text(result)).toContain("not executed");
     expect(executed).toEqual([]);
     expect(h.audit.at(-1)).toMatchObject({ outcome: "denied", reason: "nonce_store_unavailable" });
+  });
+  it("only reads the unknown-outcome marker when refusing a duplicate", async () => {
+    const inner = new InMemoryNonceStore();
+    const calls: string[] = [];
+    const nonces: NonceStore = {
+      shared: false,
+      consume: (key, ttl) => {
+        calls.push(`consume ${key}`);
+        return inner.consume(key, ttl);
+      },
+      has: (key) => {
+        calls.push(`has ${key}`);
+        return inner.has(key);
+      },
+      release: (key) => {
+        calls.push(`release ${key}`);
+        return inner.release(key);
+      },
+    };
+    const h = await harness({ config: allowed, nonces });
+    for (let round = 0; round < 2; round++) {
+      const token = await preview(h, "send_email", { invoiceId: 5 });
+      await h.client.callTool({
+        name: "send_email",
+        arguments: { invoiceId: 5, confirmation_token: token },
+      });
+    }
+    const marker = calls.filter((call) => call.includes(":outcome_unknown"));
+    expect(marker).toEqual(["has idempotency:send_email:5:outcome_unknown"]);
+    expect(calls.filter((call) => call.startsWith("release"))).toEqual([]);
+    expect(await inner.has("idempotency:send_email:5:outcome_unknown")).toBe(false);
+    expect(h.audit.at(-1)).toMatchObject({ outcome: "denied", reason: "duplicate" });
+  });
+
+  it("fails closed when the marker cannot be read", async () => {
+    const inner = new InMemoryNonceStore();
+    const nonces: NonceStore = {
+      shared: false,
+      consume: (key, ttl) => inner.consume(key, ttl),
+      has: () => Promise.reject(new Error("store down")),
+      release: (key) => inner.release(key),
+    };
+    const h = await harness({ config: allowed, nonces });
+    for (let round = 0; round < 2; round++) {
+      const token = await preview(h, "send_email", { invoiceId: 5 });
+      await h.client.callTool({
+        name: "send_email",
+        arguments: { invoiceId: 5, confirmation_token: token },
+      });
+    }
+    expect(executed).toHaveLength(1);
+    expect(h.audit.at(-1)).toMatchObject({ outcome: "denied", reason: "nonce_store_unavailable" });
+  });
+
+  it("tells the client plainly when the store lost its data, without internals", async () => {
+    const nonces: NonceStore = {
+      shared: false,
+      consume: () =>
+        Promise.reject(
+          new NonceStoreStateLostError(
+            "Redis lost its data (sentinel key missing); check appendonly yes",
+          ),
+        ),
+      has: () => Promise.resolve(false),
+      release: () => Promise.resolve(),
+    };
+    const h = await harness({ config: allowed, nonces });
+    const token = await preview(h, "send_email", { invoiceId: 5 });
+    const result = await h.client.callTool({
+      name: "send_email",
+      arguments: { invoiceId: 5, confirmation_token: token },
+    });
+    expect(result.isError).toBe(true);
+    expect(text(result)).toBe(STATE_LOST_TEXT);
+    expect(text(result)).toContain("until the operator restarts the server");
+    expect(text(result)).not.toMatch(/redis|sentinel|appendonly/i);
+    expect(executed).toEqual([]);
+    expect(h.audit.at(-1)).toMatchObject({ outcome: "denied", reason: "nonce_store_state_lost" });
   });
 });
 

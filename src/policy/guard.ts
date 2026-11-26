@@ -15,6 +15,7 @@ import { errorResult, okResult } from "../tools/result.js";
 import type { AuditOutcome } from "./audit.js";
 import type { OperationClass } from "./classification.js";
 import { argumentHash, type RejectReason } from "./confirm.js";
+import { NonceStoreStateLostError } from "./redis-nonce-store.js";
 import {
   allows,
   minRights,
@@ -88,6 +89,16 @@ const REJECT_TEXT: Record<RejectReason, string> = {
   wrong_arguments: "was issued for different arguments",
   wrong_subject: "was issued to a different user",
 };
+
+/**
+ * Answer after the replay protection lost its data: confirmations used
+ * before could be valid again, so nothing that needs one runs until the
+ * operator restarts the server. Retrying does not help.
+ */
+export const STATE_LOST_TEXT =
+  "Replay protection is disabled because its store lost data while the server was running. " +
+  "Actions that need a confirmation (W+ and X) are refused until the operator restarts the " +
+  "server; retrying does not help. Nothing was executed.";
 
 function failure(text: string): CallToolResult {
   return { isError: true, content: [{ type: "text", text }] };
@@ -355,11 +366,8 @@ export async function runGuarded(
       );
     }
     if (idempotencyKey && !(await runtime.nonces.consume(idempotencyKey, IDEMPOTENCY_TTL_MS))) {
-      // The store has no lookup: probing the marker creates it if absent,
-      // so a fresh one is removed again right away.
-      const marker = unknownOutcomeKey(idempotencyKey);
-      const unknown = !(await runtime.nonces.consume(marker, IDEMPOTENCY_TTL_MS));
-      if (!unknown) await runtime.nonces.release(marker);
+      // Only read: the marker belongs to the attempt that set it.
+      const unknown = await runtime.nonces.has(unknownOutcomeKey(idempotencyKey));
       audit("denied", { reason: unknown ? "duplicate_outcome_unknown" : "duplicate" });
       return failure(
         unknown
@@ -372,6 +380,12 @@ export async function runGuarded(
     }
   } catch (error) {
     logger.error("nonce store failed", { tool: action.tool, error });
+    // The operator log has the cause; the client only learns what it means
+    // for its call, so no store internals reach it.
+    if (error instanceof NonceStoreStateLostError) {
+      audit("denied", { reason: "nonce_store_state_lost" });
+      return failure(STATE_LOST_TEXT);
+    }
     audit("denied", { reason: "nonce_store_unavailable" });
     return failure(
       "The replay protection store is unavailable, so the action was not executed. Try again later.",

@@ -51,6 +51,7 @@ export function sharedNonceStore(): NonceStore {
   return {
     shared: true,
     consume: (key, ttlMs) => inner.consume(key, ttlMs),
+    has: (key) => inner.has(key),
     release: (key) => inner.release(key),
   };
 }
