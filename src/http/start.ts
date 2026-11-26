@@ -31,6 +31,9 @@ import {
 
 /** How long shutdown waits for in-flight requests before cutting connections. */
 export const SHUTDOWN_TIMEOUT_MS = 10_000;
+/** After closing the MCP handler, time for the streams it ended to hang up. */
+export const CLOSE_GRACE_MS = 1000;
+const IDLE_SWEEP_MS = 50;
 
 export interface StartHttpOptions {
   /** Environment to read; process.env in production. Its secrets are removed after loading. */
@@ -226,10 +229,13 @@ export async function startHttpServer(options: StartHttpOptions = {}): Promise<R
       const remaining = () => Math.max(0, deadline - Date.now());
 
       app.startDraining();
-      // Stop accepting connections; idle keep-alive connections close now,
-      // busy ones once their response is done.
+      // Stop accepting connections. server.close() drops idle keep-alive
+      // connections only once, so connections that become idle later (a
+      // finished request, a stream the handler ended) are swept until the
+      // server is closed.
       const closed = new Promise<"closed">((resolve) => server.close(() => resolve("closed")));
       server.closeIdleConnections();
+      const sweeper = setInterval(() => server.closeIdleConnections(), IDLE_SWEEP_MS);
 
       const drained =
         inFlight === 0
@@ -240,6 +246,9 @@ export async function startHttpServer(options: StartHttpOptions = {}): Promise<R
       let wait = delay(remaining());
       const first = await Promise.race([drained, wait.promise]);
       wait.cancel();
+      if (first === "timeout") {
+        logger.info("requests still open after the timeout, closing the MCP handler", { inFlight });
+      }
 
       // Aborts what is left in the MCP handler, including listen streams.
       try {
@@ -247,9 +256,10 @@ export async function startHttpServer(options: StartHttpOptions = {}): Promise<R
       } catch (error) {
         logger.error("closing the MCP handler failed", { error });
       }
-      server.closeIdleConnections();
 
-      wait = delay(first === "timeout" ? 0 : remaining());
+      // Streams the close just ended need a moment to flush and hang up,
+      // also when the drain phase already used up the timeout.
+      wait = delay(Math.max(remaining(), CLOSE_GRACE_MS));
       const second = await Promise.race([closed, wait.promise]);
       wait.cancel();
       const forced = second === "timeout";
@@ -258,6 +268,7 @@ export async function startHttpServer(options: StartHttpOptions = {}): Promise<R
         server.closeAllConnections();
         await closed;
       }
+      clearInterval(sweeper);
       await nonces.close();
       logger.info("sevdesk-mcp stopped", { forced });
       return { forced };

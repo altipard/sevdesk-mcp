@@ -251,3 +251,46 @@ describe("read tools on every mode", () => {
     );
   });
 });
+
+describe("Origin allowlist on the MCP endpoint", () => {
+  it("refuses a browser origin outside the allowed hosts; same host or no Origin passes", async () => {
+    const server = await fx.server();
+    const token = await signToken(fx.iss, server.resourceUrl.href);
+    const post = (origin?: string) =>
+      fetch(server.resourceUrl, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          authorization: `Bearer ${token}`,
+          ...(origin && { origin }),
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+      });
+    expect((await post("https://evil.example")).status).toBe(403);
+    expect((await post("null")).status).toBe(403);
+    expect((await post(`http://127.0.0.1:${server.port}`)).status).toBe(200);
+    expect((await post()).status).toBe(200);
+    // Discovery stays reachable from anywhere: it is public metadata.
+    const metadata = await fetch(server.app.resourceMetadataUrl, {
+      headers: { origin: "https://evil.example" },
+    });
+    expect(metadata.status).toBe(200);
+  });
+});
+
+describe("streams end when the token expires", () => {
+  it("closes an open subscriptions/listen stream at exp", async () => {
+    const server = await fx.server();
+    const exp = Math.floor(Date.now() / 1000) + 2;
+    const token = await signToken(fx.iss, server.resourceUrl.href, { expiresIn: exp });
+    const { client } = await fx.client(server.resourceUrl, token);
+    const subscription = await client.listen({ toolsListChanged: true });
+    const ended = await Promise.race([
+      subscription.closed,
+      new Promise((resolve) => setTimeout(() => resolve("still open"), 5000)),
+    ]);
+    expect(ended).toBe("remote");
+    expect(Date.now()).toBeGreaterThanOrEqual(exp * 1000 - 50);
+  }, 10_000);
+});

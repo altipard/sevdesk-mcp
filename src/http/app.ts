@@ -5,6 +5,7 @@ import {
   type McpServerFactory,
   type OAuthProtectedResourceMetadata,
   type OAuthTokenVerifier,
+  originValidationResponse,
   requireBearerAuth,
 } from "@modelcontextprotocol/server";
 import type { Logger } from "../logger.js";
@@ -59,13 +60,71 @@ const json = (body: unknown, status: number, headers: Record<string, string> = {
 const methodNotAllowed = () => json({ error: "method_not_allowed" }, 405, { allow: "GET, HEAD" });
 const notFound = () => json({ error: "not_found" }, 404);
 
+// setTimeout fires at once for delays above 2^31-1 ms.
+const MAX_TIMER_MS = 2_147_483_647;
+
+/**
+ * Ends an event stream response at `deadlineMs` (the token's exp): the
+ * client then has to come back with a fresh token, which the gate checks.
+ * Other responses are returned unchanged. A tool call answered as a stream
+ * is cut as well if the token expires mid-call; sevdesk calls are bounded
+ * by the client deadline, so that only hits calls started just before exp.
+ */
+export function endStreamAt(response: Response, deadlineMs: number, now = Date.now): Response {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (response.body === null || !contentType.toLowerCase().startsWith("text/event-stream")) {
+    return response;
+  }
+  const reader = response.body.getReader();
+  let timer: NodeJS.Timeout | undefined;
+  let ended = false;
+  const end = (controller: ReadableStreamDefaultController<Uint8Array>) => {
+    if (ended) return;
+    ended = true;
+    clearTimeout(timer);
+    controller.close();
+    void reader.cancel("access token expired").catch(() => {});
+  };
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const delay = deadlineMs - now();
+      if (delay <= 0) end(controller);
+      else timer = setTimeout(() => end(controller), Math.min(MAX_TIMER_MS, delay));
+    },
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (ended) return;
+        if (done) end(controller);
+        else controller.enqueue(value);
+      } catch (error) {
+        if (ended) return;
+        ended = true;
+        clearTimeout(timer);
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      ended = true;
+      clearTimeout(timer);
+      return reader.cancel(reason);
+    },
+  });
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
 /**
  * The HTTP surface, in this order:
  * 1. health check (no auth, no Host check);
  * 2. Host header allowlist;
  * 3. Protected Resource Metadata, path-aware and at the root (no auth);
- * 4. the MCP endpoint behind the bearer gate, which requires sevdesk:read;
- *    per-tool scopes are checked by the scope challenge of each tool.
+ * 4. the MCP endpoint: Origin allowlist (same hosts), then the bearer gate,
+ *    which requires sevdesk:read; per-tool scopes are checked by the scope
+ *    challenge of each tool. Event streams end when the token expires.
  * Everything else is 404. The MCP token is only used here and never leaves
  * the process: tools call sevdesk with the server's own API token.
  */
@@ -105,12 +164,19 @@ export function createHttpApp(options: HttpAppOptions): HttpApp {
     }
     if (pathname !== mcpPath) return notFound();
 
+    // Browsers send Origin; a page on another site must not drive the
+    // endpoint with a token it got hold of. Clients without Origin pass.
+    const badOrigin = originValidationResponse(request, allowedHosts);
+    if (badOrigin) return badOrigin;
+
     if (draining) {
       return json({ error: "shutting_down" }, 503, { "retry-after": "1", connection: "close" });
     }
     const auth = await gate(request);
     if (auth instanceof Response) return auth;
-    return mcp.fetch(request, { authInfo: auth });
+    const response = await mcp.fetch(request, { authInfo: auth });
+    // The gate checked exp once; a stream must not outlive the token.
+    return endStreamAt(response, (auth.expiresAt ?? 0) * 1000);
   };
 
   return {
