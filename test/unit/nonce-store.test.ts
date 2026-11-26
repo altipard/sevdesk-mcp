@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 import { InMemoryNonceStore } from "../../src/policy/nonce-store.js";
 
 describe("InMemoryNonceStore", () => {
+  it("declares itself process-local, so HTTP refuses it", () => {
+    expect(new InMemoryNonceStore().shared).toBe(false);
+  });
+
   it("consumes a key once", async () => {
     const store = new InMemoryNonceStore();
     expect(await store.consume("a", 1000)).toBe(true);

@@ -1,6 +1,7 @@
 import { inspect } from "node:util";
 import type { Config } from "../src/config.js";
 import { createLogger, type Logger } from "../src/logger.js";
+import { InMemoryNonceStore, type NonceStore } from "../src/policy/nonce-store.js";
 
 // Synthetic token in the documented format (32 hex characters).
 export const TEST_TOKEN = "0123456789abcdef0123456789abcdef";
@@ -39,4 +40,17 @@ export function errorRepresentations(error: unknown): string {
     JSON.stringify(err),
     inspect(err, { depth: null, showHidden: true }),
   ].join("\n");
+}
+
+/**
+ * Test double for a shared backend (Redis and the like): in-memory entries,
+ * but declared shared, as the HTTP transport demands.
+ */
+export function sharedNonceStore(): NonceStore {
+  const inner = new InMemoryNonceStore();
+  return {
+    shared: true,
+    consume: (key, ttlMs) => inner.consume(key, ttlMs),
+    release: (key) => inner.release(key),
+  };
 }

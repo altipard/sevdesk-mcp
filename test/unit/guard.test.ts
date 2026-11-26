@@ -2,9 +2,8 @@ import type { McpServer, ServerContext } from "@modelcontextprotocol/server";
 import { describe, expect, it } from "vitest";
 import { createAuditLog } from "../../src/policy/audit.js";
 import { canonicalTarget, runGuarded } from "../../src/policy/guard.js";
-import { InMemoryNonceStore } from "../../src/policy/nonce-store.js";
 import { createPolicyRuntime, requestPolicy } from "../../src/policy/runtime.js";
-import { captureLogger, testConfig } from "../helpers.js";
+import { captureLogger, sharedNonceStore, testConfig } from "../helpers.js";
 
 // The registry only registers X tools that are enabled, and the fallback
 // only offers X operations listed in SEVDESK_API_ALLOW, so both always pass
@@ -74,7 +73,7 @@ describe("guard on HTTP derives rights and subject per call", () => {
     const runtime = createPolicyRuntime(config, {
       transport: "http",
       secret: Buffer.from("g".repeat(32)),
-      nonces: new InMemoryNonceStore(),
+      nonces: sharedNonceStore(),
       audit: createAuditLog({ write: (l) => lines.push(l) }),
     });
     const policy = requestPolicy(config, runtime, alice);

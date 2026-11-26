@@ -15,7 +15,13 @@ import {
 import { createServer } from "../../src/server.js";
 import { createSevdeskClient } from "../../src/sevdesk/client.js";
 import { SevdeskError } from "../../src/sevdesk/errors.js";
-import { captureLogger, MOCK_BASE_URL, TEST_TOKEN, testConfig } from "../helpers.js";
+import {
+  captureLogger,
+  MOCK_BASE_URL,
+  sharedNonceStore,
+  TEST_TOKEN,
+  testConfig,
+} from "../helpers.js";
 
 // Test-only tools for the W, W+ and X paths. Production tools of these
 // classes do not exist yet; the guard is the same for all of them.
@@ -301,6 +307,7 @@ describe("class W+ confirmation", () => {
 
   it("fails closed when the nonce store is down", async () => {
     const broken: NonceStore = {
+      shared: false,
       consume: () => Promise.reject(new Error("store down")),
       release: () => Promise.resolve(),
     };
@@ -513,6 +520,7 @@ describe("class X single use and idempotency", () => {
 
   it("fails closed when the nonce store is down", async () => {
     const broken: NonceStore = {
+      shared: false,
       consume: () => Promise.reject(new Error("store down")),
       release: () => Promise.resolve(),
     };
@@ -545,6 +553,20 @@ describe("HTTP policy", () => {
     expect(() => createPolicyRuntime(config, { transport: "http", secret: SECRET })).toThrow(
       "HTTP transport needs a shared NonceStore",
     );
+    expect(() =>
+      createPolicyRuntime(config, {
+        transport: "http",
+        secret: SECRET,
+        nonces: new InMemoryNonceStore(),
+      }),
+    ).toThrow("HTTP transport needs a shared NonceStore");
+    expect(() =>
+      createPolicyRuntime(config, {
+        transport: "http",
+        secret: SECRET,
+        nonces: sharedNonceStore(),
+      }),
+    ).not.toThrow();
     expect(() => createPolicyRuntime(config, { transport: "stdio", secret: SECRET })).not.toThrow();
   });
 
@@ -552,7 +574,7 @@ describe("HTTP policy", () => {
     const runtime = createPolicyRuntime(config, {
       transport: "http",
       secret: SECRET,
-      nonces: new InMemoryNonceStore(),
+      nonces: sharedNonceStore(),
     });
     const policy = requestPolicy(config, runtime, authInfo);
     expect(policy.subject).toBe("sub:alice");
@@ -576,7 +598,7 @@ describe("HTTP policy", () => {
     const runtime = createPolicyRuntime(config, {
       transport: "http",
       secret: SECRET,
-      nonces: new InMemoryNonceStore(),
+      nonces: sharedNonceStore(),
       audit: createAuditLog({ write: (line) => auditLines.push(line) }),
     });
     const build = () => {

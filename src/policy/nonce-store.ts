@@ -8,6 +8,13 @@
  * for several instances; this process-local one serves stdio and tests.
  */
 export interface NonceStore {
+  /**
+   * true only if every instance of the server sees the same entries (e.g.
+   * Redis). The HTTP transport refuses a store that is not shared, because a
+   * token could otherwise be replayed against another instance or after a
+   * restart.
+   */
+  readonly shared: boolean;
   /** Marks `key` as used for `ttlMs`. Resolves false if it already was. */
   consume(key: string, ttlMs: number): Promise<boolean>;
   /** Frees a key again, e.g. after sevdesk definitely rejected the action. */
@@ -17,6 +24,8 @@ export interface NonceStore {
 const SWEEP_THRESHOLD = 10_000;
 
 export class InMemoryNonceStore implements NonceStore {
+  /** Process-local: entries die with the process and are not seen by others. */
+  readonly shared = false;
   readonly #entries = new Map<string, number>();
   readonly #now: () => number;
 
