@@ -132,6 +132,21 @@ if (invoiceId) {
   skip("get_document_pdf", "no invoice");
 }
 await run("list_open_receivables", { limit: 1 });
+// All types, to see how many reminders and cancellations the default leaves
+// out. Only known type codes and counts are printed.
+await run(
+  "list_open_receivables",
+  { limit: 1, invoiceTypes: ["RE", "WKR", "SR", "MA", "TR", "AR", "ER"] },
+  (data) => {
+    const counts = new Map();
+    for (const entry of data.totalsByType ?? []) {
+      const type = /^[A-Z]{2,3}$/.test(entry.invoiceType ?? "") ? entry.invoiceType : "other";
+      counts.set(type, (counts.get(type) ?? 0) + entry.count);
+    }
+    const byType = [...counts].map(([type, count]) => `${type}:${count}`).join(",");
+    return `byType=${byType || "none"}`;
+  },
+);
 await run("search_orders", { limit: 1 });
 const vouchers = await run("search_vouchers", { limit: 1 });
 const voucherId = firstId(vouchers, "vouchers");

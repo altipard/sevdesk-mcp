@@ -275,6 +275,62 @@ describe("list_open_receivables", () => {
     expect(overdue.receivables.map((r) => r.id)).toEqual([1, 4, 3]);
   });
 
+  it("leaves reminders and cancellations out by default and splits totals by type", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Invoice"), ({ request }) => {
+        if (new URL(request.url).searchParams.get("status") === "750") {
+          return HttpResponse.json(list([]));
+        }
+        return HttpResponse.json(
+          list([
+            invoice({ id: "1", invoiceType: "RE" }),
+            invoice({ id: "2", invoiceType: "MA", sumGross: "124" }),
+            invoice({ id: "3", invoiceType: "SR", sumGross: "50" }),
+            invoice({ id: "4", invoiceType: "AR", sumGross: "30" }),
+            invoice({ id: "5", invoiceType: null }),
+          ]),
+        );
+      }),
+    );
+    const c = await connect();
+    type Out = {
+      receivables: Array<{ id: number }>;
+      totals: Array<Record<string, unknown>>;
+      totalsByType: Array<Record<string, unknown>>;
+    };
+    const standard = structured<Out>(await c.call("list_open_receivables", {}));
+    expect(standard.receivables.map((r) => r.id).sort()).toEqual([1, 4]);
+    expect(standard.totals).toEqual([
+      expect.objectContaining({ currency: "EUR", count: 2, openAmount: 149 }),
+    ]);
+    expect(standard.totalsByType).toEqual([
+      expect.objectContaining({
+        invoiceType: "AR",
+        invoiceTypeName: "advance",
+        count: 1,
+        openAmount: 30,
+      }),
+      expect.objectContaining({
+        invoiceType: "RE",
+        invoiceTypeName: "invoice",
+        count: 1,
+        openAmount: 119,
+      }),
+    ]);
+
+    const reminders = structured<Out>(
+      await c.call("list_open_receivables", { invoiceTypes: ["MA"] }),
+    );
+    expect(reminders.receivables.map((r) => r.id)).toEqual([2]);
+    expect(reminders.totalsByType).toEqual([
+      expect.objectContaining({ invoiceType: "MA", invoiceTypeName: "reminder", openAmount: 124 }),
+    ]);
+
+    for (const invoiceTypes of [[], ["XX"]]) {
+      expect((await c.call("list_open_receivables", { invoiceTypes })).isError).toBe(true);
+    }
+  });
+
   it("pages through sevdesk and stops at the scan limit with a note", async () => {
     api.server.use(
       http.get(sevdeskUrl("/Invoice"), ({ request }) => {

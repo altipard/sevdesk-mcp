@@ -276,6 +276,38 @@ const totalsSchema = z.object({
   overdueCount: z.number().int(),
   overdueAmount: z.number(),
 });
+type Totals = z.infer<typeof totalsSchema>;
+
+const typeTotalsSchema = totalsSchema.extend({
+  invoiceType: z.string().nullable(),
+  invoiceTypeName: z.string().nullable(),
+});
+
+const INVOICE_TYPE_CODES = Object.keys(INVOICE_TYPE) as [string, ...string[]];
+
+/**
+ * Receivables by default: reminders (MA) only repeat the amount of the
+ * invoice they remind of, and cancellations (SR) are not owed by the
+ * customer, so counting them would double or distort the totals.
+ */
+export const DEFAULT_RECEIVABLE_TYPES = ["RE", "WKR", "TR", "AR", "ER"] as const;
+
+function addTo(entry: Totals, invoice: { openAmount: number | null; overdue: boolean }): void {
+  entry.count++;
+  entry.openAmount = cents(entry.openAmount + (invoice.openAmount ?? 0));
+  if (invoice.overdue) {
+    entry.overdueCount++;
+    entry.overdueAmount = cents(entry.overdueAmount + (invoice.openAmount ?? 0));
+  }
+}
+
+const emptyTotals = (currency: string | null): Totals => ({
+  currency,
+  count: 0,
+  openAmount: 0,
+  overdueCount: 0,
+  overdueAmount: 0,
+});
 
 async function scanStatus(
   call: ToolCall,
@@ -309,20 +341,34 @@ export const listOpenReceivables = defineTool({
   title: "List open sevdesk receivables",
   description:
     "Lists invoices customers still have to pay (status open or partially paid) with open " +
-    "amount, due date and days overdue, sorted by due date, plus totals per currency. Use it " +
-    "for dunning and cash-flow questions; use search_invoices for any other invoice search." +
+    "amount, due date and days overdue, sorted by due date, plus totals per currency and per " +
+    "invoice type. Reminders (MA) and cancellations (SR) are left out unless listed in " +
+    "invoiceTypes, because they would count amounts twice. Use it for dunning and cash-flow " +
+    "questions; use search_invoices for any other invoice search." +
     FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "getInvoices",
   inputSchema: z.object({
     contactId: entityId.optional().describe("Only receivables of this contact."),
     overdueOnly: z.boolean().default(false).describe("Only invoices past their due date."),
+    invoiceTypes: z
+      .array(z.enum(INVOICE_TYPE_CODES))
+      .min(1)
+      .max(INVOICE_TYPE_CODES.length)
+      .default([...DEFAULT_RECEIVABLE_TYPES])
+      .describe(
+        "Invoice types to include (RE invoice, WKR recurring, TR partial, AR advance, ER final, " +
+          "MA reminder, SR cancellation). Default: RE, WKR, TR, AR, ER.",
+      ),
     ...pageInput,
   }),
   outputSchema: z.object({
     asOf: z.string().describe("Today in German time; overdue is computed against it."),
     receivables: z.array(receivableSchema),
     totals: z.array(totalsSchema).describe("Over all matching receivables, not just this page."),
+    totalsByType: z
+      .array(typeTotalsSchema)
+      .describe("The same totals split by invoice type and currency."),
     page: pageSchema,
     truncated: z.boolean(),
     note: z.string().optional(),
@@ -330,6 +376,7 @@ export const listOpenReceivables = defineTool({
   annotations: READ_ANNOTATIONS,
   async handler(args, call) {
     const asOf = todayIso();
+    const types = new Set<string>(args.invoiceTypes);
     const open = await scanStatus(call, 200, args.contactId);
     const partial = await scanStatus(call, 750, args.contactId);
     const truncated = open.truncated || partial.truncated;
@@ -341,36 +388,43 @@ export const listOpenReceivables = defineTool({
         return { ...invoice, overdue: days > 0, daysOverdue: Math.max(0, days) };
       })
       .filter((invoice) => !args.overdueOnly || invoice.overdue)
+      .filter((invoice) => invoice.invoiceType !== null && types.has(invoice.invoiceType))
       .sort((a, b) => (a.dueDate ?? "9999").localeCompare(b.dueDate ?? "9999") || a.id - b.id);
 
-    const totals = new Map<string, z.infer<typeof totalsSchema>>();
+    const totals = new Map<string, Totals>();
+    const byType = new Map<string, z.infer<typeof typeTotalsSchema>>();
     for (const invoice of all) {
       const key = invoice.currency ?? "";
-      const entry = totals.get(key) ?? {
-        currency: invoice.currency,
-        count: 0,
-        openAmount: 0,
-        overdueCount: 0,
-        overdueAmount: 0,
-      };
-      entry.count++;
-      entry.openAmount = cents(entry.openAmount + (invoice.openAmount ?? 0));
-      if (invoice.overdue) {
-        entry.overdueCount++;
-        entry.overdueAmount = cents(entry.overdueAmount + (invoice.openAmount ?? 0));
-      }
+      const entry = totals.get(key) ?? emptyTotals(invoice.currency);
+      addTo(entry, invoice);
       totals.set(key, entry);
+      const typeKey = `${invoice.invoiceType}\u0000${key}`;
+      const typeEntry = byType.get(typeKey) ?? {
+        invoiceType: invoice.invoiceType,
+        invoiceTypeName: invoice.invoiceTypeName,
+        ...emptyTotals(invoice.currency),
+      };
+      addTo(typeEntry, invoice);
+      byType.set(typeKey, typeEntry);
     }
 
     const receivables = all.slice(args.offset, args.offset + args.limit);
     const page = pageOf(args.offset, args.limit, receivables.length, all.length);
     const totalList = [...totals.values()];
-    const sums = totalList.map((t) => `${t.openAmount} ${t.currency ?? ""}`.trim()).join(", ");
+    // Only ISO currency codes go into the summary line, never free text.
+    const sums = totalList
+      .map((t) => `${t.openAmount} ${/^[A-Z]{3}$/.test(t.currency ?? "") ? t.currency : ""}`.trim())
+      .join(", ");
     return present(
       {
         asOf,
         receivables,
         totals: totalList,
+        totalsByType: [...byType.values()].sort(
+          (a, b) =>
+            (a.invoiceType ?? "").localeCompare(b.invoiceType ?? "") ||
+            (a.currency ?? "").localeCompare(b.currency ?? ""),
+        ),
         page,
         truncated,
         ...(truncated && {
