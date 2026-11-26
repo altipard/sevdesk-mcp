@@ -30,4 +30,21 @@ describe("workflows", () => {
       }
     }
   });
+
+  // npm reads a bare "dir/file.tgz" as a GitHub user/repo shorthand and runs git ls-remote.
+  it("hand npm publish only tarball paths that start with ./ or /", () => {
+    let publishes = 0;
+    for (const { name, text } of workflows) {
+      // Tarball paths assigned in the workflow, which publish later reads via a variable.
+      for (const [, path = ""] of text.matchAll(/set -- (\S*\.tgz)/g)) {
+        expect(path, `${name}: ${path}`).toMatch(/^(\.\/|\/)/);
+      }
+      for (const [, arg = ""] of text.matchAll(/npm publish\s+(?!-)(\S+)/g)) {
+        publishes++;
+        const literal = arg.replace(/^"|"$/g, "");
+        if (!literal.startsWith("$")) expect(literal, name).toMatch(/^(\.\/|\/)/);
+      }
+    }
+    expect(publishes).toBeGreaterThan(0);
+  });
 });
