@@ -210,6 +210,43 @@ describe("retries", () => {
     expect(calls).toBe(2);
   });
 
+  it.each([
+    ["0", 100],
+    ["Thu, 01 Jan 1970 00:00:00 GMT", 100],
+  ])("waits at least baseDelayMs for Retry-After %j", async (retryAfter, expected) => {
+    let calls = 0;
+    server.use(
+      http.get(url("/Voucher"), () =>
+        calls++ === 0
+          ? HttpResponse.json({}, { status: 429, headers: { "Retry-After": retryAfter } })
+          : HttpResponse.json({ objects: [] }),
+      ),
+    );
+    const { client, sleeps } = setup({ retry: { baseDelayMs: 100 } });
+
+    await client.call(client.api.GET("/Voucher"));
+
+    expect(sleeps).toEqual([expected]);
+  });
+
+  it("falls back to backoff for an unparsable Retry-After", async () => {
+    let calls = 0;
+    server.use(
+      http.get(url("/Voucher"), () =>
+        calls++ === 0
+          ? HttpResponse.json({}, { status: 429, headers: { "Retry-After": "1.5" } })
+          : HttpResponse.json({ objects: [] }),
+      ),
+    );
+    const { client, sleeps } = setup({ retry: { baseDelayMs: 100 } });
+
+    await client.call(client.api.GET("/Voucher"));
+
+    expect(sleeps).toHaveLength(1);
+    expect(sleeps[0]).toBeGreaterThanOrEqual(50);
+    expect(sleeps[0]).toBeLessThanOrEqual(100);
+  });
+
   it("gives up after maxRetries", async () => {
     let calls = 0;
     server.use(

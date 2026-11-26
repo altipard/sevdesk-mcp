@@ -67,7 +67,15 @@ function clean(text: string, redact: Redactor): string {
     : singleLine;
 }
 
-/** Parses Retry-After (delta seconds or HTTP date) into milliseconds. */
+// IMF-fixdate, the HTTP date format servers must send (RFC 9110 5.6.7).
+const HTTP_DATE =
+  /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+
+/**
+ * Parses Retry-After (delta seconds or HTTP date) into milliseconds.
+ * Anything else, e.g. "1.5" or "-5", is ignored instead of being guessed
+ * at by Date.parse.
+ */
 export function parseRetryAfter(
   value: string | null,
   now: number = Date.now(),
@@ -75,6 +83,7 @@ export function parseRetryAfter(
   if (value === null) return undefined;
   const trimmed = value.trim();
   if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
+  if (!HTTP_DATE.test(trimmed)) return undefined;
   const date = Date.parse(trimmed);
   if (Number.isNaN(date)) return undefined;
   return Math.max(0, date - now);

@@ -141,7 +141,11 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
       if (!canRetry || !isRetryableStatus(response.status)) return response;
 
       const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
-      const delay = retryAfter ?? backoffDelay(attempt, policy.retry);
+      // Retry-After 0 (or a date in the past) still gets a minimal pause.
+      const delay =
+        retryAfter === undefined
+          ? backoffDelay(attempt, policy.retry)
+          : Math.max(policy.retry.baseDelayMs, retryAfter);
       // A server asking for a longer pause than we are willing to wait gets
       // the error passed through, including its Retry-After hint.
       if (delay > policy.retry.maxDelayMs) return response;
