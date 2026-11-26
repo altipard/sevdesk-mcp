@@ -31,6 +31,19 @@ describe("InMemoryNonceStore", () => {
     expect(await store.consume("a", 100)).toBe(true);
   });
 
+  it("answers has() without marking or freeing, and honours the TTL", async () => {
+    let now = 0;
+    const store = new InMemoryNonceStore({ now: () => now });
+    expect(await store.has("a")).toBe(false);
+    expect(store.size).toBe(0);
+    await store.consume("a", 100);
+    expect(await store.has("a")).toBe(true);
+    expect(await store.has("a")).toBe(true);
+    expect(await store.consume("a", 100)).toBe(false);
+    now = 100;
+    expect(await store.has("a")).toBe(false);
+  });
+
   it("sweeps expired entries once it grows large", async () => {
     let now = 0;
     const store = new InMemoryNonceStore({ now: () => now });

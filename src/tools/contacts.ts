@@ -127,7 +127,7 @@ function truncatedPage(
   count: number,
   moreReachable: boolean,
 ): SearchOutput["page"] {
-  return { ...pageOf(offset, limit, count, null), hasMore: moreReachable || count > 0 };
+  return pageOf(offset, limit, count, null, moreReachable || count > 0);
 }
 
 /** scan.note text for a scan that stopped early. */
@@ -278,10 +278,7 @@ async function searchByEmail(
     const moreAfterSlice = args.offset + args.limit < ids.length;
     page = scan.truncated
       ? truncatedPage(args.offset, args.limit, contacts.length, moreAfterSlice)
-      : {
-          ...pageOf(args.offset, args.limit, contacts.length, ids.length),
-          hasMore: moreAfterSlice,
-        };
+      : pageOf(args.offset, args.limit, contacts.length, ids.length, moreAfterSlice);
   } else {
     // Whether a match is a person shows only on the contact itself: walk the
     // matches in order, skip persons, stop when the page is full or the
@@ -308,10 +305,13 @@ async function searchByEmail(
     // budget, so a later offset reaches nothing this walk did not: once the
     // budget is spent, matches left over cannot be paged to.
     fetchCapped = index < ids.length && fetches >= MAX_EMAIL_CONTACT_FETCHES;
-    page = {
-      ...pageOf(args.offset, args.limit, contacts.length, null),
-      hasMore: !fetchCapped && (index < ids.length || (scan.truncated && contacts.length > 0)),
-    };
+    page = pageOf(
+      args.offset,
+      args.limit,
+      contacts.length,
+      null,
+      !fetchCapped && (index < ids.length || (scan.truncated && contacts.length > 0)),
+    );
   }
 
   const notes = [

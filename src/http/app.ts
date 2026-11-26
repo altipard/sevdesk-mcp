@@ -1,6 +1,6 @@
 import {
+  type AuthInfo,
   createMcpHandler,
-  DEFAULT_MAX_REQUEST_BODY_SIZE,
   getOAuthProtectedResourceMetadataUrl,
   hostHeaderValidationResponse,
   type McpServerFactory,
@@ -18,6 +18,14 @@ export const HEALTH_PATH = "/healthz";
 /** RFC 9728 well-known prefix; the path-aware document lives below it. */
 export const PRM_ROOT = "/.well-known/oauth-protected-resource";
 export const SUPPORTED_SCOPES = [SCOPES.read, SCOPES.write, SCOPES.irreversible] as const;
+/**
+ * Largest POST body read on the MCP endpoint, in bytes, for the Node
+ * adapter, the MCP handler and the long-lived-stream check alike. Sized for
+ * create_voucher: a file at its limit travels as base64 (4/3 of its size)
+ * plus the JSON envelope. Bodies are only read after screen() let the
+ * request through, so this bound applies to authenticated callers only.
+ */
+export const HTTP_MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
 
 export interface HttpAppOptions {
   /** Public URL of the MCP endpoint, also the expected token audience. */
@@ -33,7 +41,20 @@ export interface HttpAppOptions {
 }
 
 export interface HttpApp {
-  fetch(request: Request): Promise<Response>;
+  /**
+   * Answers a request. `authInfo` is screen()'s result for this request,
+   * handed on by the Node adapter (req.auth): with it, fetch takes the
+   * admission (token, scope, draining) as decided and repeats only the
+   * checks screen ran before it. Nothing else may pass authInfo.
+   */
+  fetch(request: Request, options?: { authInfo?: AuthInfo }): Promise<Response>;
+  /**
+   * Every check that needs no body, with the same rules fetch applies: the
+   * answer for a request that ends here (health, metadata, 404, Host,
+   * Origin, draining, missing or bad token, missing scope), or the verified
+   * token of an MCP request whose body may now be read.
+   */
+  screen(request: Request): Promise<Response | AuthInfo>;
   /** From now on the MCP endpoint answers 503 and the health check reports draining. */
   startDraining(): void;
   /** Aborts in-flight MCP exchanges and closes their server instances. */
@@ -85,7 +106,7 @@ export async function isLongLivedStream(request: Request): Promise<boolean> {
   if (request.method === "GET") return true;
   if (request.method !== "POST" || request.body === null) return false;
   const declared = Number(request.headers.get("content-length") ?? "0");
-  if (declared > DEFAULT_MAX_REQUEST_BODY_SIZE) return false;
+  if (declared > HTTP_MAX_REQUEST_BODY_BYTES) return false;
   const reader = request.clone().body?.getReader();
   if (reader === undefined) return false;
   const chunks: Uint8Array[] = [];
@@ -95,7 +116,7 @@ export async function isLongLivedStream(request: Request): Promise<boolean> {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > DEFAULT_MAX_REQUEST_BODY_SIZE) {
+      if (size > HTTP_MAX_REQUEST_BODY_BYTES) {
         // Not awaited: cancelling one branch of a tee only settles once the
         // handler's branch is done too.
         void reader.cancel().catch(() => {});
@@ -194,36 +215,60 @@ export function createHttpApp(options: HttpAppOptions): HttpApp {
   });
   const mcp = createMcpHandler(options.factory, {
     onerror: (error) => logger.error("mcp handler error", { error }),
+    maxRequestBodySize: HTTP_MAX_REQUEST_BODY_BYTES,
   });
   let draining = false;
 
-  const route = async (request: Request, pathname: string): Promise<Response> => {
+  // The one place for every check without a body. fetch runs it again, so
+  // a request answered by screen() gets the same answer from fetch.
+  const screenRoute = async (
+    request: Request,
+    pathname: string,
+    admitted?: AuthInfo,
+  ): Promise<{ response: Response } | { auth: AuthInfo }> => {
+    const end = (response: Response) => ({ response });
     const readOnlyMethod = request.method === "GET" || request.method === "HEAD";
     if (pathname === HEALTH_PATH) {
-      if (!readOnlyMethod) return methodNotAllowed();
-      return draining ? json({ status: "draining" }, 503) : json({ status: "ok" }, 200);
+      if (!readOnlyMethod) return end(methodNotAllowed());
+      return end(draining ? json({ status: "draining" }, 503) : json({ status: "ok" }, 200));
     }
 
     const badHost = hostHeaderValidationResponse(request, allowedHosts);
-    if (badHost) return badHost;
+    if (badHost) return end(badHost);
 
     if (pathname === metadataPath || pathname === PRM_ROOT) {
       // The root document is a fallback for clients that probe it.
-      if (!readOnlyMethod) return methodNotAllowed();
-      return Response.json(metadata, { headers: { "cache-control": "public, max-age=300" } });
+      if (!readOnlyMethod) return end(methodNotAllowed());
+      return end(Response.json(metadata, { headers: { "cache-control": "public, max-age=300" } }));
     }
-    if (pathname !== mcpPath) return notFound();
+    if (pathname !== mcpPath) return end(notFound());
 
     // Browsers send Origin; a page on another site must not drive the
     // endpoint with a token it got hold of. Clients without Origin pass.
     const badOrigin = originValidationResponse(request, allowedHosts);
-    if (badOrigin) return badOrigin;
+    if (badOrigin) return end(badOrigin);
 
+    // Admitted by screen() already: a request that arrived before draining
+    // runs to the end, and a token that expired while the body was being
+    // uploaded does not throw away a call the client finished sending.
+    if (admitted) return { auth: admitted };
     if (draining) {
-      return json({ error: "shutting_down" }, 503, { "retry-after": "1", connection: "close" });
+      return end(
+        json({ error: "shutting_down" }, 503, { "retry-after": "1", connection: "close" }),
+      );
     }
     const auth = await gate(request);
-    if (auth instanceof Response) return auth;
+    return auth instanceof Response ? end(auth) : { auth };
+  };
+
+  const route = async (
+    request: Request,
+    pathname: string,
+    admitted?: AuthInfo,
+  ): Promise<Response> => {
+    const screened = await screenRoute(request, pathname, admitted);
+    if ("response" in screened) return screened.response;
+    const { auth } = screened;
     // Read before the handler consumes the body.
     const longLived = await isLongLivedStream(request);
     const response = await mcp.fetch(request, { authInfo: auth });
@@ -239,27 +284,45 @@ export function createHttpApp(options: HttpAppOptions): HttpApp {
       draining = true;
     },
     close: () => mcp.close(),
-    fetch: async (request) => {
-      const started = performance.now();
-      // Only the path is logged: no query, no headers, so neither the
-      // Authorization header nor anything a client put in the URL.
-      const { pathname } = new URL(request.url);
-      let response: Response;
-      try {
-        response = await route(request, pathname);
-      } catch (error) {
-        logger.error("request failed", { method: request.method, path: pathname, error });
-        response = json({ error: "server_error" }, 500);
-      }
-      // Health probes arrive every few seconds; they only show at debug.
-      const log = pathname === HEALTH_PATH ? logger.debug : logger.info;
-      log("http request", {
-        method: request.method,
-        path: pathname,
-        status: response.status,
-        durationMs: Math.round(performance.now() - started),
+    fetch: (request, options) =>
+      logged(request, (req, pathname) => route(req, pathname, options?.authInfo)),
+    screen: async (request) => {
+      let auth: AuthInfo | undefined;
+      const response = await logged(request, async (req, pathname) => {
+        const screened = await screenRoute(req, pathname);
+        if ("response" in screened) return screened.response;
+        auth = screened.auth;
+        return undefined;
       });
-      return response;
+      return auth ?? (response as Response);
     },
   };
+
+  /** Runs one stage with error handling and logs its answer, if it gave one. */
+  async function logged<R extends Response | undefined>(
+    request: Request,
+    stage: (request: Request, pathname: string) => Promise<R>,
+  ): Promise<R | Response> {
+    const started = performance.now();
+    // Only the path is logged: no query, no headers, so neither the
+    // Authorization header nor anything a client put in the URL.
+    const { pathname } = new URL(request.url);
+    let response: R | Response;
+    try {
+      response = await stage(request, pathname);
+    } catch (error) {
+      logger.error("request failed", { method: request.method, path: pathname, error });
+      response = json({ error: "server_error" }, 500);
+    }
+    if (response === undefined) return response;
+    // Health probes arrive every few seconds; they only show at debug.
+    const log = pathname === HEALTH_PATH ? logger.debug : logger.info;
+    log("http request", {
+      method: request.method,
+      path: pathname,
+      status: response.status,
+      durationMs: Math.round(performance.now() - started),
+    });
+    return response;
+  }
 }

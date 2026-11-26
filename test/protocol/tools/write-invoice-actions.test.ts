@@ -181,7 +181,8 @@ describe("book_invoice_payment (W+)", () => {
       paymentType: "FULL_PAYMENT",
     });
     expect(over.preview.warnings).toEqual([
-      "Overpayment: 150 is 50 more than the open amount of 100.",
+      "Overpayment: 150 is 50 more than the open amount of 100. Without type O or OF this " +
+        "server refuses the booking at execution.",
       "FULL_PAYMENT expects the open amount (100), not 150; use N for a partial payment, CB, " +
         "MTC or O for a reduced amount, OF for reminder fees.",
     ]);
@@ -215,6 +216,69 @@ describe("book_invoice_payment (W+)", () => {
     const drafted = await previewOf(c, "book_invoice_payment", args);
     expect((drafted.preview.warnings as string[])[0]).toContain("is draft (100)");
     expect(writes()).toEqual([]);
+  });
+
+  it("expects CB, MTC and O to settle the invoice, other types to leave the rest open", async () => {
+    api.server.use(readInvoice(openInvoice), readContact, account);
+    const c = await connectWrites({ config: { mode: "write" } });
+    for (const [paymentType, amount, openAfter, expectedSettled] of [
+      ["CB", 97, 0, true],
+      ["MTC", 99, 0, true],
+      ["O", 80, 0, true],
+      ["N", 40, 60, false],
+      ["FULL_PAYMENT", 100, 0, false],
+      ["OF", 105, 0, false],
+    ] as const) {
+      const { preview } = await previewOf(c, "book_invoice_payment", {
+        ...args,
+        paymentType,
+        amount,
+      });
+      expect(preview, paymentType).toMatchObject({ openBefore: 100, openAfter, expectedSettled });
+    }
+  });
+
+  it("refuses an overpayment that arose after the preview unless the type is O or OF", async () => {
+    let reads = 0;
+    api.server.use(
+      http.get(sevdeskUrl("/Invoice/1001"), () => {
+        reads++;
+        // Another payment of 70 arrived between preview and confirmation.
+        return HttpResponse.json(
+          list([
+            reads % 2 === 1
+              ? openInvoice
+              : invoice({ status: "750", sumGross: "119", paidAmount: "89" }),
+          ]),
+        );
+      }),
+      readContact,
+      account,
+      http.put(sevdeskUrl("/Invoice/1001/bookAmount"), () =>
+        HttpResponse.json({ id: "78", objectName: "InvoiceLog" }),
+      ),
+    );
+    const c = await connectWrites({ config: { mode: "write" } });
+    const refused = await confirm(c, "book_invoice_payment", args);
+    expect(refused.result.isError).toBe(true);
+    expect(textOf(refused.result)).toBe(
+      "Invoice 1001 has 30 open now; 100 would overpay it by 70; this server refuses " +
+        "overpayments without type O or OF. Nothing was booked; call the tool again without " +
+        "confirmation_token for a new preview.",
+    );
+    expect(writes()).toEqual([]);
+
+    const booked = await confirm(c, "book_invoice_payment", { ...args, paymentType: "O" });
+    expect(booked.result.isError, textOf(booked.result)).toBeFalsy();
+    // The log entry bare, as in the spec, is read as well as the wrapped one.
+    expect(structured(booked.result)).toMatchObject({
+      paymentType: "O",
+      openBefore: 30,
+      openAfterExpected: 0,
+      overpayment: 70,
+      logId: 78,
+    });
+    expect(writes()).toHaveLength(1);
   });
 
   it("requires paymentType and date and accepts amounts in whole cents only", async () => {

@@ -17,6 +17,11 @@ export interface NonceStore {
   readonly shared: boolean;
   /** Marks `key` as used for `ttlMs`. Resolves false if it already was. */
   consume(key: string, ttlMs: number): Promise<boolean>;
+  /**
+   * Whether `key` is currently marked, without marking or freeing it. A
+   * store that cannot answer rejects, like consume.
+   */
+  has(key: string): Promise<boolean>;
   /** Frees a key again, e.g. after sevdesk definitely rejected the action. */
   release(key: string): Promise<void>;
 }
@@ -45,6 +50,11 @@ export class InMemoryNonceStore implements NonceStore {
     if (expiresAt !== undefined && expiresAt > now) return Promise.resolve(false);
     this.#entries.set(key, now + ttlMs);
     return Promise.resolve(true);
+  }
+
+  has(key: string): Promise<boolean> {
+    const expiresAt = this.#entries.get(key);
+    return Promise.resolve(expiresAt !== undefined && expiresAt > this.#now());
   }
 
   release(key: string): Promise<void> {

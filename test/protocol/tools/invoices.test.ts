@@ -48,7 +48,14 @@ describe("search_invoices", () => {
     });
     // 2026-01-01 00:00 in Berlin is 2025-12-31 23:00 UTC.
     expect(unixSeconds("2026-01-01")).toBe(Date.UTC(2025, 11, 31, 23) / 1000);
-    expect(data.page).toEqual({ offset: 10, limit: 2, count: 2, total: 57, hasMore: true });
+    expect(data.page).toEqual({
+      offset: 10,
+      limit: 2,
+      count: 2,
+      total: 57,
+      hasMore: true,
+      nextOffset: 12,
+    });
     expect(data.invoices[0]).toEqual({
       id: 1001,
       invoiceNumber: "RE-1001",
@@ -100,7 +107,14 @@ describe("search_invoices", () => {
       contactId: null,
       openAmount: null,
     });
-    expect(data.page).toEqual({ offset: 0, limit: 25, count: 1, total: null, hasMore: false });
+    expect(data.page).toEqual({
+      offset: 0,
+      limit: 25,
+      count: 1,
+      total: null,
+      hasMore: false,
+      nextOffset: null,
+    });
   });
 
   it("rejects bad input before calling sevdesk", async () => {
@@ -271,7 +285,14 @@ describe("list_open_receivables", () => {
       openAmount: 119,
     });
     expect(data.receivables[1]).toMatchObject({ openAmount: 19, statusName: "partially_paid" });
-    expect(data.page).toEqual({ offset: 0, limit: 2, count: 2, total: 4, hasMore: true });
+    expect(data.page).toEqual({
+      offset: 0,
+      limit: 2,
+      count: 2,
+      total: 4,
+      hasMore: true,
+      nextOffset: 2,
+    });
     expect(data.totals).toEqual([
       { currency: "EUR", count: 3, openAmount: 188, overdueCount: 2, overdueAmount: 138 },
       { currency: "USD", count: 1, openAmount: 10, overdueCount: 1, overdueAmount: 10 },

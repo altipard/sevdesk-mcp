@@ -1,7 +1,7 @@
-import { createServer, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { toNodeHandler } from "@modelcontextprotocol/node";
-import { OAuthError, type OAuthTokenVerifier } from "@modelcontextprotocol/server";
+import { type AuthInfo, OAuthError, type OAuthTokenVerifier } from "@modelcontextprotocol/server";
 import { createRemoteJWKSet } from "jose";
 import {
   type Config,
@@ -21,13 +21,104 @@ import { createServer as createMcpServer } from "../server.js";
 import { createSevdeskClient, type SevdeskClient } from "../sevdesk/client.js";
 import { TOOL_NAMES } from "../tools/index.js";
 import { VERSION } from "../version.js";
-import { createHttpApp, type HttpApp } from "./app.js";
+import { createHttpApp, HTTP_MAX_REQUEST_BODY_BYTES, type HttpApp } from "./app.js";
 import { createJwtVerifier } from "./jwt-verifier.js";
 import {
   type ConnectNonceStore,
   connectRedisNonceStore,
   type RedisNonceConnection,
 } from "./redis.js";
+
+/** Methods the server answers; anything else gets 405 before a Request is built. */
+const ALLOWED_METHODS: ReadonlySet<string> = new Set(["GET", "HEAD", "POST", "DELETE", "OPTIONS"]);
+const ALLOW_HEADER = [...ALLOWED_METHODS].join(", ");
+
+/** Longest wait for a request's headers once a connection is open or reused. */
+export const HTTP_HEADERS_TIMEOUT_MS = 15_000;
+/**
+ * Longest wait for a whole request, body included. A body at the 16 MiB
+ * limit then needs a little over 1 Mbit/s. Not applied to the answer, so
+ * event streams stay open.
+ */
+export const HTTP_REQUEST_TIMEOUT_MS = 120_000;
+/** How long an idle keep-alive connection is kept. */
+export const HTTP_KEEP_ALIVE_TIMEOUT_MS = 5_000;
+/** How often Node checks the two timeouts above; its default is 30 s. */
+const HTTP_CONNECTIONS_CHECK_INTERVAL_MS = 1_000;
+
+/**
+ * Admitted requests with a large body that may be read at the same time.
+ * The adapter holds a body as one string and the MCP handler parses it, so
+ * one 16 MiB body costs roughly 50 MiB of memory at its peak; four of them
+ * stay around 200 MiB. Further ones get 503 with Retry-After.
+ */
+export const MAX_CONCURRENT_LARGE_BODIES = 4;
+/** Bodies above this, or of unknown length (chunked), count as large. */
+export const LARGE_BODY_BYTES = 1024 * 1024;
+
+export interface HttpTimeouts {
+  readonly headersMs: number;
+  readonly requestMs: number;
+  readonly keepAliveMs: number;
+}
+
+/** Whether the request carries a body, declared or chunked. */
+function hasBody(req: IncomingMessage): boolean {
+  return (
+    req.headers["transfer-encoding"] !== undefined || Number(req.headers["content-length"] ?? 0) > 0
+  );
+}
+
+function isLargeBody(req: IncomingMessage): boolean {
+  return (
+    req.headers["transfer-encoding"] !== undefined ||
+    Number(req.headers["content-length"] ?? 0) > LARGE_BODY_BYTES
+  );
+}
+
+/**
+ * The request line and headers as a body-less Request, built like the
+ * Node adapter builds its Request (same URL and headers), so screen() sees
+ * what fetch() will see later. undefined if they do not form a valid URL.
+ */
+function headersOnly(req: IncomingMessage): Request | undefined {
+  const single = (value: string | string[] | undefined) =>
+    Array.isArray(value) ? value[0] : value;
+  const host = single(req.headers.host) ?? single(req.headers[":authority"]) ?? "localhost";
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (value === undefined || name.startsWith(":")) continue;
+    if (Array.isArray(value)) for (const item of value) headers.append(name, item);
+    else headers.set(name, value);
+  }
+  try {
+    return new Request(`http://${host}${req.url ?? "/"}`, {
+      method: (req.method ?? "GET").toUpperCase(),
+      headers,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Writes an answer that ends the request before its body is read. With a
+ * body pending the connection is closed afterwards, so the client stops
+ * sending instead of the server reading the rest only to discard it.
+ */
+async function writeEarly(req: IncomingMessage, res: ServerResponse, response: Response) {
+  const headers: Record<string, string> = {};
+  for (const [name, value] of response.headers) headers[name] = value;
+  if (hasBody(req) && !req.complete) headers.connection = "close";
+  res.writeHead(response.status, headers);
+  res.end(Buffer.from(await response.arrayBuffer()));
+}
+
+const plain = (
+  status: number,
+  body: Record<string, string>,
+  headers: Record<string, string> = {},
+) => Response.json(body, { status, headers: { "cache-control": "no-store", ...headers } });
 
 /** How long shutdown waits for in-flight requests before cutting connections. */
 export const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -47,6 +138,8 @@ export interface StartHttpOptions {
   connectNonceStore?: ConnectNonceStore;
   /** Replaced in tests, so no request reaches sevdesk. */
   sevdesk?: SevdeskClient;
+  /** Replaced in tests; default the HTTP_*_TIMEOUT_MS constants. */
+  timeouts?: Partial<HttpTimeouts>;
 }
 
 export interface RunningHttpServer {
@@ -182,8 +275,65 @@ export async function startHttpServer(options: StartHttpOptions = {}): Promise<R
   let idle: (() => void) | undefined;
   const handle = toNodeHandler(app, {
     onerror: (error) => logger.error("http adapter error", { error }),
+    maxRequestBodySize: HTTP_MAX_REQUEST_BODY_BYTES,
   });
-  const server = createServer((req, res) => {
+  let largeBodies = 0;
+  // The adapter reads the whole body before the app runs. Everything that
+  // needs no body (method, Host, Origin, token, scope, capacity) is decided
+  // first, so an unauthenticated client never gets a body buffered.
+  const serve = async (req: IncomingMessage, res: ServerResponse, expectsContinue: boolean) => {
+    if (!ALLOWED_METHODS.has(req.method ?? "")) {
+      logger.debug("http method not allowed", { method: req.method?.slice(0, 20) });
+      await writeEarly(
+        req,
+        res,
+        plain(405, { error: "method_not_allowed" }, { allow: ALLOW_HEADER }),
+      );
+      return;
+    }
+    // Node keeps only the first Host header; RFC 9112 wants such a request refused.
+    const hosts = req.rawHeaders.filter(
+      (_, i) => i % 2 === 0 && req.rawHeaders[i]?.toLowerCase() === "host",
+    );
+    const request = hosts.length > 1 ? undefined : headersOnly(req);
+    let screened: Response | AuthInfo;
+    if (request === undefined) {
+      screened = plain(400, { error: "bad_request" });
+    } else {
+      try {
+        screened = await app.screen(request);
+      } catch (error) {
+        logger.error("request screening failed", { error });
+        screened = plain(500, { error: "server_error" });
+      }
+    }
+    if (screened instanceof Response) {
+      // No 100 Continue was sent: the client learns the outcome before it
+      // sends the body.
+      await writeEarly(req, res, screened);
+      return;
+    }
+    if (isLargeBody(req)) {
+      if (largeBodies >= MAX_CONCURRENT_LARGE_BODIES) {
+        logger.warn("too many large request bodies at once", {
+          limit: MAX_CONCURRENT_LARGE_BODIES,
+        });
+        await writeEarly(req, res, plain(503, { error: "busy" }, { "retry-after": "5" }));
+        return;
+      }
+      largeBodies++;
+      res.once("close", () => {
+        largeBodies--;
+      });
+    }
+    if (expectsContinue) res.writeContinue();
+    // The adapter hands req.auth to app.fetch as authInfo: the admission
+    // stands, the token is not verified a second time.
+    const admitted = Object.assign(req, { auth: screened });
+    // The adapter's types predate exactOptionalPropertyTypes (method?: string).
+    await handle(admitted as Parameters<typeof handle>[0], res);
+  };
+  const dispatch = (req: IncomingMessage, res: ServerResponse, expectsContinue: boolean) => {
     if (req.method !== "GET") {
       inFlight++;
       res.once("close", () => {
@@ -191,9 +341,48 @@ export async function startHttpServer(options: StartHttpOptions = {}): Promise<R
         if (inFlight === 0) idle?.();
       });
     }
-    // The adapter's types predate exactOptionalPropertyTypes (method?: string).
-    void handle(req as Parameters<typeof handle>[0], res);
+    serve(req, res, expectsContinue).catch((error: unknown) => {
+      logger.error("request handling failed", { error });
+      res.destroy();
+    });
+  };
+  const server = createServer(
+    { connectionsCheckingInterval: HTTP_CONNECTIONS_CHECK_INTERVAL_MS },
+    (req, res) => dispatch(req, res, false),
+  );
+  // Without this listener Node answers 100 Continue itself, before the
+  // request is checked.
+  server.on("checkContinue", (req, res) => dispatch(req, res, true));
+  // CONNECT never reaches the request handler; answered like any other
+  // method this server does not serve.
+  server.on("connect", (_req, socket) => {
+    socket.end(
+      `HTTP/1.1 405 Method Not Allowed\r\nAllow: ${ALLOW_HEADER}\r\nContent-Length: 0\r\n` +
+        "Connection: close\r\n\r\n",
+    );
   });
+  // Requests Node's parser refuses before the handler: unknown methods
+  // (TRACK and the like) get 405 like the ones the handler refuses; the
+  // rest keeps Node's own answers (408 timeout, 431 header overflow, 400).
+  server.on("clientError", (error: NodeJS.ErrnoException, socket) => {
+    const pending = (socket as { _httpMessage?: { headersSent?: boolean } })._httpMessage;
+    if (!socket.writable || pending?.headersSent || error.code === "ECONNRESET") {
+      socket.destroy();
+      return;
+    }
+    const status =
+      error.code === "HPE_INVALID_METHOD"
+        ? `405 Method Not Allowed\r\nAllow: ${ALLOW_HEADER}`
+        : error.code === "ERR_HTTP_REQUEST_TIMEOUT"
+          ? "408 Request Timeout"
+          : error.code === "HPE_HEADER_OVERFLOW"
+            ? "431 Request Header Fields Too Large"
+            : "400 Bad Request";
+    socket.end(`HTTP/1.1 ${status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
+  });
+  server.headersTimeout = options.timeouts?.headersMs ?? HTTP_HEADERS_TIMEOUT_MS;
+  server.requestTimeout = options.timeouts?.requestMs ?? HTTP_REQUEST_TIMEOUT_MS;
+  server.keepAliveTimeout = options.timeouts?.keepAliveMs ?? HTTP_KEEP_ALIVE_TIMEOUT_MS;
 
   try {
     await new Promise<void>((resolve, reject) => {

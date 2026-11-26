@@ -91,7 +91,14 @@ describe("search_orders", () => {
     // Not sent to sevdesk: the spec declares no orderType parameter.
     expect(queryOf(api.requests[0])).toEqual({ limit: "3", offset: "0", countAll: "true" });
     expect(data.orders.map((o) => o.id)).toEqual([7002]);
-    expect(data.page).toEqual({ offset: 0, limit: 3, count: 3, total: 40, hasMore: true });
+    expect(data.page).toEqual({
+      offset: 0,
+      limit: 3,
+      count: 3,
+      total: 40,
+      hasMore: true,
+      nextOffset: 3,
+    });
     expect(data.orderTypeFilter).toMatchObject({ orderType: "AB", fetched: 3, kept: 1 });
     expect(String(data.orderTypeFilter.note)).toContain("applied to this page only");
     expect(textOf(result).split("\n")[0]).toBe(

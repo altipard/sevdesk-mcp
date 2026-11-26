@@ -1,7 +1,8 @@
 // Starts a compiled binary as an MCP client would, sends initialize and
-// tools/list over stdin and checks the answers. No network: the token is a
-// dummy and the base URL points at a closed local port, and neither request
-// reaches sevdesk.
+// tools/list over stdin and checks the answers: once with the defaults, once
+// with SEVDESK_MODE=full and the irreversible tools enabled, which must list
+// every write tool. No network: the token is a dummy and the base URL points
+// at a closed local port, and no request reaches sevdesk.
 //
 //   node scripts/smoke-bin.mjs [path]   default: out/bin/sevdesk-mcp-<host>
 //   SMOKE_ARCH=x86_64 node scripts/smoke-bin.mjs out/bin/sevdesk-mcp-darwin-x64
@@ -17,6 +18,23 @@ const bin = process.argv[2] ?? fileURLToPath(new URL(`out/bin/sevdesk-mcp-${host
 const { version } = JSON.parse(readFileSync(new URL("package.json", root), "utf8"));
 const DUMMY_TOKEN = "0123456789abcdef0123456789abcdef";
 const EXPECTED_TOOLS = ["get_account_info", "search_invoices", "sevdesk_api_request"];
+// Written out: a write tool missing from the binary must fail here. A unit
+// test keeps both lists in line with the tool definitions.
+const X_TOOLS = ["send_invoice_email", "cancel_invoice", "enshrine_document"];
+const WRITE_TOOLS = [
+  "create_contact",
+  "update_contact",
+  "create_invoice_draft",
+  "create_order_draft",
+  "create_invoice_from_order",
+  "mark_invoice_sent",
+  "book_invoice_payment",
+  "create_voucher",
+  "tag_document",
+  "reset_document_status",
+  "book_voucher_payment",
+  ...X_TOOLS,
+];
 
 function fail(message, stderr = "") {
   console.error(`smoke-bin: ${message}`);
@@ -31,81 +49,108 @@ if (!existsSync(bin)) fail(`${bin} is missing; run "npm run build:bin" first`);
 const arch = process.env.SMOKE_ARCH;
 if (arch !== undefined && !/^[a-z0-9_]+$/.test(arch)) fail(`invalid SMOKE_ARCH ${arch}`);
 const [command, args] = arch ? ["/usr/bin/arch", [`-${arch}`, bin]] : [bin, []];
-const child = spawn(command, args, {
-  env: {
-    PATH: process.env.PATH ?? "",
-    SEVDESK_API_TOKEN: DUMMY_TOKEN,
-    SEVDESK_BASE_URL: "http://127.0.0.1:9/api/v1",
-    LOG_LEVEL: "warn",
-  },
-  stdio: ["pipe", "pipe", "pipe"],
-});
 
-let stderr = "";
-child.stderr.setEncoding("utf8").on("data", (chunk) => {
-  stderr += chunk;
-});
-child.on("error", (error) => fail(`cannot start ${bin}: ${error.message}`));
-
-const pending = new Map();
-createInterface({ input: child.stdout }).on("line", (line) => {
-  let message;
-  try {
-    message = JSON.parse(line);
-  } catch {
-    fail(`stdout carried a non-JSON line: ${line.slice(0, 200)}`, stderr);
-  }
-  pending.get(message.id)?.(message);
-});
-
-const exited = new Promise((resolve) =>
-  child.on("exit", (code, signal) => resolve({ code, signal })),
-);
-exited.then(({ code, signal }) => {
-  if (pending.size > 0) fail(`binary exited early (code ${code}, signal ${signal})`, stderr);
-});
-
-function request(id, method, params = {}) {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => fail(`no answer to ${method} within 15s`, stderr), 15_000);
-    pending.set(id, (message) => {
-      clearTimeout(timer);
-      pending.delete(id);
-      if (message.error) fail(`${method} failed: ${JSON.stringify(message.error)}`, stderr);
-      resolve(message.result);
-    });
-    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+/** One run of the binary: initialize, tools/list, then stdin closes and it must exit 0. */
+async function smoke(label, extraEnv, expectedTools) {
+  const child = spawn(command, args, {
+    env: {
+      PATH: process.env.PATH ?? "",
+      SEVDESK_API_TOKEN: DUMMY_TOKEN,
+      SEVDESK_BASE_URL: "http://127.0.0.1:9/api/v1",
+      LOG_LEVEL: "warn",
+      ...extraEnv,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
   });
+
+  let stderr = "";
+  child.stderr.setEncoding("utf8").on("data", (chunk) => {
+    stderr += chunk;
+  });
+  child.on("error", (error) => fail(`${label}: cannot start ${bin}: ${error.message}`));
+
+  const pending = new Map();
+  createInterface({ input: child.stdout }).on("line", (line) => {
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      fail(`${label}: stdout carried a non-JSON line: ${line.slice(0, 200)}`, stderr);
+    }
+    pending.get(message.id)?.(message);
+  });
+
+  const exited = new Promise((resolve) =>
+    child.on("exit", (code, signal) => resolve({ code, signal })),
+  );
+  exited.then(({ code, signal }) => {
+    if (pending.size > 0) {
+      fail(`${label}: binary exited early (code ${code}, signal ${signal})`, stderr);
+    }
+  });
+
+  function request(id, method, params = {}) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(
+        () => fail(`${label}: no answer to ${method} within 15s`, stderr),
+        15_000,
+      );
+      pending.set(id, (message) => {
+        clearTimeout(timer);
+        pending.delete(id);
+        if (message.error) {
+          fail(`${label}: ${method} failed: ${JSON.stringify(message.error)}`, stderr);
+        }
+        resolve(message.result);
+      });
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    });
+  }
+
+  const init = await request(1, "initialize", {
+    protocolVersion: "2025-11-25",
+    capabilities: {},
+    clientInfo: { name: "smoke-bin", version: "0.0.0" },
+  });
+  if (init?.serverInfo?.name !== "sevdesk-mcp") {
+    fail(`${label}: unexpected serverInfo ${JSON.stringify(init)}`);
+  }
+  if (init.serverInfo.version !== version) {
+    fail(
+      `${label}: binary reports version ${init.serverInfo.version}, package.json has ${version}`,
+    );
+  }
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+
+  const list = await request(2, "tools/list");
+  const names = (list?.tools ?? []).map((tool) => tool.name);
+  const missing = expectedTools.filter((name) => !names.includes(name));
+  if (missing.length > 0) {
+    fail(`${label}: tools/list lacks ${missing.join(", ")}; got ${names.join(", ")}`);
+  }
+
+  child.stdin.end();
+  const { code, signal } = await Promise.race([
+    exited,
+    new Promise((resolve) => setTimeout(() => resolve({ code: "timeout" }), 5_000)),
+  ]);
+  if (code === "timeout") {
+    child.kill("SIGKILL");
+    fail(`${label}: binary did not exit after stdin closed`, stderr);
+  }
+  if (code !== 0) fail(`${label}: binary exited with code ${code} (signal ${signal})`, stderr);
+  if (stderr.includes(DUMMY_TOKEN)) fail(`${label}: the token appeared on stderr`);
+  return names;
 }
 
-const init = await request(1, "initialize", {
-  protocolVersion: "2025-11-25",
-  capabilities: {},
-  clientInfo: { name: "smoke-bin", version: "0.0.0" },
-});
-if (init?.serverInfo?.name !== "sevdesk-mcp") fail(`unexpected serverInfo ${JSON.stringify(init)}`);
-if (init.serverInfo.version !== version) {
-  fail(`binary reports version ${init.serverInfo.version}, package.json has ${version}`);
-}
-child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
-
-const list = await request(2, "tools/list");
-const names = (list?.tools ?? []).map((tool) => tool.name);
-const missing = EXPECTED_TOOLS.filter((name) => !names.includes(name));
-if (missing.length > 0) fail(`tools/list lacks ${missing.join(", ")}; got ${names.join(", ")}`);
-
-child.stdin.end();
-const { code, signal } = await Promise.race([
-  exited,
-  new Promise((resolve) => setTimeout(() => resolve({ code: "timeout" }), 5_000)),
-]);
-if (code === "timeout") {
-  child.kill("SIGKILL");
-  fail("binary did not exit after stdin closed", stderr);
-}
-if (code !== 0) fail(`binary exited with code ${code} (signal ${signal})`, stderr);
-if (stderr.includes(DUMMY_TOKEN)) fail("the token appeared on stderr");
+const defaults = await smoke("default", {}, EXPECTED_TOOLS);
+const full = await smoke(
+  "full",
+  { SEVDESK_MODE: "full", SEVDESK_ENABLE_TOOLS: X_TOOLS.join(",") },
+  [...EXPECTED_TOOLS, ...WRITE_TOOLS],
+);
 
 console.error(
-  `smoke-bin: ${bin}${arch ? ` (${arch})` : ""} ${version} ok, ${names.length} tools: ${names.join(", ")}`,
+  `smoke-bin: ${bin}${arch ? ` (${arch})` : ""} ${version} ok, ${defaults.length} tools by ` +
+    `default: ${defaults.join(", ")}; ${full.length} tools in full mode with ${X_TOOLS.join(", ")}`,
 );

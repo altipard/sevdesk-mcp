@@ -1,11 +1,9 @@
 import { z } from "zod";
-import type { Logger } from "../logger.js";
 import { MAX_APPROVAL_FACTS_LENGTH } from "../policy/guard.js";
-import { defineTool, type StrictToolAnnotations } from "../policy/registry.js";
+import { defineTool } from "../policy/registry.js";
 import { SevdeskError } from "../sevdesk/errors.js";
 import {
   badInput,
-  cents,
   entityId,
   FOREIGN_DATA_NOTE,
   integer,
@@ -16,16 +14,29 @@ import {
 } from "./format.js";
 import { present } from "./result.js";
 import {
+  bookingLogId,
   contactNameOf,
   emailInput,
   type InvoiceState,
+  IRREVERSIBLE_ANNOTATIONS,
   inputText,
   invoiceLabel,
   invoiceStateSchema,
   mapInvoiceState,
   money,
+  OVERPAYING_PAYMENT_TYPES,
+  oneLineText,
+  openAfterPayment,
+  overpaymentOf,
+  overpaymentWarning,
+  PAYMENT_TYPES,
+  paymentAmountInput,
+  paymentTypeMismatch,
   readInvoice,
   ref,
+  SETTLING_PAYMENT_TYPES,
+  STATUS_CHANGE_ANNOTATIONS,
+  shapedOutput,
 } from "./write-common.js";
 
 /**
@@ -34,31 +45,6 @@ import {
  * the preview only reads. These tools cannot declare an outputSchema, so
  * each handler result is checked against the schema defined here.
  */
-
-const STATUS_CHANGE_ANNOTATIONS: StrictToolAnnotations = {
-  readOnlyHint: false,
-  destructiveHint: true,
-  idempotentHint: true,
-  openWorldHint: true,
-};
-
-const IRREVERSIBLE_ANNOTATIONS: StrictToolAnnotations = {
-  readOnlyHint: false,
-  destructiveHint: true,
-  idempotentHint: false,
-  openWorldHint: true,
-};
-
-/**
- * The handler result checked against its schema. The action has already
- * happened at this point, so a mismatch is logged and the result returned
- * anyway: an error here would invite a second booking or e-mail.
- */
-function shaped<S extends z.ZodType>(schema: S, value: z.infer<S>, logger: Logger, tool: string) {
-  const parsed = schema.safeParse(value);
-  if (!parsed.success) logger.error("tool output does not match its schema", { tool });
-  return parsed.success ? parsed.data : value;
-}
 
 const invoiceIdInput = entityId.describe("sevdesk ID of the invoice (search_invoices).");
 
@@ -79,17 +65,10 @@ function invoiceFacts(invoice: InvoiceState, contactName: string | null) {
   };
 }
 
-/** One line of free text for the approval question; line breaks could fake extra lines. */
-const oneLine = (value: string | null, max = 200): string => {
-  const flat = (value ?? "").replace(/\s+/g, " ").trim();
-  if (flat.length <= max) return flat;
-  return max <= 0 ? "" : `${flat.slice(0, max - 1)}…`;
-};
-
 /** "RE-1001 (ID 1001) for Muster GmbH, gross 119 EUR" from the preview's read. */
 function invoiceLine(invoice: InvoiceState, contactName: string | null): string {
-  const customer = contactName ? ` for ${oneLine(contactName, 100)}` : "";
-  return `${oneLine(invoiceLabel(invoice), 120)}${customer}, gross ${money(invoice.sumGross, invoice.currency)}`;
+  const customer = contactName ? ` for ${oneLineText(contactName, 100)}` : "";
+  return `${oneLineText(invoiceLabel(invoice), 120)}${customer}, gross ${money(invoice.sumGross, invoice.currency)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +140,7 @@ export const markInvoiceSent = defineTool({
     const returned = objectsOf(body)[0];
     // sevdesk answers with the invoice; if not, report what is known.
     const invoice = returned ? mapInvoiceState(returned) : before;
-    const output = shaped(
+    const output = shapedOutput(
       markSentOutput,
       {
         invoice,
@@ -183,9 +162,6 @@ export const markInvoiceSent = defineTool({
 // ---------------------------------------------------------------------------
 // book_invoice_payment
 
-const PAYMENT_TYPES = ["FULL_PAYMENT", "N", "CB", "O", "OF", "MTC"] as const;
-type PaymentType = (typeof PAYMENT_TYPES)[number];
-
 const bookOutput = z.object({
   invoiceId: z.number().int(),
   invoiceNumber: z.string().nullable(),
@@ -197,38 +173,15 @@ const bookOutput = z.object({
   openAfterExpected: z
     .number()
     .nullable()
-    .describe("Open amount before minus the booking, at least 0."),
+    .describe(
+      "Open amount before minus the booking, at least 0; 0 for CB, MTC and O (expected settled).",
+    ),
   overpayment: z.number().describe("Amount above the open amount, 0 if none."),
   logId: z.number().int().nullable().describe("ID of sevdesk's booking log entry."),
 });
 
-/** Whether the amount has at most two decimals (whole cents). */
-const wholeCents = (value: number) => Math.abs(value * 100 - Math.round(value * 100)) < 1e-6;
-
 const openOf = (invoice: InvoiceState) => invoice.openAmount;
 const bookable = (invoice: InvoiceState) => invoice.status === 200 || invoice.status === 750;
-
-/**
- * Hint when the chosen type does not fit the amount and the open amount.
- * Only a warning: which type is right is the bookkeeper's decision.
- */
-function typeMismatch(type: PaymentType, amount: number, open: number | null): string | undefined {
-  if (open === null) return undefined;
-  const diff = cents(amount - open);
-  if (type === "FULL_PAYMENT" && diff !== 0) {
-    return `FULL_PAYMENT expects the open amount (${open}), not ${amount}; use N for a partial payment, CB, MTC or O for a reduced amount, OF for reminder fees.`;
-  }
-  if (type === "N" && diff >= 0) {
-    return `N books a partial payment, but ${amount} covers the open amount of ${open}; FULL_PAYMENT may fit better.`;
-  }
-  if ((type === "CB" || type === "MTC") && diff >= 0) {
-    return `${type} is for a payment below the open amount (${open}), not ${amount}.`;
-  }
-  if (type === "OF" && diff <= 0) {
-    return `OF is for a payment above the open amount (${open}) because of reminder fees, not ${amount}.`;
-  }
-  return undefined;
-}
 
 export const bookInvoicePayment = defineTool({
   name: "book_invoice_payment",
@@ -249,12 +202,7 @@ export const bookInvoicePayment = defineTool({
   operations: ["getInvoiceById", "getContactById", "getCheckAccountById"],
   inputSchema: z.object({
     invoiceId: invoiceIdInput,
-    amount: z
-      .number()
-      .positive()
-      .max(1_000_000_000)
-      .refine(wholeCents, { error: "must have at most two decimal places" })
-      .describe("Amount paid, in invoice currency, at most two decimals."),
+    amount: paymentAmountInput.describe("Amount paid, in invoice currency, at most two decimals."),
     // Required: a default would be resolved again at execution, possibly on
     // another day than the preview showed, and is not bound to the token.
     date: isoDate.describe("Payment date YYYY-MM-DD (German calendar)."),
@@ -280,14 +228,11 @@ export const bookInvoicePayment = defineTool({
           "partially paid invoices, so the booking will be refused.",
       );
     }
-    const overpayment = open === null ? 0 : Math.max(0, cents(args.amount - open));
-    // OF (reminder fees) and O (other difference) are meant for a higher amount.
-    if (overpayment > 0 && args.paymentType !== "OF" && args.paymentType !== "O") {
-      warnings.push(
-        `Overpayment: ${args.amount} is ${overpayment} more than the open amount of ${open}.`,
-      );
+    const overpayment = overpaymentOf(args.amount, open);
+    if (overpayment > 0 && !OVERPAYING_PAYMENT_TYPES.includes(args.paymentType)) {
+      warnings.push(overpaymentWarning(args.amount, overpayment, open));
     }
-    const mismatch = typeMismatch(args.paymentType, args.amount, open);
+    const mismatch = paymentTypeMismatch(args.paymentType, args.amount, open);
     if (mismatch) warnings.push(mismatch);
     let checkAccount: { id: number; name: string | null } = { id: args.checkAccountId, name: null };
     const { sevdesk } = call;
@@ -312,7 +257,10 @@ export const bookInvoicePayment = defineTool({
         checkAccountTransactionId: args.checkAccountTransactionId,
       }),
       openBefore: open,
-      openAfter: open === null ? null : Math.max(0, cents(open - args.amount)),
+      openAfter: openAfterPayment(args.paymentType, args.amount, open),
+      // Expected only: the spec says these types settle the rest, not that
+      // sevdesk then lists the invoice as paid.
+      expectedSettled: SETTLING_PAYMENT_TYPES.includes(args.paymentType),
       overpayment,
       warnings,
     };
@@ -329,6 +277,16 @@ export const bookInvoicePayment = defineTool({
       );
     }
     const open = openOf(invoice);
+    // The open amount may have dropped since the preview (another payment);
+    // an overpayment sevdesk can only book as O or OF is refused here.
+    const overpayment = overpaymentOf(args.amount, open);
+    if (overpayment > 0 && !OVERPAYING_PAYMENT_TYPES.includes(args.paymentType)) {
+      throw badInput(
+        `Invoice ${args.invoiceId} has ${open} open now; ${args.amount} would overpay it by ` +
+          `${overpayment}; this server refuses overpayments without type O or OF. Nothing was ` +
+          "booked; call the tool again without confirmation_token for a new preview.",
+      );
+    }
     const date = args.date;
     const { sevdesk } = call;
     const body = await sevdesk.call(
@@ -345,8 +303,7 @@ export const bookInvoicePayment = defineTool({
         },
       }),
     );
-    const overpayment = open === null ? 0 : Math.max(0, cents(args.amount - open));
-    const output = shaped(
+    const output = shapedOutput(
       bookOutput,
       {
         invoiceId: args.invoiceId,
@@ -356,9 +313,9 @@ export const bookInvoicePayment = defineTool({
         paymentType: args.paymentType,
         checkAccountId: args.checkAccountId,
         openBefore: open,
-        openAfterExpected: open === null ? null : Math.max(0, cents(open - args.amount)),
+        openAfterExpected: openAfterPayment(args.paymentType, args.amount, open),
         overpayment,
-        logId: integer((body as { objects?: { id?: unknown } } | undefined)?.objects?.id),
+        logId: bookingLogId(body),
       },
       call.logger,
       "book_invoice_payment",
@@ -402,12 +359,12 @@ export function emailApproval(
     `${copies.length > 0 ? ` (${copies.join("; ")})` : ""}.`;
   const tail =
     ` Attachment: ${args.sendXml ? "e-invoice XML" : "PDF"}.` +
-    `${warnings.length > 0 ? ` Warnings: ${warnings.map((w) => oneLine(w, Number.MAX_SAFE_INTEGER)).join(" ")}` : ""}`;
+    `${warnings.length > 0 ? ` Warnings: ${warnings.map((w) => oneLineText(w, Number.MAX_SAFE_INTEGER)).join(" ")}` : ""}`;
   const frame = (subject: string, body: string) => ` Subject: "${subject}". Text: "${body}".`;
   const room = MAX_APPROVAL_FACTS_LENGTH - head.length - tail.length - frame("", "").length;
   if (room < 0) return head + tail;
-  const subject = oneLine(args.subject, Math.min(200, room));
-  const body = oneLine(args.text, Math.min(160, room - subject.length));
+  const subject = oneLineText(args.subject, Math.min(200, room));
+  const body = oneLineText(args.text, Math.min(160, room - subject.length));
   return head + frame(subject, body) + tail;
 }
 
@@ -538,7 +495,7 @@ export const sendInvoiceEmail = defineTool({
       }),
     );
     const email = objectsOf(body)[0];
-    const output = shaped(
+    const output = shapedOutput(
       emailOutput,
       {
         invoiceId: args.invoiceId,
@@ -613,7 +570,7 @@ export const cancelInvoice = defineTool({
     );
     const raw = objectsOf(body)[0];
     const cancellation = raw ? mapInvoiceState(raw) : null;
-    const output = shaped(
+    const output = shapedOutput(
       cancelOutput,
       {
         cancelledInvoiceId: args.invoiceId,

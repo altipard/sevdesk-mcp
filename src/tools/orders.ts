@@ -101,7 +101,7 @@ export const searchOrders = defineTool({
     orders: z.array(orderSummarySchema),
     page: pageSchema.describe(
       "sevdesk's list before the orderType filter: total, count and hasMore refer to all " +
-        "types; continue with offset + limit.",
+        "types; continue with nextOffset.",
     ),
     orderTypeFilter: z
       .object({
@@ -149,7 +149,7 @@ export const searchOrders = defineTool({
           kept: orders.length,
           note:
             "sevdesk has no orderType filter: it was applied to this page only. page.total " +
-            "counts all order types; more matches may follow at offset + limit.",
+            "counts all order types; more matches may follow at page.nextOffset.",
         },
       },
       {

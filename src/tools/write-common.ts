@@ -658,8 +658,8 @@ export function money(value: number | null, currency: string | null): string {
 }
 
 // ---------------------------------------------------------------------------
-// Status changes and irreversible actions (shared by the voucher and
-// document tools; invoice-actions.ts keeps its own copies for now)
+// Status changes and irreversible actions (shared by the invoice, voucher
+// and document tools)
 
 /** Changes a status; the same call twice leaves the same state. */
 export const STATUS_CHANGE_ANNOTATIONS: StrictToolAnnotations = {
@@ -716,6 +716,43 @@ export const paymentAmountInput = z
   .positive()
   .max(1_000_000_000)
   .refine(wholeCents, { error: "must have at most two decimal places" });
+
+/** Types that settle the document whatever is left open (cash discount, bank charges, other). */
+export const SETTLING_PAYMENT_TYPES: readonly PaymentType[] = ["CB", "MTC", "O"];
+/**
+ * Types this server books above the open amount. Any other type that would
+ * overpay is refused at execution, also when the open amount only dropped
+ * after the preview.
+ */
+export const OVERPAYING_PAYMENT_TYPES: readonly PaymentType[] = ["O", "OF"];
+
+/** Open amount expected after the booking: 0 for settling types, else open minus the amount. */
+export function openAfterPayment(
+  type: PaymentType,
+  paid: number,
+  open: number | null,
+): number | null {
+  if (open === null) return null;
+  return SETTLING_PAYMENT_TYPES.includes(type) ? 0 : Math.max(0, cents(open - paid));
+}
+
+/** Amount above the open amount, 0 if none or unknown. */
+export function overpaymentOf(paid: number, open: number | null): number {
+  return open === null ? 0 : Math.max(0, cents(paid - open));
+}
+
+/** The preview's warning for an overpayment the chosen type cannot book. */
+export function overpaymentWarning(paid: number, overpayment: number, open: number | null): string {
+  return (
+    `Overpayment: ${paid} is ${overpayment} more than the open amount of ${open}. ` +
+    "Without type O or OF this server refuses the booking at execution."
+  );
+}
+
+/** The booking log entry's ID: wrapped in `objects` as sevdesk usually answers, or bare as in the spec. */
+export function bookingLogId(body: unknown): number | null {
+  return integer((objectsOf(body)[0] ?? asRecord(body)).id);
+}
 
 /**
  * Hint when the chosen type does not fit the amount and the open amount.

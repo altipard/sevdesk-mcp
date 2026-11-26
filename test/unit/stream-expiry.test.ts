@@ -1,6 +1,6 @@
 import { DEFAULT_MAX_REQUEST_BODY_SIZE } from "@modelcontextprotocol/server";
 import { describe, expect, it } from "vitest";
-import { endStreamAt, isLongLivedStream } from "../../src/http/app.js";
+import { endStreamAt, HTTP_MAX_REQUEST_BODY_BYTES, isLongLivedStream } from "../../src/http/app.js";
 
 function endless(onCancel: (reason: unknown) => void): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
@@ -86,15 +86,21 @@ describe("isLongLivedStream", () => {
     expect(
       await isLongLivedStream(
         post(rpc("subscriptions/listen"), {
-          "content-length": String(DEFAULT_MAX_REQUEST_BODY_SIZE + 1),
+          "content-length": String(HTTP_MAX_REQUEST_BODY_BYTES + 1),
         }),
       ),
     ).toBe(false);
-    const big = `{"method":"subscriptions/listen","pad":"${"x".repeat(DEFAULT_MAX_REQUEST_BODY_SIZE)}"}`;
+    const big = `{"method":"subscriptions/listen","pad":"${"x".repeat(HTTP_MAX_REQUEST_BODY_BYTES)}"}`;
     expect(await isLongLivedStream(post(big))).toBe(false);
     expect(await isLongLivedStream(new Request("http://127.0.0.1/mcp", { method: "DELETE" }))).toBe(
       false,
     );
+  });
+
+  it("counts a listen padded past the SDK default, up to the body limit the handler takes", async () => {
+    // Otherwise padding would let a subscription escape the cut at token expiry.
+    const padded = `{"method":"subscriptions/listen","pad":"${"x".repeat(DEFAULT_MAX_REQUEST_BODY_SIZE)}"}`;
+    expect(await isLongLivedStream(post(padded))).toBe(true);
   });
 
   it("leaves the body readable for the handler", async () => {

@@ -118,8 +118,52 @@ describe("RedisNonceStore", () => {
       await expect(store.consume("a", 1000)).rejects.toThrow(NonceStoreUnavailableError);
     });
 
+    it("rejects an unexpected reply to has() instead of reading it as absent", async () => {
+      const redis: RedisCommands = {
+        isReady: true,
+        set: async () => "OK",
+        get: async (key) => (key.endsWith("sentinel") ? "s" : 1),
+        del: async () => 1,
+      };
+      const store = new RedisNonceStore(redis);
+      await store.initialize();
+      await expect(store.has("a")).rejects.toThrow(NonceStoreUnavailableError);
+    });
+
     it("refuses to consume before initialize()", async () => {
       await expect(new RedisNonceStore(new FakeRedis()).consume("a", 1000)).rejects.toThrow(
+        "before initialize",
+      );
+    });
+  });
+
+  describe("has", () => {
+    it("reads with GET under the key prefix and never writes", async () => {
+      const { redis, store } = await ready();
+      expect(await store.has("marker")).toBe(false);
+      await store.consume("marker", 1000);
+      expect(await store.has("marker")).toBe(true);
+      expect(sets(redis)).toHaveLength(1);
+      expect(redis.calls.filter((c) => c.command === "DEL")).toEqual([]);
+      expect(redis.calls.filter((c) => c.command === "GET").map((c) => c.key)).toContain(
+        "sevdesk-mcp:marker",
+      );
+    });
+
+    it("fails closed: disconnected, no answer in time, lost data", async () => {
+      const { redis, store } = await ready();
+      redis.isReady = false;
+      await expect(store.has("a")).rejects.toThrow(NonceStoreUnavailableError);
+      redis.isReady = true;
+      redis.hang = true;
+      await expect(store.has("a")).rejects.toThrow("Redis did not answer in time");
+      redis.hang = false;
+      redis.flush();
+      await expect(store.has("a")).rejects.toThrow(NonceStoreStateLostError);
+    });
+
+    it("refuses before initialize()", async () => {
+      await expect(new RedisNonceStore(new FakeRedis()).has("a")).rejects.toThrow(
         "before initialize",
       );
     });

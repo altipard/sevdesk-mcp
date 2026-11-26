@@ -39,6 +39,9 @@ export const isoDate = z
 
 export const entityId = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
 
+/** Highest offset the list tools accept. */
+export const MAX_OFFSET = 1_000_000;
+
 export const pageInput = {
   limit: z
     .number()
@@ -51,7 +54,7 @@ export const pageInput = {
     .number()
     .int()
     .min(0)
-    .max(1_000_000)
+    .max(MAX_OFFSET)
     .default(0)
     .describe("Number of results to skip, for paging."),
 };
@@ -81,6 +84,14 @@ export const pageSchema = z.object({
   count: z.number().int().describe("Number of results in this answer."),
   total: z.number().int().nullable().describe("All matching results, null if sevdesk did not say."),
   hasMore: z.boolean().describe("More results exist after this page (raise offset)."),
+  nextOffset: z
+    .number()
+    .int()
+    .nullable()
+    .describe(
+      "offset for the next page: this page's offset plus limit, whatever count is. null when " +
+        "nothing more comes, or when it would exceed the highest offset accepted.",
+    ),
 });
 export type Page = z.infer<typeof pageSchema>;
 
@@ -412,14 +423,28 @@ export function totalOf(body: unknown): number | null {
   return integer(asRecord(body).total);
 }
 
-export function pageOf(offset: number, limit: number, count: number, total: number | null): Page {
+/**
+ * The page for a request of `limit` results from `offset`. `hasMore`
+ * defaults to the total, or without one to a full page; callers that know
+ * better pass it. nextOffset follows the requested range, not the results:
+ * a page thinned out by a filter or by objects that vanished would
+ * otherwise send the client over part of the same range again.
+ */
+export function pageOf(
+  offset: number,
+  limit: number,
+  count: number,
+  total: number | null,
+  hasMore: boolean = total === null ? count >= limit : offset + count < total,
+): Page {
+  const next = offset + limit;
   return {
     offset,
     limit,
     count,
     total,
-    // Without a total, a full page is the only hint that more may follow.
-    hasMore: total === null ? count >= limit : offset + count < total,
+    hasMore,
+    nextOffset: hasMore && next <= MAX_OFFSET ? next : null,
   };
 }
 

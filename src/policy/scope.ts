@@ -257,18 +257,22 @@ export function createScopeGate(env: GateEnv): RequestGate {
   };
 }
 
-/** Scope of a curated tool: its main operation plus the ones it lists. */
+/**
+ * Scope of a curated tool: its main operation plus the ones it lists. An
+ * operationId picked per call (a function) adds nothing here; what it can
+ * pick has to be listed in `operations`.
+ */
 export function toolScope(tool: {
   readonly name: string;
   readonly class: OperationClass;
-  readonly operationId?: OperationId | undefined;
+  readonly operationId?: OperationId | ((args: never) => OperationId) | undefined;
   readonly operations?: readonly OperationId[] | undefined;
 }): ClientScope {
   return {
     tool: tool.name,
     class: tool.class,
     operations: new Set([
-      ...(tool.operationId ? [tool.operationId] : []),
+      ...(typeof tool.operationId === "string" ? [tool.operationId] : []),
       ...(tool.operations ?? []),
     ]),
   };
@@ -317,12 +321,12 @@ export function genericScope(
  */
 export function scopeProblems(tool: {
   readonly class: OperationClass;
-  readonly operationId?: string | undefined;
+  readonly operationId?: string | ((args: never) => string) | undefined;
   readonly operations?: readonly string[] | undefined;
 }): string[] {
   const problems: string[] = [];
   const declared = [
-    ...(tool.operationId !== undefined ? [["operationId", tool.operationId] as const] : []),
+    ...(typeof tool.operationId === "string" ? [["operationId", tool.operationId] as const] : []),
     ...(tool.operations ?? []).map((id) => ["operations", id] as const),
   ];
   for (const [field, id] of declared) {

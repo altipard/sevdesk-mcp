@@ -41,8 +41,13 @@ export interface ToolDefinition<S extends ObjectSchema = ObjectSchema> {
   readonly title: string;
   readonly description: string;
   readonly class: OperationClass;
-  /** Main sevdesk operation, for audit events and idempotency keys. */
-  readonly operationId?: OperationId;
+  /**
+   * Main sevdesk operation, for audit events and idempotency keys. A
+   * function picks it from the arguments when the tool reaches several
+   * operations (e.g. invoiceEnshrine or voucherEnshrine); every result it
+   * can return must be listed in `operations`, otherwise the call is refused.
+   */
+  readonly operationId?: OperationId | ((args: z.infer<S>) => OperationId);
   /**
    * Further operations the handler calls besides operationId. The client a
    * handler gets sends nothing else: requests to other operations, or to
@@ -69,6 +74,27 @@ export interface ToolDefinition<S extends ObjectSchema = ObjectSchema> {
 
 export class ToolDefinitionError extends Error {
   override readonly name = "ToolDefinitionError";
+}
+
+/**
+ * The operation a call acts on: the fixed operationId, or the one the
+ * definition picks from the arguments. A picked operation outside the
+ * tool's declared operations is a definition error, so the call fails
+ * instead of being audited or locked under an operation it cannot reach.
+ */
+export function resolveOperationId<S extends ObjectSchema>(
+  definition: ToolDefinition<S>,
+  args: z.infer<S>,
+): OperationId | undefined {
+  const { operationId } = definition;
+  if (typeof operationId !== "function") return operationId;
+  const picked = operationId(args);
+  if (!definition.operations?.includes(picked)) {
+    throw new ToolDefinitionError(
+      `tool ${definition.name}: operationId ${String(picked)} is not listed in operations`,
+    );
+  }
+  return picked;
 }
 
 const needsConfirmation = (operationClass: OperationClass) =>
@@ -100,6 +126,9 @@ export function defineTool<S extends ObjectSchema>(
     }
   }
   if (definition.class === "X" && definition.targetId === undefined) fail("class X needs targetId");
+  if (typeof definition.operationId === "function" && !definition.operations?.length) {
+    fail("an operationId picked from the arguments needs the candidates in operations");
+  }
   const problems = scopeProblems(definition);
   if (problems.length > 0) fail(problems.join("; "));
   return definition;
@@ -273,10 +302,25 @@ export function registerTools(
         const args = (confirm ? rest : input) as z.infer<typeof definition.inputSchema>;
         const call: ToolCall = { ...deps, config, sevdesk, ctx };
         const previewCall: ToolCall = { ...call, sevdesk: previewClient };
+        let operationId: OperationId | undefined;
+        try {
+          operationId = resolveOperationId(definition, args);
+        } catch (error) {
+          deps.logger.error("tool definition error", { tool: definition.name, error });
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: `${definition.name} failed inside the server; nothing was sent to sevdesk.`,
+              },
+            ],
+          };
+        }
         return runGuarded({ policy, server, logger: deps.logger }, ctx, {
           key: definition.name,
           tool: definition.name,
-          operationId: definition.operationId,
+          operationId,
           class: definition.class,
           args: args as Record<string, unknown>,
           confirmationToken: typeof token === "string" && token !== "" ? token : undefined,

@@ -1,5 +1,6 @@
 import { extractWWWAuthenticateParams, InsufficientScopeError } from "@modelcontextprotocol/client";
 import { describe, expect, it } from "vitest";
+import { STATE_LOST_TEXT } from "../../src/policy/guard.js";
 import {
   ALL_SCOPES,
   ERAS,
@@ -246,8 +247,10 @@ describe("the token subject flows into confirmation tokens and the audit trail",
     s.redis.flush();
     const replay = await client.callTool(update(first.confirmation_token));
     expect(replay.isError).toBe(true);
-    expect(textOf(replay)).toContain("replay protection store is unavailable");
+    expect(textOf(replay)).toBe(STATE_LOST_TEXT);
+    expect(textOf(replay)).not.toMatch(/redis|sentinel|appendonly/i);
     expect(fx.sevdesk.seen.filter((r) => r.method === "PUT")).toHaveLength(1);
+    expect(s.audit().at(-1)).toMatchObject({ outcome: "denied", reason: "nonce_store_state_lost" });
     const log = s.logLines.join("");
     expect(log).toContain("NonceStoreStateLostError");
     expect(log).toContain("until the server is restarted");

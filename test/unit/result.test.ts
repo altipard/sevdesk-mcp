@@ -39,11 +39,11 @@ describe("okResult size budget", () => {
     const data = present(
       {
         items: entries(100),
-        page: { offset: 0, limit: 100, count: 100, total: 250, hasMore: true },
+        page: { offset: 50, limit: 100, count: 100, total: 250, hasMore: true, nextOffset: 150 },
         truncated: false,
         note: "Earlier note.",
       },
-      { summary: "100 of 250 items (offset 0, more available)." },
+      { summary: "100 of 250 items (offset 50, more available)." },
     );
     const result = okResult(data);
     const text = textOf(result);
@@ -59,7 +59,45 @@ describe("okResult size budget", () => {
     expect(json.truncated).toBe(true);
     expect(json.note.startsWith("Earlier note. Answer cut")).toBe(true);
     expect(json.page).toMatchObject({ count: json.items.length, hasMore: true, total: 250 });
+    // The next page starts after the entries kept, so the cut ones are not skipped.
+    expect(json.page.nextOffset).toBe(50 + json.items.length);
     expect(json.items.map((i) => i.id)).toEqual(json.items.map((_, i) => i));
+  });
+
+  it("never lets nextOffset skip cut entries of a page filtered after fetching", () => {
+    // 100 fetched orders, 60 kept by the orderType filter, then cut to fit.
+    const data = present(
+      {
+        orders: entries(60),
+        page: { offset: 200, limit: 100, count: 100, total: 900, hasMore: true, nextOffset: 300 },
+        orderTypeFilter: { orderType: "AB", fetched: 100, kept: 60 },
+      },
+      { summary: "60 of 100 fetched orders are AB." },
+    );
+    const json = JSON.parse(textOf(okResult(data)).split("\n")[1] ?? "") as {
+      orders: unknown[];
+      page: Record<string, unknown>;
+      note: string;
+    };
+    expect(json.orders.length).toBeGreaterThan(0);
+    expect(json.orders.length).toBeLessThan(60);
+    // The k-th kept entry is at fetched position k or later: offset + k skips nothing.
+    expect(json.page).toMatchObject({
+      count: 100,
+      hasMore: true,
+      nextOffset: 200 + json.orders.length,
+    });
+    expect(json.note).toContain("may repeat entries already returned");
+  });
+
+  it("gives no nextOffset when not a single entry fits", () => {
+    const huge = [{ id: 1, text: "x".repeat(MAX_TOOL_RESPONSE_CHARS) }];
+    const data = {
+      items: huge,
+      page: { offset: 0, limit: 1, count: 1, total: 5, hasMore: true, nextOffset: 1 },
+    };
+    const json = JSON.parse(textOf(okResult(data))) as { page: Record<string, unknown> };
+    expect(json.page).toMatchObject({ count: 0, hasMore: true, nextOffset: null });
   });
 
   it("cuts the largest list first and leaves small ones whole", () => {
