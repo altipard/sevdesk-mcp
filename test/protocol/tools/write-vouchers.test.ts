@@ -297,6 +297,7 @@ describe("create_voucher (W)", () => {
   it("accepts a file of exactly the limit", async () => {
     const atLimit = Buffer.alloc(MAX_VOUCHER_FILE_BYTES, 0x20);
     PDF_BYTES.copy(atLimit);
+    PDF_BYTES.copy(atLimit, atLimit.length - PDF_BYTES.length);
     api.server.use(readSupplier, guidance(), uploadHandler([]), saved());
     const c = await connectWrites({ config: { mode: "write" } });
     const result = await c.call("create_voucher", {
@@ -323,6 +324,33 @@ describe("create_voucher (W)", () => {
     });
     expect(textOf(far)).toContain("is not a application/pdf file");
     expect(received).toHaveLength(1);
+  });
+
+  it("refuses a polyglot with %PDF- in a preamble but no %%EOF at the end", async () => {
+    api.server.use(readSupplier, guidance(), uploadHandler([]), saved());
+    const c = await connectWrites({ config: { mode: "write" } });
+    const polyglot = Buffer.concat([
+      Buffer.from("%PDF-1.4\n", "latin1"),
+      Buffer.alloc(2048, 0x41),
+      Buffer.from("<html><script>x()</script></html>\n", "latin1"),
+    ]);
+    const result = await c.call("create_voucher", {
+      ...base,
+      file: { ...pdfFile, content: polyglot.toString("base64") },
+    });
+    expect(textOf(result)).toContain("is not a application/pdf file");
+    expect(api.requests).toHaveLength(0);
+  });
+
+  it("refuses a PDF whose %%EOF lies before the last 1024 bytes", async () => {
+    const c = await connectWrites({ config: { mode: "write" } });
+    const trailing = Buffer.concat([PDF_BYTES, Buffer.alloc(1024, 0x20)]);
+    const result = await c.call("create_voucher", {
+      ...base,
+      file: { ...pdfFile, content: trailing.toString("base64") },
+    });
+    expect(textOf(result)).toContain("is not a application/pdf file");
+    expect(api.requests).toHaveLength(0);
   });
 
   it("accepts canonical padding of both lengths", async () => {
@@ -638,8 +666,8 @@ describe("book_voucher_payment (W+)", () => {
       "Warnings: Overpayment: 55 is 15 more than the open amount of 40. Without type O or OF",
     );
     expect(over.preview.warnings).toEqual([
-      "Overpayment: 55 is 15 more than the open amount of 40. Without type O or OF the " +
-        "booking will be refused at execution.",
+      "Overpayment: 55 is 15 more than the open amount of 40. Without type O or OF this server refuses the " +
+        "booking at execution.",
       "FULL_PAYMENT expects the open amount (40), not 55; use N for a partial payment, CB, " +
         "MTC or O for a reduced amount, OF for reminder fees.",
     ]);
@@ -651,7 +679,7 @@ describe("book_voucher_payment (W+)", () => {
     expect(writes()).toEqual([]);
   });
 
-  it("shows CB, MTC and O as settled with nothing left open", async () => {
+  it("shows CB, MTC and O as expected settled with nothing left open", async () => {
     api.server.use(readVoucher(unpaid), readSupplier, account);
     const c = await connectWrites({ config: { mode: "write" } });
     for (const paymentType of ["CB", "MTC", "O"]) {
@@ -660,15 +688,19 @@ describe("book_voucher_payment (W+)", () => {
         amount: 38,
         paymentType,
       });
-      expect(preview, paymentType).toMatchObject({ openBefore: 40, openAfter: 0, settled: true });
-      expect(preview.approval as string, paymentType).toContain("open 40 -> 0 (settled).");
+      expect(preview, paymentType).toMatchObject({
+        openBefore: 40,
+        openAfter: 0,
+        expectedSettled: true,
+      });
+      expect(preview.approval as string, paymentType).toContain("open 40 -> 0 (expected settled).");
     }
     const partial = await previewOf(c, "book_voucher_payment", {
       ...args,
       amount: 38,
       paymentType: "N",
     });
-    expect(partial.preview).toMatchObject({ openAfter: 2, settled: false });
+    expect(partial.preview).toMatchObject({ openAfter: 2, expectedSettled: false });
   });
 
   it("refuses an enshrined voucher in the preview and at execution", async () => {
@@ -681,7 +713,7 @@ describe("book_voucher_payment (W+)", () => {
     const c = await connectWrites({ config: { mode: "write" } });
     const result = await c.call("book_voucher_payment", args);
     expect(textOf(result)).toBe(
-      "Voucher 8001 is enshrined (festgeschrieben); sevdesk does not book payments on " +
+      "Voucher 8001 is enshrined (festgeschrieben); this server refuses payments on " +
         "enshrined vouchers. Nothing was booked.",
     );
     expect(result.structuredContent).toBeUndefined();
@@ -717,8 +749,8 @@ describe("book_voucher_payment (W+)", () => {
     const c = await connectWrites({ config: { mode: "write" } });
     const { result } = await confirm(c, "book_voucher_payment", args);
     expect(textOf(result)).toBe(
-      "Voucher 8001 has 20 open now; 40 would overpay it by 20, which only type O or OF can " +
-        "book. Nothing was booked; call the tool again without confirmation_token for a new preview.",
+      "Voucher 8001 has 20 open now; 40 would overpay it by 20; this server refuses " +
+        "overpayments without type O or OF. Nothing was booked; call the tool again without confirmation_token for a new preview.",
     );
     expect(writes()).toEqual([]);
   });

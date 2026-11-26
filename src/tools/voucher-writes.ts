@@ -106,8 +106,13 @@ function canonicalPadding(content: string): boolean {
   return (last & (padding === 2 ? 0x0f : 0x03)) === 0;
 }
 
-/** PDF readers accept the header anywhere in the first 1024 bytes. */
-const PDF_HEADER_WINDOW = 1024;
+/**
+ * PDF readers accept the header anywhere in the first 1024 bytes and look
+ * for the end marker in the last 1024. Requiring both keeps out files that
+ * only carry "%PDF-" in a preamble (polyglots).
+ */
+const PDF_WINDOW = 1024;
+const PDF_END = Buffer.from("%%EOF", "latin1");
 
 /**
  * The decoded file, or an input error: strict base64 (Buffer.from skips
@@ -136,11 +141,12 @@ export function decodeVoucherFile(file: FileInput): Buffer {
   const type = FILE_TYPES[mimeType];
   const matches =
     mimeType === "application/pdf"
-      ? bytes.subarray(0, PDF_HEADER_WINDOW).includes(Buffer.from(type.magic[0]))
+      ? bytes.subarray(0, PDF_WINDOW).includes(Buffer.from(type.magic[0])) &&
+        bytes.subarray(Math.max(0, bytes.length - PDF_WINDOW)).includes(PDF_END)
       : type.magic.some((magic) => magic.every((byte, i) => bytes[i] === byte));
   if (!matches) {
     throw badInput(
-      `The file content is not a ${mimeType} file (its first bytes do not match). Only PDF, ` +
+      `The file content is not a ${mimeType} file (its start or end markers do not match). Only PDF, ` +
         "PNG and JPEG are accepted. Nothing was sent.",
     );
   }
@@ -474,7 +480,7 @@ function openAfter(type: PaymentType, paid: number, open: number | null): number
 }
 
 const enshrinedText = (id: number) =>
-  `Voucher ${id} is enshrined (festgeschrieben); sevdesk does not book payments on enshrined ` +
+  `Voucher ${id} is enshrined (festgeschrieben); this server refuses payments on enshrined ` +
   "vouchers. Nothing was booked.";
 
 const bookVoucherOutput = z.object({
@@ -488,7 +494,9 @@ const bookVoucherOutput = z.object({
   openAfterExpected: z
     .number()
     .nullable()
-    .describe("Open amount before minus the booking, at least 0; 0 for CB, MTC and O (settled)."),
+    .describe(
+      "Open amount before minus the booking, at least 0; 0 for CB, MTC and O (expected settled).",
+    ),
   overpayment: z.number().describe("Amount above the open amount, 0 if none."),
   logId: z.number().int().nullable().describe("ID of sevdesk's booking log entry."),
 });
@@ -544,11 +552,13 @@ export const bookVoucherPayment = defineTool({
     if (overpayment > 0 && !OVERPAYING.includes(args.paymentType)) {
       warnings.push(
         `Overpayment: ${args.amount} is ${overpayment} more than the open amount of ${open}. ` +
-          "Without type O or OF the booking will be refused at execution.",
+          "Without type O or OF this server refuses the booking at execution.",
       );
     }
     const after = openAfter(args.paymentType, args.amount, open);
-    const settled = SETTLING.includes(args.paymentType);
+    // Expected only: the spec says these types settle the rest, not that
+    // sevdesk then lists the voucher as paid.
+    const expectedSettled = SETTLING.includes(args.paymentType);
     const mismatch = paymentTypeMismatch(args.paymentType, args.amount, open);
     if (mismatch) warnings.push(mismatch);
     let checkAccount: { id: number; name: string | null } = { id: args.checkAccountId, name: null };
@@ -569,7 +579,7 @@ export const bookVoucherPayment = defineTool({
         `Book ${money(args.amount, voucher.currency)} (${args.paymentType}) dated ${args.date} on ` +
         `${documentLine(voucher)} to check account ${args.checkAccountId}` +
         `${checkAccount.name ? ` (${oneLineText(checkAccount.name, 100)})` : ""}; open ` +
-        `${open ?? "unknown"} -> ${after ?? "unknown"}${settled ? " (settled)" : ""}.` +
+        `${open ?? "unknown"} -> ${after ?? "unknown"}${expectedSettled ? " (expected settled)" : ""}.` +
         `${warnings.length > 0 ? ` Warnings: ${warnings.join(" ")}` : ""}`,
       voucher,
       amount: args.amount,
@@ -581,7 +591,7 @@ export const bookVoucherPayment = defineTool({
       }),
       openBefore: open,
       openAfter: after,
-      settled,
+      expectedSettled,
       overpayment,
       warnings,
     };
@@ -608,7 +618,7 @@ export const bookVoucherPayment = defineTool({
     if (overpayment > 0 && !OVERPAYING.includes(args.paymentType)) {
       throw badInput(
         `Voucher ${args.voucherId} has ${open} open now; ${args.amount} would overpay it by ` +
-          `${overpayment}, which only type O or OF can book. Nothing was booked; call the tool ` +
+          `${overpayment}; this server refuses overpayments without type O or OF. Nothing was booked; call the tool ` +
           "again without confirmation_token for a new preview.",
       );
     }
