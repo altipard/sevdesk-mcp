@@ -33,12 +33,16 @@
   },
   "scripts": {
     "gen": "node scripts/gen.mjs",
-    "build": "npm run gen && tsc -p tsconfig.build.json",
+    "build": "npm run gen && npm run build:tsc",
+    "build:tsc": "tsc -p tsconfig.build.json",
     "lint": "biome check .",
     "format": "biome check --write .",
-    "typecheck": "npm run gen && tsc -p tsconfig.json",
-    "test": "npm run build && vitest run --dir test",
-    "check": "npm run gen && npm run lint && npm run typecheck && npm run test && npm run build"
+    "typecheck": "npm run gen && npm run typecheck:tsc",
+    "typecheck:tsc": "tsc -p tsconfig.json",
+    "test": "npm run build && npm run test:run",
+    "test:run": "vitest run --dir test",
+    "check": "npm run gen && npm run lint && npm run typecheck:tsc && npm run build:tsc && npm run test:run",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.4.0",
