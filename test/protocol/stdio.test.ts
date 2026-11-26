@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { VERSION } from "../../src/version.js";
 import { TEST_TOKEN } from "../helpers.js";
@@ -15,6 +15,9 @@ import { READ_TOOLS } from "../support/tool-names.js";
 // child process, so a real HTTP server on a random port stands in for sevdesk.
 
 const BIN = fileURLToPath(new URL("../../dist/bin/stdio.js", import.meta.url));
+const ENV_PROBE = pathToFileURL(
+  fileURLToPath(new URL("../support/env-probe.mjs", import.meta.url)),
+).href;
 
 let mock: Server;
 let mockBaseUrl: string;
@@ -138,6 +141,71 @@ describe("built stdio binary", () => {
     expect(stderr).toContain('"msg":"sevdesk-mcp started"');
     expect(stderr).toContain('"msg":"sevdesk request"');
     expect(stderr).not.toContain(TEST_TOKEN);
+  });
+
+  /** Secret variable names still in the server's process.env after startup. */
+  async function secretsLeftAfterStart(session: StdioSession): Promise<string[]> {
+    const init = await session.request(1, "initialize", {
+      protocolVersion: "2025-11-25",
+      capabilities: {},
+      clientInfo: { name: "stdio-test", version: "0.0.0" },
+    });
+    expect(init.result).toBeDefined();
+    const line = session.stderr
+      .join("")
+      .split("\n")
+      .find((entry) => entry.startsWith("env-probe "));
+    expect(line, "the env probe did not report").toBeDefined();
+    return (JSON.parse(line?.slice("env-probe ".length) ?? "{}") as { present: string[] }).present;
+  }
+
+  async function accountInfo(session: StdioSession): Promise<void> {
+    session.notify("notifications/initialized");
+    const call = await session.request(2, "tools/call", {
+      name: "get_account_info",
+      arguments: {},
+    });
+    expect(call.result).toMatchObject({ structuredContent: { bookkeepingSystemVersion: "2.0" } });
+  }
+
+  it("removes the token and the confirmation secret from process.env after startup", async () => {
+    const secret = "s".repeat(40);
+    const session = new StdioSession(
+      spawn(process.execPath, ["--import", ENV_PROBE, BIN], {
+        env: childEnv({
+          SEVDESK_API_TOKEN: TEST_TOKEN,
+          SEVDESK_CONFIRM_SECRET: secret,
+          SEVDESK_BASE_URL: mockBaseUrl,
+        }),
+      }),
+    );
+    expect(await secretsLeftAfterStart(session)).toEqual([]);
+    // The server still has both through its config.
+    await accountInfo(session);
+    expect(seenHeaders.at(-1)?.authorization).toBe(TEST_TOKEN);
+    expect(await session.close()).toBe(0);
+    expect(session.stderr.join("")).not.toContain(secret);
+  });
+
+  it.skipIf(process.platform === "win32")("keeps a keychain token out of process.env", async () => {
+    const keychainToken = "k".repeat(32);
+    const session = new StdioSession(
+      spawn(process.execPath, ["--import", ENV_PROBE, BIN], {
+        env: childEnv({
+          // Blank counts as unset, so the keychain is asked.
+          SEVDESK_API_TOKEN: "",
+          PROBE_KEYCHAIN_TOKEN: keychainToken,
+          SEVDESK_BASE_URL: mockBaseUrl,
+        }),
+      }),
+    );
+    expect(await secretsLeftAfterStart(session)).toEqual([]);
+    await accountInfo(session);
+    expect(seenHeaders.at(-1)?.authorization).toBe(keychainToken);
+    expect(await session.close()).toBe(0);
+    const stderr = session.stderr.join("");
+    expect(stderr).toContain('"tokenSource":"keychain"');
+    expect(stderr).not.toContain(keychainToken);
   });
 
   it("exits with a clear message when the token is missing", async () => {

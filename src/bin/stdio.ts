@@ -13,6 +13,18 @@ import { VERSION } from "../version.js";
 // stdout carries the MCP protocol. Everything else, including startup
 // errors, goes to stderr.
 
+/** Variables holding secrets; nothing in this process reads them after the config. */
+const SECRET_VARIABLES = ["SEVDESK_API_TOKEN", "SEVDESK_CONFIRM_SECRET"] as const;
+
+/**
+ * Drops the secrets from the environment once the config holds them, so
+ * code running later in this process (a dependency, a tool) cannot read
+ * them from process.env, and child processes do not inherit them.
+ */
+function forgetSecrets(...envs: Array<Record<string, string | undefined>>): void {
+  for (const env of envs) for (const name of SECRET_VARIABLES) delete env[name];
+}
+
 // Without SEVDESK_API_TOKEN the token comes from the system keychain, so it
 // does not have to sit in a client configuration file.
 const token = await resolveApiToken(process.env);
@@ -20,6 +32,8 @@ const token = await resolveApiToken(process.env);
 let config: Config;
 try {
   config = loadConfig(token.env);
+  // token.env is process.env itself, or a copy holding the keychain token.
+  forgetSecrets(process.env, token.env);
   validateToolNames(config, TOOL_NAMES);
 } catch (error) {
   if (error instanceof ConfigError) {
