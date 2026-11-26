@@ -1,7 +1,7 @@
 import type { McpServer, ServerContext } from "@modelcontextprotocol/server";
 import { describe, expect, it } from "vitest";
 import { createAuditLog } from "../../src/policy/audit.js";
-import { runGuarded } from "../../src/policy/guard.js";
+import { canonicalTarget, runGuarded } from "../../src/policy/guard.js";
 import { InMemoryNonceStore } from "../../src/policy/nonce-store.js";
 import { createPolicyRuntime, requestPolicy } from "../../src/policy/runtime.js";
 import { captureLogger, testConfig } from "../helpers.js";
@@ -153,5 +153,50 @@ describe("guard with a failing audit sink", () => {
     expect(executed).toBe(1);
     expect(lines.join("")).toContain("audit sink failed");
     expect(lines.join("")).toContain("disk full");
+  });
+});
+
+describe("canonical target IDs in the guard", () => {
+  it("treats different spellings of a numeric target as one", () => {
+    expect(canonicalTarget("042")).toBe("42");
+    expect(canonicalTarget("42")).toBe("42");
+    expect(canonicalTarget("0")).toBe("0");
+    expect(canonicalTarget("INV-042")).toBe("INV-042");
+    expect(canonicalTarget(undefined)).toBeUndefined();
+  });
+
+  it("keeps the once-per-target lock across spellings", async () => {
+    const config = testConfig({ mode: "full" });
+    const runtime = createPolicyRuntime(config, {
+      transport: "stdio",
+      secret: Buffer.from("g".repeat(32)),
+    });
+    const env = {
+      policy: requestPolicy(config, runtime, undefined),
+      server: noElicitation,
+      logger: captureLogger().logger,
+    };
+    let executed = 0;
+    const run = (targetId: string) => {
+      const args = { invoice: targetId };
+      const { token } = runtime.signer.issue({ tool: "x_tool", args, subject: "stdio" });
+      return runGuarded(env, ctx, {
+        key: "x_tool",
+        tool: "x_tool",
+        class: "X",
+        args,
+        targetId,
+        confirmationToken: token,
+        explicitlyAllowed: true,
+        summary: "x.",
+        execute: async () => {
+          executed++;
+          return { ok: true };
+        },
+      });
+    };
+    expect(await run("42")).toMatchObject({ structuredContent: { ok: true } });
+    expect(JSON.stringify(await run("042"))).toContain("already ran for this target");
+    expect(executed).toBe(1);
   });
 });

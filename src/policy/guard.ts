@@ -135,6 +135,15 @@ function approvalState(ctx: ServerContext): ApprovalState {
 }
 
 /**
+ * Digit-only target IDs in one form ("042" and "42" are the same object),
+ * so the once-per-target lock holds whatever spelling a tool passes on.
+ */
+export function canonicalTarget(targetId: string | undefined): string | undefined {
+  if (targetId === undefined) return undefined;
+  return /^\d{1,15}$/.test(targetId) ? String(Number(targetId)) : targetId;
+}
+
+/**
  * Definite rejections free the idempotency key, unknown outcomes keep it:
  * a 4xx from sevdesk, or a local policy refusal before anything was sent.
  */
@@ -285,7 +294,7 @@ export async function runGuarded(
   const idempotencyKey =
     action.class === "X"
       ? `idempotency:${action.operationId ?? action.tool}:${
-          action.targetId ?? `args:${argumentHash(action.args)}`
+          canonicalTarget(action.targetId) ?? `args:${argumentHash(action.args)}`
         }`
       : undefined;
   try {
