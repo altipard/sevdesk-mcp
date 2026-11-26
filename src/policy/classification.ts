@@ -1,7 +1,7 @@
 import type { OperationId } from "./operations.js";
 
 /**
- * Risk class of a sevdesk operation (docs/research/stack-analyse.md, section 4).
+ * Risk class of a sevdesk operation, ordered by how hard its effect is to undo.
  *
  * - R:  reads without side effects.
  * - R+: reads that move bulk data out (exports). Only with an explicit allowlist.

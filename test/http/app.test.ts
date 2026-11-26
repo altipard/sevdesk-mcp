@@ -31,7 +31,7 @@ function rawStatus(url: URL, host: string): Promise<number> {
   });
 }
 
-describe("token validation at the bearer gate (spike point 1)", () => {
+describe("token validation at the bearer gate", () => {
   it.each(ERAS)("valid token: a tool call succeeds via the MCP client (%s)", async (era) => {
     const server = await fx.server();
     const token = await signToken(fx.iss, server.resourceUrl.href);
@@ -184,7 +184,7 @@ describe("token validation at the bearer gate (spike point 1)", () => {
   });
 });
 
-describe("scopes (spike point 2 and the write-only rule)", () => {
+describe("scopes (the write-only rule)", () => {
   it("gate: a token without sevdesk:read gets 403 insufficient_scope naming sevdesk:read", async () => {
     const server = await fx.server();
     const response = await rawPost(
