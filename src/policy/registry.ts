@@ -2,12 +2,19 @@ import type { McpServer, ServerContext } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { type Config, ConfigError } from "../config.js";
 import type { Logger } from "../logger.js";
-import type { SevdeskClient } from "../sevdesk/client.js";
+import { restrictClient, type SevdeskClient } from "../sevdesk/client.js";
 import type { OperationClass } from "./classification.js";
 import { CONFIRMATION_TOKEN_DESCRIPTION, runGuarded, type ToolOutput } from "./guard.js";
 import type { OperationId } from "./operations.js";
 import { allows, type Rights } from "./rights.js";
 import type { RequestPolicy } from "./runtime.js";
+import {
+  type ClientScope,
+  createScopeGate,
+  previewScope,
+  scopeProblems,
+  toolScope,
+} from "./scope.js";
 
 export interface ToolDeps {
   readonly config: Config;
@@ -36,6 +43,12 @@ export interface ToolDefinition<S extends ObjectSchema = ObjectSchema> {
   readonly class: OperationClass;
   /** Main sevdesk operation, for audit events and idempotency keys. */
   readonly operationId?: OperationId;
+  /**
+   * Further operations the handler calls besides operationId. The client a
+   * handler gets sends nothing else: requests to other operations, or to
+   * operations above the tool's class, are refused before the network.
+   */
+  readonly operations?: readonly OperationId[];
   readonly inputSchema: S;
   /** Only for R, R+ and W: W+/X calls first return a confirmation preview instead. */
   readonly outputSchema?: ObjectSchema;
@@ -87,7 +100,23 @@ export function defineTool<S extends ObjectSchema>(
     }
   }
   if (definition.class === "X" && definition.targetId === undefined) fail("class X needs targetId");
+  const problems = scopeProblems(definition);
+  if (problems.length > 0) fail(problems.join("; "));
   return definition;
+}
+
+/**
+ * Adds operations to an existing definition, for tools whose own file does
+ * not list them yet. Validated like defineTool.
+ */
+export function withOperations<S extends ObjectSchema>(
+  definition: ToolDefinition<S>,
+  operations: readonly OperationId[],
+): ToolDefinition<S> {
+  return defineTool({
+    ...definition,
+    operations: [...new Set([...(definition.operations ?? []), ...operations])],
+  });
 }
 
 /**
@@ -148,6 +177,37 @@ const stringId = (value: string | number | undefined) =>
   value === undefined ? undefined : String(value);
 
 /**
+ * The configuration as tools see it: without the API token and the
+ * confirmation secret. Only the client and the policy runtime need them,
+ * and both are built before any tool runs.
+ */
+export function configForTools(config: Config): Config {
+  const copy: Config = { ...config, sevdeskApiToken: "" };
+  delete copy.confirmSecret;
+  return Object.freeze(copy);
+}
+
+/** `client` restricted to `scope`, with denials audited for this policy. */
+export function scopedClient(
+  client: SevdeskClient,
+  scope: ClientScope,
+  policy: RequestPolicy,
+  logger: Logger,
+): SevdeskClient {
+  return restrictClient(
+    client,
+    createScopeGate({
+      scope,
+      rights: policy.rights,
+      baseUrl: policy.config.baseUrl,
+      subject: policy.subject,
+      audit: policy.runtime.audit,
+      logger,
+    }),
+  );
+}
+
+/**
  * The one way tools get onto the server. Tools above the effective rights
  * or excluded by the lists are not registered at all; every registered tool
  * runs through the guard, which re-checks rights at call time.
@@ -157,9 +217,21 @@ export function registerTools(
   definitions: readonly ToolDefinition[],
 ): string[] {
   const { server, policy, deps } = env;
+  const config = configForTools(deps.config);
   const registered: string[] = [];
   for (const definition of definitions) {
     if (!isToolEnabled(policy.config, policy.rights, definition)) continue;
+    // Definitions built without defineTool still must not declare more
+    // than their class.
+    const problems = scopeProblems(definition);
+    if (problems.length > 0) {
+      throw new ToolDefinitionError(`tool ${definition.name}: ${problems.join("; ")}`);
+    }
+    // The handler only ever sees this client: requests outside the tool's
+    // declared operations and class are refused and audited. A preview runs
+    // before the confirmation and therefore only reads.
+    const sevdesk = scopedClient(deps.sevdesk, toolScope(definition), policy, deps.logger);
+    const previewClient = scopedClient(deps.sevdesk, previewScope(definition), policy, deps.logger);
     const confirm = needsConfirmation(definition.class);
     const inputSchema = confirm
       ? definition.inputSchema.extend({
@@ -183,7 +255,8 @@ export function registerTools(
       async (input: Record<string, unknown>, ctx: ServerContext) => {
         const { confirmation_token: token, ...rest } = input;
         const args = (confirm ? rest : input) as z.infer<typeof definition.inputSchema>;
-        const call: ToolCall = { ...deps, ctx };
+        const call: ToolCall = { ...deps, config, sevdesk, ctx };
+        const previewCall: ToolCall = { ...call, sevdesk: previewClient };
         return runGuarded({ policy, server, logger: deps.logger }, ctx, {
           key: definition.name,
           tool: definition.name,
@@ -195,7 +268,8 @@ export function registerTools(
           explicitlyAllowed: isExplicitlyEnabled(policy.config, definition.name),
           summary: definition.summary?.(args) ?? `Run ${definition.name}.`,
           preview:
-            definition.preview && (() => definition.preview?.(args, call) ?? Promise.resolve({})),
+            definition.preview &&
+            (() => definition.preview?.(args, previewCall) ?? Promise.resolve({})),
           execute: () => definition.handler(args, call),
         });
       },

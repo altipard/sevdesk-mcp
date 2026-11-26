@@ -26,8 +26,11 @@ export interface SevdeskClientOptions {
   maxResponseBytes?: number;
   retry?: Partial<RetryOptions>;
   logger?: Logger;
-  /** Injected in tests so retries do not wait in real time. */
-  sleep?: (ms: number) => Promise<void>;
+  /**
+   * Injected in tests so retries do not wait in real time. The signal
+   * aborts with the caller's request; the wait is abandoned either way.
+   */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Clock for the deadline, injected in tests together with `sleep`. */
   now?: () => number;
 }
@@ -55,7 +58,17 @@ export const DEFAULT_DEADLINE_MS = 60_000;
 export const DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_RETRY: RetryOptions = { maxRetries: 3, baseDelayMs: 500, maxDelayMs: 10_000 };
 
-const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+/** Waits `ms`; an abort clears the timer, so it does not outlive the call. */
+const realSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve) => {
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  });
 
 // 500 is left out on purpose: sevdesk answers some invalid input with 500,
 // and repeating that only multiplies the failure.
@@ -69,6 +82,65 @@ function backoffDelay(attempt: number, retry: RetryOptions): number {
   const exponential = Math.min(retry.maxDelayMs, retry.baseDelayMs * 2 ** (attempt - 1));
   // Jitter between 50 % and 100 % so parallel callers do not retry in lockstep.
   return Math.round(exponential * (0.5 + Math.random() * 0.5));
+}
+
+/** fetch's rejection for a redirect under `redirect: "error"`. */
+function isRedirectRefusal(error: unknown): boolean {
+  if (!(error instanceof TypeError)) return false;
+  const cause = (error as { cause?: unknown }).cause;
+  const causeMessage = cause instanceof Error ? cause.message : "";
+  return /redirect/i.test(`${error.message} ${causeMessage}`);
+}
+
+/**
+ * Request headers a call may carry. The client sets Accept, User-Agent and,
+ * with a body, Content-Type; a caller may override those, nothing else.
+ * Method overrides (X-HTTP-Method-Override and relatives) or forwarding
+ * headers could make sevdesk run another operation than the one checked.
+ */
+const ALLOWED_HEADERS = new Set(["accept", "content-type", "user-agent"]);
+
+/** Query keys some frameworks read as the real method. */
+const METHOD_OVERRIDE_QUERY = new Set([
+  "_method",
+  "x-http-method",
+  "x-http-method-override",
+  "x-method-override",
+]);
+
+function refuseCall(
+  gates: readonly RequestGate[],
+  method: string,
+  reason: string,
+  message: string,
+): never {
+  for (const gate of gates) gate.callRefused(method.toUpperCase(), reason);
+  throw new SevdeskError("policy", `${message} Nothing was sent.`);
+}
+
+function refuseSmuggling(gates: readonly RequestGate[], request: Request): void {
+  for (const name of request.headers.keys()) {
+    if (!ALLOWED_HEADERS.has(name)) {
+      const shown = name.slice(0, 60);
+      refuseCall(
+        gates,
+        request.method,
+        `header:${shown}`,
+        `The request header "${shown}" is not allowed on sevdesk requests.`,
+      );
+    }
+  }
+  for (const key of new URL(request.url).searchParams.keys()) {
+    if (METHOD_OVERRIDE_QUERY.has(key.toLowerCase())) {
+      const shown = key.slice(0, 60);
+      refuseCall(
+        gates,
+        request.method,
+        `query:${shown}`,
+        `The query parameter "${shown}" is not allowed on sevdesk requests.`,
+      );
+    }
+  }
 }
 
 function networkErrorCode(error: unknown): string | undefined {
@@ -98,8 +170,27 @@ function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
+/** Checks of a restricted client. */
+export interface RequestGate {
+  /**
+   * Runs on every outgoing request before anything is sent. Throws to
+   * refuse it (a SevdeskError of kind "policy").
+   */
+  check(request: Request): void;
+  /**
+   * Told when the client refuses a call itself: a per-call override, a
+   * header outside the allowlist or a method-override query. `reason` is
+   * short and machine-readable, e.g. "call_override:fetch".
+   */
+  callRefused(method: string, reason: string): void;
+}
+
 interface FetchPolicy {
   baseUrl: string;
+  /** Added after every check, so nothing before the policy fetch sees it. */
+  token: string;
+  /** Checks of a restricted client, in order; each one can refuse. */
+  gates: readonly RequestGate[];
   maxResponseBytes: number;
   /**
    * The request may have a side effect even if it is a GET (single-attempt
@@ -110,7 +201,7 @@ interface FetchPolicy {
   deadlineMs: number;
   retry: RetryOptions;
   logger: Logger;
-  sleep: (ms: number) => Promise<void>;
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   now: () => number;
 }
 
@@ -176,12 +267,30 @@ async function readFully(
 }
 
 /**
+ * The pause before a retry. A caller that aborts before or during it gets
+ * its abort at once instead of after the full Retry-After or backoff.
+ */
+async function waitUnlessAborted(
+  policy: FetchPolicy,
+  delayMs: number,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted) throw signal.reason;
+  await untilAborted(policy.sleep(delayMs, signal), signal);
+}
+
+/**
  * fetch with a per-attempt timeout, an overall deadline and retries.
  * Retries happen only for GET: repeating a write could create or send
  * something twice.
  */
 function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<Response> {
   return async (original) => {
+    // Headers and method overrides first, then the scope of a restricted
+    // client: a request outside either is refused before pins, retries or
+    // the network see it.
+    refuseSmuggling(policy.gates, original);
+    for (const gate of policy.gates) gate.check(original);
     // Pins (preventSendBy, enshrine flags) hold for every caller of the
     // client, not only for the fallback that checks them up front.
     let request: Request;
@@ -191,6 +300,12 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
       if (error instanceof PinViolation) throw new SevdeskError("policy", error.message);
       throw error;
     }
+    // The token is set only here, after openapi-fetch and every check, so
+    // nothing a caller can hook into (middleware, Request) ever holds it.
+    const headers = new Headers(request.headers);
+    // sevdesk expects the raw token, without a "Bearer" prefix.
+    headers.set("Authorization", policy.token);
+    request = new Request(request, { headers });
     const method = request.method.toUpperCase();
     const mayHaveSideEffect = method !== "GET" || policy.sideEffects;
     const maxAttempts = method === "GET" ? policy.retry.maxRetries + 1 : 1;
@@ -211,7 +326,11 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
       let response: Response;
 
       try {
-        const raw = await untilAborted(fetch(new Request(request, { signal })), signal);
+        // A redirect could lead to a path or host the scope never checked.
+        const raw = await untilAborted(
+          fetch(new Request(request, { signal, redirect: "error" })),
+          signal,
+        );
         response = await readFully(raw, signal, policy.maxResponseBytes);
       } catch (error) {
         if (request.signal.aborted) throw error;
@@ -232,6 +351,15 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
           }
           throw error;
         }
+        // A refused redirect is an answer, not a transport failure: retrying
+        // would only be redirected again.
+        if (!timeout.aborted && isRedirectRefusal(error)) {
+          const unknown = mayHaveSideEffect ? ` ${OUTCOME_UNKNOWN}` : "";
+          throw new SevdeskError(
+            "http_error",
+            `sevdesk answered with a redirect, which this server does not follow.${unknown}`,
+          );
+        }
         const kind = timeout.aborted ? "timeout" : "network";
         const delay = backoffDelay(attempt, policy.retry);
         const deadlineHit = canRetry && !fitsDeadline(delay);
@@ -243,7 +371,7 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
             kind,
             delayMs: delay,
           });
-          await policy.sleep(delay);
+          await waitUnlessAborted(policy, delay, request.signal);
           continue;
         }
         // A write may have reached sevdesk before the connection failed, so
@@ -302,15 +430,102 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
         status: response.status,
         delayMs: delay,
       });
-      await policy.sleep(delay);
+      await waitUnlessAborted(policy, delay, request.signal);
     }
   };
 }
 
+// openapi-fetch lets a single call replace fetch or the Request class, or
+// add middleware. fetch and Request would skip the policy fetch (scope,
+// pins, timeouts); middleware could rewrite the request or read what the
+// call carries. All three are refused.
+const FORBIDDEN_CALL_OPTIONS = ["fetch", "Request", "middleware"] as const;
+const CALL_METHODS = ["GET", "PUT", "POST", "DELETE", "OPTIONS", "HEAD", "PATCH", "TRACE"] as const;
+
+/**
+ * The call options as a plain copy, read once, so a getter cannot show one
+ * value here and another to openapi-fetch.
+ */
+function refuseOverrides(gates: readonly RequestGate[], method: string, init: unknown): unknown {
+  if (typeof init !== "object" || init === null) return init;
+  const copy: Record<string, unknown> = { ...init };
+  for (const option of FORBIDDEN_CALL_OPTIONS) {
+    if (copy[option] !== undefined) {
+      refuseCall(
+        gates,
+        method,
+        `call_override:${option}`,
+        `The per-call option "${option}" is not allowed on the sevdesk client.`,
+      );
+    }
+  }
+  return copy;
+}
+
+/**
+ * The openapi-fetch client with per-call overrides refused and without
+ * use/eject: client-wide middleware would see every request of the tool.
+ */
+function sealApi(api: SevdeskApi, gates: readonly RequestGate[]): SevdeskApi {
+  const sealed: Record<string, unknown> = {
+    request: (method: string, url: string, init?: unknown) => {
+      return (api.request as (m: string, u: string, i?: unknown) => unknown)(
+        method,
+        url,
+        refuseOverrides(gates, String(method), init),
+      );
+    },
+    use: () =>
+      refuseCall(
+        gates,
+        "USE",
+        "call_override:middleware",
+        "Middleware is not allowed on the sevdesk client.",
+      ),
+    eject: () =>
+      refuseCall(
+        gates,
+        "EJECT",
+        "call_override:middleware",
+        "Middleware is not allowed on the sevdesk client.",
+      ),
+  };
+  for (const name of CALL_METHODS) {
+    const call = api[name] as (url: string, init?: unknown) => unknown;
+    sealed[name] = (url: string, init?: unknown) => {
+      return call(url, refuseOverrides(gates, name, init));
+    };
+  }
+  return Object.freeze(sealed) as unknown as SevdeskApi;
+}
+
+/** Builds clients sharing one configuration with additional gates. */
+type ClientFactory = (gates: readonly RequestGate[]) => SevdeskClient;
+
+// Known only to this module, so a restricted client can be narrowed further
+// but never widened: the factory of a restricted client keeps its gates.
+const factories = new WeakMap<SevdeskClient, ClientFactory>();
+
+/**
+ * The same client, limited by `gate`: every request (through `api` and
+ * `apiSingleAttempt`) must pass it, in addition to any gate the client
+ * already has. Only clients built by createSevdeskClient can be
+ * restricted; anything else is refused instead of passed on unchecked.
+ */
+export function restrictClient(client: SevdeskClient, gate: RequestGate): SevdeskClient {
+  const factory = factories.get(client);
+  if (factory === undefined) {
+    throw new TypeError("restrictClient needs a client built by createSevdeskClient");
+  }
+  return factory([gate]);
+}
+
 export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClient {
   const redact: Redactor = createRedactor([options.token]);
-  const policy: FetchPolicy = {
+  const base: FetchPolicy = {
     baseUrl: options.baseUrl,
+    token: options.token,
+    gates: [],
     maxResponseBytes: options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
     sideEffects: false,
     timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
@@ -322,53 +537,61 @@ export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClien
   };
 
   const clientFor = (fetchPolicy: FetchPolicy) =>
-    createClient<paths>({
-      baseUrl: options.baseUrl.replace(/\/+$/, ""),
-      headers: {
-        // sevdesk expects the raw token, without a "Bearer" prefix.
-        Authorization: options.token,
-        "User-Agent": options.userAgent ?? USER_AGENT,
-        Accept: "application/json",
-      },
-      fetch: createPolicyFetch(fetchPolicy),
-    });
-  const api = clientFor(policy);
-  const apiSingleAttempt = clientFor({
-    ...policy,
-    sideEffects: true,
-    retry: { ...policy.retry, maxRetries: 0 },
-  });
+    sealApi(
+      createClient<paths>({
+        baseUrl: options.baseUrl.replace(/\/+$/, ""),
+        // Authorization is added by the policy fetch, after every check.
+        headers: {
+          "User-Agent": options.userAgent ?? USER_AGENT,
+          Accept: "application/json",
+        },
+        fetch: createPolicyFetch(fetchPolicy),
+      }),
+      fetchPolicy.gates,
+    );
 
-  return {
-    api,
-    apiSingleAttempt,
-    async call<T>(request: Promise<ApiResult<T>>): Promise<T> {
-      let result: ApiResult<T>;
-      try {
-        result = await request;
-      } catch (error) {
-        // openapi-fetch parses the body after our fetch returned; a body
-        // that is not JSON surfaces here as a SyntaxError.
-        if (error instanceof SyntaxError) {
-          throw new SevdeskError("http_error", "sevdesk sent a response that is not valid JSON.");
-        }
-        // Bodies are read inside the fetch policy, so this is a safety net
-        // for a timeout that still escapes. A caller's own abort (AbortError)
-        // is passed through unchanged.
-        if (error instanceof Error && error.name === "TimeoutError") {
-          throw new SevdeskError("timeout", "sevdesk did not answer in time.");
-        }
-        throw error;
+  async function call<T>(request: Promise<ApiResult<T>>): Promise<T> {
+    let result: ApiResult<T>;
+    try {
+      result = await request;
+    } catch (error) {
+      // openapi-fetch parses the body after our fetch returned; a body
+      // that is not JSON surfaces here as a SyntaxError.
+      if (error instanceof SyntaxError) {
+        throw new SevdeskError("http_error", "sevdesk sent a response that is not valid JSON.");
       }
-      const { data, error, response } = result;
-      if (response.ok) return data as T;
-      throw mapHttpError({
-        outcomeUnknown: response.headers.get(OUTCOME_HEADER) === "unknown",
-        status: response.status,
-        body: error,
-        retryAfter: response.headers.get("retry-after"),
-        redact,
-      });
-    },
+      // Bodies are read inside the fetch policy, so this is a safety net
+      // for a timeout that still escapes. A caller's own abort (AbortError)
+      // is passed through unchanged.
+      if (error instanceof Error && error.name === "TimeoutError") {
+        throw new SevdeskError("timeout", "sevdesk did not answer in time.");
+      }
+      throw error;
+    }
+    const { data, error, response } = result;
+    if (response.ok) return data as T;
+    throw mapHttpError({
+      outcomeUnknown: response.headers.get(OUTCOME_HEADER) === "unknown",
+      status: response.status,
+      body: error,
+      retryAfter: response.headers.get("retry-after"),
+      redact,
+    });
+  }
+
+  const build = (gates: readonly RequestGate[]): SevdeskClient => {
+    const policy: FetchPolicy = { ...base, gates };
+    const client: SevdeskClient = Object.freeze({
+      api: clientFor(policy),
+      apiSingleAttempt: clientFor({
+        ...policy,
+        sideEffects: true,
+        retry: { ...policy.retry, maxRetries: 0 },
+      }),
+      call,
+    });
+    factories.set(client, (more) => build([...gates, ...more]));
+    return client;
   };
+  return build([]);
 }

@@ -24,7 +24,13 @@ export interface AuditEvent {
   tool: string;
   operationId?: string | undefined;
   targetId?: string | undefined;
+  /** Class of the tool or action. */
   class: OperationClass;
+  /**
+   * Class of the operation a refused request asked for, when it maps to
+   * one: shows how far above the tool's class the attempt reached.
+   */
+  attemptedClass?: OperationClass | undefined;
   outcome: AuditOutcome;
   /** Short machine-readable reason for denied/error, e.g. "expired". */
   reason?: string | undefined;
@@ -67,6 +73,7 @@ export function createAuditLog(options: AuditLogOptions = {}): AuditLog {
         operationId: event.operationId,
         targetId: event.targetId,
         class: event.class,
+        attemptedClass: event.attemptedClass,
         outcome: event.outcome,
         reason: event.reason,
         status: event.status,

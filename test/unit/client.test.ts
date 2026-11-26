@@ -1,7 +1,13 @@
 import { delay, HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { createSevdeskClient, type SevdeskClientOptions } from "../../src/sevdesk/client.js";
+import { createLogger } from "../../src/logger.js";
+import {
+  createSevdeskClient,
+  type RequestGate,
+  restrictClient,
+  type SevdeskClientOptions,
+} from "../../src/sevdesk/client.js";
 import { SevdeskError, type SevdeskErrorKind } from "../../src/sevdesk/errors.js";
 import { USER_AGENT } from "../../src/version.js";
 import { captureLogger, errorRepresentations, MOCK_BASE_URL, TEST_TOKEN } from "../helpers.js";
@@ -715,4 +721,217 @@ describe("timeouts and deadline", () => {
       ),
     ).resolves.toBeUndefined();
   });
+});
+
+describe("aborting during a retry wait", () => {
+  const retryAfter503 = (seconds: string) => {
+    let calls = 0;
+    server.use(
+      http.get(url("/Voucher"), () => {
+        calls++;
+        return HttpResponse.json({}, { status: 503, headers: { "Retry-After": seconds } });
+      }),
+    );
+    return () => calls;
+  };
+
+  it("ends a real Retry-After wait shortly before the deadline at once", async () => {
+    // The 5 s wait just fits the 6.1 s deadline, so the client would sleep.
+    const calls = retryAfter503("5");
+    const client = createSevdeskClient({
+      baseUrl: MOCK_BASE_URL,
+      token: TEST_TOKEN,
+      timeoutMs: 1000,
+      deadlineMs: 6100,
+    });
+    const controller = new AbortController();
+    const started = Date.now();
+    const pending = client.call(client.api.GET("/Voucher", { signal: controller.signal }));
+    setTimeout(() => controller.abort(), 50);
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(calls()).toBe(1);
+  });
+
+  it("hands the caller's signal to the sleep and stops waiting when it aborts", async () => {
+    const calls = retryAfter503("1");
+    const controller = new AbortController();
+    const signals: Array<AbortSignal | undefined> = [];
+    const { client } = setup({
+      sleep: (_ms, signal) => {
+        signals.push(signal);
+        controller.abort();
+        return new Promise(() => {});
+      },
+    });
+
+    await expect(
+      client.call(client.api.GET("/Voucher", { signal: controller.signal })),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(true);
+    expect(calls()).toBe(1);
+  });
+
+  it("does not start the wait when the caller aborted before it", async () => {
+    const calls = retryAfter503("1");
+    const controller = new AbortController();
+    // The retry warning is logged right before the wait; abort there.
+    const logger = createLogger({
+      level: "debug",
+      redact: [TEST_TOKEN],
+      write: (line) => {
+        if (line.includes("retrying")) controller.abort();
+      },
+    });
+    const { client, sleeps } = setup({ logger });
+
+    await expect(
+      client.call(client.api.GET("/Voucher", { signal: controller.signal })),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(sleeps).toEqual([]);
+    expect(calls()).toBe(1);
+  });
+});
+
+describe("what reaches the network", () => {
+  afterEach(() => {
+    server.events.removeAllListeners("request:start");
+  });
+  type Untyped = (method: string, path: string, init?: Record<string, unknown>) => Promise<never>;
+
+  function recording() {
+    const seen: Request[] = [];
+    server.events.on("request:start", ({ request }) => {
+      seen.push(request.clone());
+    });
+    return seen;
+  }
+
+  it("does not follow a redirect and does not retry it", async () => {
+    let calls = 0;
+    server.use(
+      http.get(url("/Voucher"), () => {
+        calls++;
+        return HttpResponse.redirect(url("/Contact"), 302);
+      }),
+      http.get(url("/Contact"), () => HttpResponse.json({ objects: ["followed"] })),
+    );
+    const { client } = setup({ retry: { maxRetries: 3 } });
+
+    const error = await captureError(client.call(client.api.GET("/Voucher")));
+
+    expect(error.kind).toBe("http_error");
+    expect(error.message).toBe(
+      "sevdesk answered with a redirect, which this server does not follow.",
+    );
+    expect(calls).toBe(1);
+  });
+
+  it("marks a redirected write as outcome unknown", async () => {
+    server.use(http.post(url("/Contact"), () => HttpResponse.redirect(url("/Contact/1"), 303)));
+    const { client } = setup();
+    const error = await captureError(
+      client.call(client.api.POST("/Contact", { body: {} as never })),
+    );
+    expect(error.message).toContain("does not follow.");
+    expect(error.message).toContain("The outcome is unknown");
+  });
+
+  it("adds the token only after every check, so nothing before the network sees it", async () => {
+    server.use(http.get(url("/Voucher"), () => HttpResponse.json({ objects: [] })));
+    const beforeNetwork: Array<string | null> = [];
+    const gate: RequestGate = {
+      check: (request) => {
+        beforeNetwork.push(request.headers.get("authorization"));
+      },
+      callRefused: () => {},
+    };
+    const seen = recording();
+    const base = createSevdeskClient({ baseUrl: MOCK_BASE_URL, token: TEST_TOKEN });
+    const client = restrictClient(base, gate);
+
+    await client.call(client.api.GET("/Voucher"));
+
+    expect(beforeNetwork).toEqual([null]);
+    expect(seen.at(-1)?.headers.get("authorization")).toBe(TEST_TOKEN);
+  });
+
+  it("refuses middleware, client-wide and per call", async () => {
+    const refused: string[] = [];
+    const gate: RequestGate = {
+      check: () => {},
+      callRefused: (_m, reason) => refused.push(reason),
+    };
+    const client = restrictClient(
+      createSevdeskClient({ baseUrl: MOCK_BASE_URL, token: TEST_TOKEN }),
+      gate,
+    );
+    const middleware = { onRequest: ({ request }: { request: Request }) => request };
+
+    expect(() => client.api.use(middleware)).toThrow(/Middleware is not allowed/);
+    expect(() => client.api.eject(middleware)).toThrow(/Middleware is not allowed/);
+    expect(() => client.api.GET("/Voucher", { middleware: [middleware] } as never)).toThrow(
+      /per-call option "middleware" is not allowed/,
+    );
+    expect(refused).toEqual([
+      "call_override:middleware",
+      "call_override:middleware",
+      "call_override:middleware",
+    ]);
+  });
+
+  it.each([
+    ["X-HTTP-Method-Override", { headers: { "X-HTTP-Method-Override": "DELETE" } }],
+    ["X-HTTP-Method", { params: { header: { "X-HTTP-Method": "DELETE" } } }],
+    ["X-Forwarded-Host", { headers: { "X-Forwarded-Host": "elsewhere.example" } }],
+    ["Authorization", { headers: { Authorization: "other" } }],
+  ])("refuses the request header %s before anything is sent", async (name, init) => {
+    const seen = recording();
+    const refused: string[] = [];
+    const gate: RequestGate = {
+      check: () => {},
+      callRefused: (_m, reason) => refused.push(reason),
+    };
+    const client = restrictClient(
+      createSevdeskClient({ baseUrl: MOCK_BASE_URL, token: TEST_TOKEN }),
+      gate,
+    );
+    const before = seen.length;
+
+    const error = await captureError(
+      client.call((client.api.request as unknown as Untyped)("get", "/Voucher", init)),
+    );
+
+    expect(error.kind).toBe("policy");
+    expect(error.message).toBe(
+      `The request header "${name.toLowerCase()}" is not allowed on sevdesk requests. Nothing was sent.`,
+    );
+    expect(refused).toEqual([`header:${name.toLowerCase()}`]);
+    expect(seen.length).toBe(before);
+  });
+
+  it("lets a caller choose Accept, e.g. for a PDF", async () => {
+    server.use(http.get(url("/Voucher"), () => HttpResponse.json({ objects: [] })));
+    const seen = recording();
+    const { client } = setup();
+    await client.call(client.api.GET("/Voucher", { headers: { Accept: "application/pdf" } }));
+    expect(seen.at(-1)?.headers.get("accept")).toBe("application/pdf");
+  });
+
+  it.each(["_method", "_METHOD", "x-http-method-override"])(
+    "refuses the method-override query %s",
+    async (key) => {
+      const seen = recording();
+      const before = seen.length;
+      const { client } = setup();
+      const error = await captureError(
+        client.call((client.api.request as unknown as Untyped)("get", `/Voucher?${key}=DELETE`)),
+      );
+      expect(error.kind).toBe("policy");
+      expect(error.message).toContain(`"${key}" is not allowed`);
+      expect(seen.length).toBe(before);
+    },
+  );
 });
