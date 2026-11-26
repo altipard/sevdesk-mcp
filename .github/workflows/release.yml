@@ -15,8 +15,8 @@
 #
 # Order and reruns: everything is built and attested before anything is published; then npm,
 # then the GitHub release, which also creates the tag. Every publish step checks what already
-# exists, so "Re-run all jobs" after a partial failure completes the release: a commit that
-# already carries its release tag is resumed instead of bumped again.
+# exists and never replaces it, so "Re-run all jobs" after a partial failure completes the
+# release: a commit that already carries its release tag is resumed instead of bumped again.
 name: release
 
 on:
@@ -55,7 +55,8 @@ jobs:
 
       - id: next
         run: |
-          resumed=$(git tag --points-at HEAD --list '[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n 1)
+          # Same strict X.Y.Z check as for commitizen's answer below.
+          resumed=$(git tag --points-at HEAD | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
           if [ -n "$resumed" ]; then
             VERSION=$resumed
             echo "HEAD already carries release tag $VERSION; resuming it"
@@ -145,7 +146,7 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: |
           if ! /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
-            softwareupdate --install-rosetta --agree-to-license
+            sudo softwareupdate --install-rosetta --agree-to-license
           fi
 
       # Also checks that the binary reports the release version.
@@ -188,6 +189,8 @@ jobs:
     if: needs.version.outputs.version != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    outputs:
+      sha256: ${{ steps.pack.outputs.sha256 }}
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
@@ -204,10 +207,18 @@ jobs:
 
       - run: npm version --no-git-tag-version --allow-same-version "$VERSION"
 
-      - run: |
+      - id: pack
+        run: |
           mkdir -p out/pack
           npm pack --pack-destination out/pack
-          ls -l out/pack
+          set -- out/pack/*.tgz
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "::error::expected exactly one tarball, found: $*"
+            exit 1
+          fi
+          sha256=$(sha256sum "$1" | cut -d ' ' -f 1)
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          echo "$sha256  $1"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -228,10 +239,13 @@ jobs:
       id-token: write
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      TARBALL_SHA256: ${{ needs.pack.outputs.sha256 }}
     steps:
+      # No checkout here, so .nvmrc is not available: same as .nvmrc, kept in sync by
+      # test/unit/workflows.test.ts.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version-file: .nvmrc
+          node-version: "24"
           registry-url: https://registry.npmjs.org
 
       - name: npm supports trusted publishing
@@ -247,19 +261,40 @@ jobs:
           name: npm-tarball
           path: pack
 
+      # The tarball must be the one the pack job built, for this package and this version.
+      - name: check the tarball
+        id: tarball
+        run: |
+          set -- pack/*.tgz
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "::error::expected exactly one tarball, found: $*"
+            exit 1
+          fi
+          actual=$(sha256sum "$1" | cut -d ' ' -f 1)
+          if [ -z "$TARBALL_SHA256" ] || [ "$actual" != "$TARBALL_SHA256" ]; then
+            echo "::error::tarball checksum $actual does not match the pack job ($TARBALL_SHA256)"
+            exit 1
+          fi
+          # shellcheck disable=SC2016 # the single quotes hold JavaScript, not shell
+          tar -xzOf "$1" package/package.json | node -e '
+            const pkg = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+            const { PACKAGE, VERSION } = process.env;
+            if (pkg.name !== PACKAGE || pkg.version !== VERSION) {
+              console.error(`::error::tarball holds ${pkg.name}@${pkg.version}, expected ${PACKAGE}@${VERSION}`);
+              process.exit(1);
+            }'
+          echo "file=$1" >> "$GITHUB_OUTPUT"
+
       - name: publish
+        env:
+          TARBALL: ${{ steps.tarball.outputs.file }}
         run: |
           # Anonymous lookup: the .npmrc from setup-node carries a placeholder token.
           if NPM_CONFIG_USERCONFIG=/dev/null npm view "$PACKAGE@$VERSION" version >/dev/null 2>&1; then
             echo "$PACKAGE@$VERSION is already on npm; nothing to publish"
             exit 0
           fi
-          set -- pack/*.tgz
-          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
-            echo "::error::expected exactly one tarball, found: $*"
-            exit 1
-          fi
-          npm publish "$1" --provenance --access public
+          npm publish "$TARBALL" --provenance --access public --ignore-scripts
 
   github-release:
     needs: [version, attest, npm]
@@ -279,23 +314,42 @@ jobs:
           pattern: sevdesk-mcp-*
           merge-multiple: true
 
-      - name: checksums
-        run: |
-          cd assets
-          sha256sum sevdesk-mcp-darwin-arm64 sevdesk-mcp-darwin-x64 \
-            sevdesk-mcp-linux-x64 sevdesk-mcp-linux-arm64 > SHA256SUMS
-          cat SHA256SUMS
-
       # gh creates the tag on the released commit through the API; no push from the runner.
-      # A rerun finds the release and replaces its assets instead of failing.
+      # A published asset is never replaced: a rerun only adds what a partial run left out.
       - name: tag and release
         run: |
-          if gh release view "$VERSION" >/dev/null 2>&1; then
-            gh release upload "$VERSION" assets/* --clobber
-          else
+          binaries=(sevdesk-mcp-darwin-arm64 sevdesk-mcp-darwin-x64 sevdesk-mcp-linux-x64 sevdesk-mcp-linux-arm64)
+          if ! existing=$(gh release view "$VERSION" --json assets --jq '.assets[].name' 2>/dev/null); then
+            (cd assets && sha256sum "${binaries[@]}" > SHA256SUMS && cat SHA256SUMS)
             gh release create "$VERSION" assets/* \
               --target "$GITHUB_SHA" \
               --title "$VERSION" \
               --generate-notes \
               --notes "Verify a binary: gh attestation verify <file> --repo $GH_REPO"
+            exit 0
           fi
+          has() { printf '%s\n' "$existing" | grep -qxF "$1"; }
+          missing=()
+          for name in "${binaries[@]}" SHA256SUMS; do
+            has "$name" || missing+=("$name")
+          done
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo "release $VERSION is complete; nothing to upload"
+            exit 0
+          fi
+          if has SHA256SUMS; then
+            # The published sums describe binaries of the earlier run; a rebuilt one would not match.
+            echo "::error::release $VERSION has SHA256SUMS but lacks: ${missing[*]}. Delete the release and its tag, then re-run."
+            exit 1
+          fi
+          # Sums over exactly what the release will hold: published binaries as they are, rebuilt
+          # ones only where missing. --clobber replaces the local rebuilt copy, not the asset.
+          for name in "${binaries[@]}"; do
+            if has "$name"; then
+              gh release download "$VERSION" --pattern "$name" --dir assets --clobber
+            fi
+          done
+          (cd assets && sha256sum "${binaries[@]}" > SHA256SUMS && cat SHA256SUMS)
+          for name in "${missing[@]}"; do
+            gh release upload "$VERSION" "assets/$name"
+          done
