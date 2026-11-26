@@ -1,6 +1,7 @@
 import createClient, { type Client } from "openapi-fetch";
 import type { paths } from "../generated/sevdesk.js";
 import { type Logger, silentLogger } from "../logger.js";
+import { enforceRequestPins, PinViolation } from "../policy/pins.js";
 import { createRedactor, type Redactor } from "../redact.js";
 import { USER_AGENT } from "../version.js";
 import { mapHttpError, parseRetryAfter, SevdeskError } from "./errors.js";
@@ -95,6 +96,7 @@ function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 }
 
 interface FetchPolicy {
+  baseUrl: string;
   timeoutMs: number;
   deadlineMs: number;
   retry: RetryOptions;
@@ -129,7 +131,16 @@ async function readFully(response: Response, signal: AbortSignal): Promise<Respo
  * something twice.
  */
 function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<Response> {
-  return async (request) => {
+  return async (original) => {
+    // Pins (preventSendBy, enshrine flags) hold for every caller of the
+    // client, not only for the fallback that checks them up front.
+    let request: Request;
+    try {
+      request = await enforceRequestPins(original, policy.baseUrl);
+    } catch (error) {
+      if (error instanceof PinViolation) throw new SevdeskError("policy", error.message);
+      throw error;
+    }
     const method = request.method.toUpperCase();
     const maxAttempts = method === "GET" ? policy.retry.maxRetries + 1 : 1;
     const path = new URL(request.url).pathname;
@@ -220,6 +231,7 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
 export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClient {
   const redact: Redactor = createRedactor([options.token]);
   const policy: FetchPolicy = {
+    baseUrl: options.baseUrl,
     timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     deadlineMs: options.deadlineMs ?? DEFAULT_DEADLINE_MS,
     retry: { ...DEFAULT_RETRY, ...options.retry },

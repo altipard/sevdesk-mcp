@@ -3,6 +3,7 @@ import { z } from "zod";
 import { classOf, type OperationClass } from "../policy/classification.js";
 import { CONFIRMATION_TOKEN_DESCRIPTION, runGuarded, type ToolOutput } from "../policy/guard.js";
 import { OPERATIONS, type OperationId, type ParamSpec } from "../policy/operations.js";
+import { type PinnedParam, PinViolation, pinQueryParam } from "../policy/pins.js";
 import { isToolEnabled, type RegistrationEnv } from "../policy/registry.js";
 import { allows } from "../policy/rights.js";
 
@@ -76,20 +77,6 @@ export const DEFAULT_API_ALLOW: readonly OperationId[] = [
   "getTagById",
   "getTagRelations",
 ];
-
-/**
- * Parameters the server pins, because the other value would lift the
- * operation into a higher class: getPdf without preventSendBy marks the
- * document as sent (W+), the DATEV exports with enshrine/enshrineDocuments
- * enshrine every exported record (X). A caller asking for the other value
- * gets an error. `true` is sent explicitly; `false` is sent by leaving the
- * parameter out, so nothing depends on how sevdesk parses the string "false".
- */
-export const FORCED_PARAMS: Readonly<Record<string, boolean>> = {
-  preventSendBy: true,
-  enshrine: false,
-  enshrineDocuments: false,
-};
 
 /** Applied when an operation declares `limit` and the caller sets none. */
 export const DEFAULT_LIMIT = 50;
@@ -268,14 +255,16 @@ export function buildRequest(
   const appliedDefaults: Record<string, unknown> = {};
   for (const spec of operation.params) {
     let value = params[spec.name];
-    const forced = FORCED_PARAMS[spec.name];
-    if (forced !== undefined) {
-      if (value !== undefined && value !== forced && value !== String(forced)) {
-        fail(`${spec.name} is always ${forced} on this server`);
+    if (spec.in === "query") {
+      let pinned: PinnedParam | undefined;
+      try {
+        pinned = pinQueryParam(spec.name, value);
+      } catch (error) {
+        if (error instanceof PinViolation) fail(error.message);
+        throw error;
       }
-      // Omitted means off for these flags; see FORCED_PARAMS.
-      if (!forced) continue;
-      value = forced;
+      if (pinned?.omit) continue;
+      if (pinned) value = pinned.value;
     }
     if (value === undefined && spec.name === "limit" && spec.in === "query") {
       value = DEFAULT_LIMIT;

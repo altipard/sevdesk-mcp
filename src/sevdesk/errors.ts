@@ -10,7 +10,9 @@ export type SevdeskErrorKind =
   | "server_error"
   | "http_error"
   | "timeout"
-  | "network";
+  | "network"
+  /** Refused locally by a policy pin; nothing was sent. */
+  | "policy";
 
 export interface SevdeskErrorDetails {
   status?: number;

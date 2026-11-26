@@ -27,8 +27,8 @@ export type OperationClass = (typeof OPERATION_CLASSES)[number];
  *   because they can change booked or sent documents;
  * - export job follow-ups (Progress, ExportJob): R+ like the exports themselves.
  *
- * Parameters that would lift an operation into a higher class are pinned by
- * the fallback instead (FORCED_PARAMS in src/tools/generic.ts): getPdf always
+ * Parameters that would lift an operation into a higher class are pinned on
+ * every call path instead (src/policy/pins.ts): getPdf always
  * runs with preventSendBy=true, so it is R here, and the DATEV exports never
  * send enshrine/enshrineDocuments=true.
  */

@@ -134,14 +134,14 @@ function approvalState(ctx: ServerContext): ApprovalState {
   return content?.confirm === true ? "approved" : "declined";
 }
 
-/** Definite rejections by sevdesk free the idempotency key; unknown outcomes keep it. */
+/**
+ * Definite rejections free the idempotency key, unknown outcomes keep it:
+ * a 4xx from sevdesk, or a local policy refusal before anything was sent.
+ */
 function isDefiniteRejection(error: unknown): boolean {
-  return (
-    error instanceof SevdeskError &&
-    error.status !== undefined &&
-    error.status >= 400 &&
-    error.status < 500
-  );
+  if (!(error instanceof SevdeskError)) return false;
+  if (error.kind === "policy") return true;
+  return error.status !== undefined && error.status >= 400 && error.status < 500;
 }
 
 /**
