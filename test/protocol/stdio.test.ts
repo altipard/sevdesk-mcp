@@ -1,7 +1,9 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -140,7 +142,14 @@ describe("built stdio binary", () => {
 
   it("exits with a clear message when the token is missing", async () => {
     const session = new StdioSession(
-      spawn(process.execPath, [BIN], { env: childEnv({ SEVDESK_BASE_URL: mockBaseUrl }) }),
+      spawn(process.execPath, [BIN], {
+        // An empty HOME keeps the server from finding a token the developer stored in the
+        // login keychain.
+        env: childEnv({
+          SEVDESK_BASE_URL: mockBaseUrl,
+          HOME: mkdtempSync(join(tmpdir(), "sevdesk-mcp-home-")),
+        }),
+      }),
     );
 
     expect(await session.close()).toBe(1);

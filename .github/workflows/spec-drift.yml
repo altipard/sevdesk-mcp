@@ -1,0 +1,62 @@
+# Weekly check whether sevdesk changed its published OpenAPI spec. The vendored copy in
+# openapi/ is what the overlay, the generated types and the request checks are built on, so a
+# change upstream needs a deliberate update here.
+name: spec-drift
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spec-drift
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      - name: download the published spec
+        run: |
+          curl -fsS --proto '=https' --tlsv1.2 --retry 3 --max-time 120 \
+            -o "$RUNNER_TEMP/sevdesk.openapi.yaml" https://api.sevdesk.de/openapi.yaml
+
+      - name: compare with the vendored spec
+        id: compare
+        run: |
+          if cmp -s openapi/sevdesk.openapi.yaml "$RUNNER_TEMP/sevdesk.openapi.yaml"; then
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+            echo "published spec matches openapi/sevdesk.openapi.yaml"
+          else
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+            diff -u openapi/sevdesk.openapi.yaml "$RUNNER_TEMP/sevdesk.openapi.yaml" | head -n 400 || true
+          fi
+
+      # Runs on the published spec even without drift: it shows whether the overlay still
+      # applies and the code still compiles, which is what an update would need.
+      - name: generate types from the published spec
+        run: |
+          cp "$RUNNER_TEMP/sevdesk.openapi.yaml" openapi/sevdesk.openapi.yaml
+          npm run gen
+          npm run typecheck:tsc
+
+      - name: fail on drift
+        if: steps.compare.outputs.drift == 'true'
+        run: |
+          echo "::error::the published sevdesk spec differs from openapi/sevdesk.openapi.yaml; update the vendored copy and the overlay"
+          exit 1
