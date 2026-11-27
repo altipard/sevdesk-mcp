@@ -6,11 +6,11 @@ import { BOOKKEEPING_1_MESSAGE } from "../../src/tools/tax-rules.js";
 import {
   address,
   contact,
+  voucher as fixtureVoucher,
   invoice,
   list,
   receiptGuide,
   transaction,
-  voucher,
   voucherPosition,
 } from "../fixtures/sevdesk.js";
 import {
@@ -27,6 +27,19 @@ import {
 } from "../support/harness.js";
 
 const api = mockSevdesk();
+
+/** Fixture voucher whose *Accounting sums follow overridden sums unless given themselves. */
+function voucher(overrides: Record<string, unknown> = {}) {
+  const base = fixtureVoucher(overrides);
+  const follow = (field: "sumNet" | "sumTax" | "sumGross") =>
+    `${field}Accounting` in overrides ? overrides[`${field}Accounting`] : base[field];
+  return {
+    ...base,
+    sumNetAccounting: follow("sumNet"),
+    sumTaxAccounting: follow("sumTax"),
+    sumGrossAccounting: follow("sumGross"),
+  };
+}
 
 const ref = (id: number, objectName: string) => ({ id: String(id), objectName });
 const MARCH = { startDate: "2026-03-01", endDate: "2026-03-31" };
@@ -572,7 +585,14 @@ describe("summarize_documents", () => {
         HttpResponse.json(
           list([
             voucher({ id: "1", creditDebit: "D", sumGross: "50" }),
-            voucher({ id: "2", creditDebit: "C", sumGross: "500", currency: "CHF" }),
+            // CHF voucher: sumGross in CHF, the accounting sum in euro.
+            voucher({
+              id: "2",
+              creditDebit: "C",
+              currency: "CHF",
+              sumGross: "520",
+              sumGrossAccounting: "500",
+            }),
           ]),
         ),
       ),
@@ -585,8 +605,36 @@ describe("summarize_documents", () => {
       ["D", 50, 0],
     ]);
     expect(data.note).toContain("euro amounts");
+    expect(data.note).not.toContain("unconfirmed");
     expect(textOf(result).split("\n")[0]).toBe(
       "2 vouchers 2026-03-01 to 2026-03-31, gross income 500 EUR, expenses 50 EUR.",
+    );
+  });
+
+  it("falls back to sumGross for a foreign voucher without accounting sums and says so", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Voucher"), () =>
+        HttpResponse.json(
+          list([
+            voucher({
+              id: "2",
+              currency: "USD",
+              sumGross: "520",
+              sumNetAccounting: null,
+              sumTaxAccounting: null,
+              sumGrossAccounting: null,
+            }),
+          ]),
+        ),
+      ),
+    );
+    const c = await connect();
+    const data = structured<{ totals: Array<{ gross: number }>; note: string }>(
+      await c.call("summarize_documents", { documentType: "vouchers", ...MARCH }),
+    );
+    expect(data.totals[0]?.gross).toBe(520);
+    expect(data.note).toContain(
+      "1 voucher(s) in another currency came without euro accounting sums",
     );
   });
 

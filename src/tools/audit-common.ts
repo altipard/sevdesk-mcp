@@ -270,18 +270,36 @@ export interface AuditVoucher {
   readonly supplierName: string | null;
   readonly status: number | null;
   readonly creditDebit: string | null;
-  /** Document currency if not EUR; the sums are in euro either way. */
+  /** Document currency if not EUR. */
   readonly foreignCurrency: string | null;
+  /** Euro sums: the *Accounting fields where sevdesk sends them, else sumNet etc. */
   readonly sumNet: number | null;
   readonly sumTax: number | null;
   readonly sumGross: number | null;
+  /**
+   * Foreign-currency voucher without the *Accounting sums: its sums are
+   * sumNet etc., whose currency the spec does not state.
+   */
+  readonly euroUnconfirmed: boolean;
   readonly openAmount: number | null;
   readonly taxRuleId: number | null;
   readonly hasDocument: boolean;
 }
 
+/**
+ * Vouchers have no *ForeignCurrency sums, only sumNetAccounting,
+ * sumTaxAccounting and sumGrossAccounting, documented as "usually the same
+ * as sumNet": they differ for foreign currency, so they are read as the euro
+ * amounts. Without them sumNet etc. are used; for a foreign-currency
+ * voucher that euro amount is unconfirmed (euroUnconfirmed).
+ */
 export function mapAuditVoucher(raw: Raw): AuditVoucher {
   const summary = mapVoucherSummary(raw);
+  const foreignCurrency = foreignCurrencyOf(summary.currency);
+  const net = amount(raw.sumNetAccounting);
+  const tax = amount(raw.sumTaxAccounting);
+  const gross = amount(raw.sumGrossAccounting);
+  const accounting = net !== null && gross !== null;
   return {
     id: summary.id,
     date: summary.voucherDate,
@@ -290,10 +308,11 @@ export function mapAuditVoucher(raw: Raw): AuditVoucher {
     supplierName: summary.supplierName,
     status: summary.status,
     creditDebit: summary.creditDebit,
-    foreignCurrency: foreignCurrencyOf(summary.currency),
-    sumNet: summary.sumNet,
-    sumTax: amount(raw.sumTax),
-    sumGross: summary.sumGross,
+    foreignCurrency,
+    sumNet: accounting ? net : summary.sumNet,
+    sumTax: accounting ? (tax ?? amount(raw.sumTax)) : amount(raw.sumTax),
+    sumGross: accounting ? gross : summary.sumGross,
+    euroUnconfirmed: foreignCurrency !== null && !accounting,
     openAmount: summary.openAmount,
     taxRuleId: refId(raw.taxRule),
     hasDocument: refId(raw.document) !== null,
@@ -407,8 +426,10 @@ export async function scanInvoices(run: AuditRun, period: Period): Promise<Audit
 }
 
 /**
- * GET /CreditNote declares no paging in the spec; sevdesk answers unpaged
- * list requests with up to 100 objects, so a full answer may be cut.
+ * GET /CreditNote declares no limit/offset in the spec, so the client cannot
+ * page it (requests outside the spec are refused). That sevdesk answers
+ * such unpaged requests with at most 100 objects is an assumption, taken
+ * from the other unpaged lists; a full answer is marked truncated.
  */
 export const MAX_CREDIT_NOTES = 100;
 
@@ -433,8 +454,8 @@ export async function scanCreditNotes(run: AuditRun, period: Period): Promise<Au
   if (rows.length >= MAX_CREDIT_NOTES) {
     run.hit(
       "cap:credit notes",
-      `sevdesk returned ${rows.length} credit notes in one answer (the API offers no paging ` +
-        "for them); more may exist. Narrow the period.",
+      `sevdesk returned ${rows.length} credit notes in one answer. The API declares no paging ` +
+        "for them and a limit of 100 per answer is assumed, so more may exist. Narrow the period.",
     );
   }
   return rows
@@ -564,6 +585,16 @@ export function transactionRef(t: AuditTransaction): DocumentRef {
     foreignCurrency: null,
     foreignAmount: null,
   };
+}
+
+/** Note for answers with foreign-currency vouchers whose euro amount sevdesk did not send. */
+export function euroNote(vouchers: readonly AuditVoucher[]): string | undefined {
+  const count = vouchers.filter((v) => v.euroUnconfirmed).length;
+  if (count === 0) return undefined;
+  return (
+    `${count} voucher(s) in another currency came without euro accounting sums; their amounts ` +
+    "are sevdesk's sumNet/sumGross, whose currency is unconfirmed."
+  );
 }
 
 /** Lower-case, single-spaced key for comparing names and numbers. */

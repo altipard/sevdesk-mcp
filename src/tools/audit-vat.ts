@@ -10,6 +10,7 @@ import {
   checkPeriod,
   type DocumentRef,
   documentRefSchema,
+  euroNote,
   HINT_DISCLAIMER,
   invoiceRef,
   MAX_AUDIT_CONTACTS,
@@ -338,8 +339,11 @@ export function checkVoucher({ voucher, positions, country, guidance }: VoucherC
     add(
       "low",
       "FOREIGN_CURRENCY",
-      `Document currency ${voucher.foreignCurrency}; the amounts shown are the euro amounts ` +
-        "sevdesk reports.",
+      voucher.euroUnconfirmed
+        ? `Document currency ${voucher.foreignCurrency}; sevdesk sent no euro accounting sums, ` +
+            "so the amounts shown may be in that currency and position sums were not compared."
+        : `Document currency ${voucher.foreignCurrency}; the amounts shown are sevdesk's euro ` +
+            "accounting sums and position sums were not compared.",
       "Check the exchange rate and the euro amounts in sevdesk.",
     );
   }
@@ -464,7 +468,8 @@ export function checkVoucher({ voucher, positions, country, guidance }: VoucherC
     }
   }
 
-  if (!positions.partial && list.length > 0) {
+  // Position sums are in the document currency, the header in euro: compare only euro vouchers.
+  if (!positions.partial && list.length > 0 && voucher.foreignCurrency === null) {
     const tolerance = Math.max(SUM_TOLERANCE, 0.01 * list.length);
     const net = sum(list.map((p) => p.sumNet));
     const gross = sum(list.map((p) => p.sumGross));
@@ -728,6 +733,7 @@ export const auditVat = defineTool({
         truncated,
         ...run.noteField([
           version.note,
+          euroNote(vouchers),
           vouchers.length > 0 &&
             guidance === undefined &&
             "Booking accounts were not checked: sevdesk's tax guidance was not available.",
@@ -937,6 +943,7 @@ export const reverseChargeReport = defineTool({
         truncated,
         ...run.noteField([
           version.note,
+          euroNote(vouchers),
           partialInvoiceNote(revenueInvoices),
           classified.length === 0 && "No reverse charge documents in the period.",
         ]),

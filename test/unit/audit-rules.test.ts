@@ -5,12 +5,15 @@ import {
   type AuditTransaction,
   type AuditVoucher,
   checkPeriod,
+  euroNote,
+  mapAuditVoucher,
   mapLimited,
 } from "../../src/tools/audit-common.js";
 import {
   billedMonths,
   findDuplicates,
   findGaps,
+  hasDocumentNumber,
   monthsBefore,
   type Summable,
   summarize,
@@ -38,6 +41,7 @@ function voucher(overrides: Partial<AuditVoucher> = {}): AuditVoucher {
     sumNet: 100,
     sumTax: 0,
     sumGross: 100,
+    euroUnconfirmed: false,
     openAmount: 100,
     taxRuleId: 9,
     hasDocument: true,
@@ -61,6 +65,39 @@ describe("checkPeriod", () => {
       startDate: "2026-03-01",
       endDate: "2026-03-01",
     });
+  });
+});
+
+describe("voucher euro amounts", () => {
+  const raw = (overrides: Record<string, unknown>) => ({
+    id: "1",
+    currency: "USD",
+    status: "100",
+    sumNet: "110",
+    sumTax: "0",
+    sumGross: "110",
+    ...overrides,
+  });
+
+  it("reads the accounting sums as euro when sevdesk sends them", () => {
+    const v = mapAuditVoucher(
+      raw({ sumNetAccounting: "100", sumTaxAccounting: "0", sumGrossAccounting: "100" }),
+    );
+    expect(v).toMatchObject({
+      sumNet: 100,
+      sumGross: 100,
+      foreignCurrency: "USD",
+      euroUnconfirmed: false,
+    });
+    expect(euroNote([v])).toBeUndefined();
+  });
+
+  it("falls back to sumNet and marks the euro amount of a foreign voucher unconfirmed", () => {
+    const v = mapAuditVoucher(raw({}));
+    expect(v).toMatchObject({ sumNet: 110, sumGross: 110, euroUnconfirmed: true });
+    expect(euroNote([v])).toContain("1 voucher(s)");
+    // A euro voucher without accounting sums is fine.
+    expect(mapAuditVoucher(raw({ currency: "EUR" })).euroUnconfirmed).toBe(false);
   });
 });
 
@@ -516,6 +553,36 @@ describe("duplicates", () => {
     expect(findings[0]?.detail).not.toContain("R-77");
   });
 
+  it("does not take a bare year for a number, and needs 90 days for high", () => {
+    expect(hasDocumentNumber("miete 2026")).toBe(false);
+    expect(hasDocumentNumber("inv-2026-001")).toBe(true);
+    expect(hasDocumentNumber("r 12345")).toBe(true);
+    const yearOnly = findDuplicates(
+      [
+        voucher({ id: 1, description: "Miete 2026", date: "2026-01-01", sumGross: 900 }),
+        voucher({ id: 2, description: "Miete 2026", date: "2026-02-01", sumGross: 900 }),
+      ],
+      options,
+    );
+    expect(yearOnly).toEqual([]);
+    const far = findDuplicates(
+      [
+        voucher({ id: 1, description: "R-1", date: "2025-03-01", sumGross: 50 }),
+        voucher({ id: 2, description: "R-1", date: "2026-03-01", sumGross: 50 }),
+      ],
+      options,
+    );
+    expect(far).toEqual([expect.objectContaining({ severity: "low", code: "SAME_NUMBER" })]);
+    const near = findDuplicates(
+      [
+        voucher({ id: 1, description: "R-1", date: "2026-01-01", sumGross: 50 }),
+        voucher({ id: 2, description: "R-1", date: "2026-03-31", sumGross: 50 }),
+      ],
+      options,
+    );
+    expect(near).toEqual([expect.objectContaining({ severity: "high", code: "SAME_NUMBER" })]);
+  });
+
   it("lists drafts older than draftAgeDays", () => {
     const findings = findDuplicates(
       [
@@ -606,9 +673,28 @@ describe("subscription gaps", () => {
     );
     expect(detected).toBe(1);
     expect(gaps).toEqual([]);
-    expect([...billedMonths(["2026-01-31", "2026-03-01"])].sort()).toHaveLength(2);
+    expect(billedMonths(["2026-01-31", "2026-03-01"]).size).toBe(3);
     // A single early voucher without a month-end one before it stays in its month.
     expect(billedMonths(["2026-01-15", "2026-03-02"]).size).toBe(2);
+  });
+
+  it("keeps the own month when month-end billing drifts (30.01., 01.03., 01.04., 01.05.)", () => {
+    const dates = ["2026-01-30", "2026-03-01", "2026-04-01", "2026-05-01"];
+    expect([...billedMonths(dates)].map((m) => `${Math.floor(m / 12)}-${(m % 12) + 1}`)).toEqual([
+      "2026-1",
+      "2026-3",
+      "2026-4",
+      "2026-5",
+      "2026-2",
+    ]);
+    const { gaps } = findGaps(
+      dates.map((date, i) => voucher({ id: 300 + i, date })),
+      { startDate: "2026-01-01", endDate: "2026-05-31" },
+      { minMonths: 3, today: "2026-06-15" },
+    );
+    expect(gaps).toEqual([]);
+    // The original case: 31.01., then 01.03. covers February and March.
+    expect(billedMonths(["2026-01-31", "2026-03-01"]).size).toBe(3);
   });
 
   it("monthsBefore", () => {

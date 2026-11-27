@@ -7,6 +7,7 @@ import {
   auditFields,
   checkPeriod,
   documentRefSchema,
+  euroNote,
   normalized,
   type Period,
   partialInvoiceNote,
@@ -52,6 +53,13 @@ const duplicateSchema = z.object({
 type Duplicate = z.infer<typeof duplicateSchema>;
 
 export const DEFAULT_DUPLICATE_WINDOW_DAYS = 7;
+/** Same number and amount further apart than this is low (a yearly bill), not high. */
+export const SAME_NUMBER_WINDOW_DAYS = 90;
+
+/** A description is a document number when it has a digit outside year-like 19xx/20xx tokens. */
+export function hasDocumentNumber(description: string): boolean {
+  return /\d/.test(description.replace(/(?<!\d)(?:19|20)\d{2}(?!\d)/g, ""));
+}
 export const DEFAULT_DRAFT_AGE_DAYS = 30;
 
 const byDate = (a: AuditVoucher, b: AuditVoucher) =>
@@ -72,15 +80,16 @@ export function findDuplicates(
   };
 
   // Same voucher number for the same supplier and side. The description is
-  // free text ("Miete" every month), so it only counts as a number when it
-  // has a digit, and only the same number with the same amount is high.
+  // free text ("Miete" or "Miete 2026" every month), so it only counts as a
+  // number when it has a digit besides a year, and only the same number with
+  // the same amount within SAME_NUMBER_WINDOW_DAYS is high.
   const numbered = new Set<string>();
   const pair = (x: AuditVoucher, y: AuditVoucher) =>
     `${Math.min(x.id, y.id)}-${Math.max(x.id, y.id)}`;
   for (const group of groupBy((v) => {
     const supplier = supplierKey(v);
     const number = normalized(v.description);
-    return supplier === null || !/\d/.test(number)
+    return supplier === null || !hasDocumentNumber(number)
       ? null
       : `${supplier}\u0000${v.creditDebit}\u0000${number}`;
   })) {
@@ -93,17 +102,34 @@ export function findDuplicates(
     let same = false;
     for (const [key, members] of byAmount) {
       if (members.length < 2 || key === "none") continue;
-      same = true;
       const sorted = [...members].sort(byDate);
-      for (const x of sorted) for (const y of sorted) if (x.id !== y.id) numbered.add(pair(x, y));
-      findings.push({
-        severity: "high",
-        code: "SAME_NUMBER",
-        documents: sorted.map(voucherRef),
-        detail:
-          `${sorted.length} vouchers of the same supplier with the same voucher number and ` +
-          "amount; possibly booked twice.",
-      });
+      // Clusters of vouchers at most SAME_NUMBER_WINDOW_DAYS apart; no date, no cluster.
+      const clusters: AuditVoucher[][] = [];
+      for (const v of sorted) {
+        const cluster = clusters[clusters.length - 1];
+        const last = cluster?.[cluster.length - 1];
+        if (
+          cluster !== undefined &&
+          last?.date != null &&
+          v.date !== null &&
+          daysBetween(last.date, v.date) <= SAME_NUMBER_WINDOW_DAYS
+        ) {
+          cluster.push(v);
+        } else clusters.push([v]);
+      }
+      for (const cluster of clusters.filter((c) => c.length >= 2)) {
+        same = true;
+        for (const x of cluster)
+          for (const y of cluster) if (x.id !== y.id) numbered.add(pair(x, y));
+        findings.push({
+          severity: "high",
+          code: "SAME_NUMBER",
+          documents: cluster.map(voucherRef),
+          detail:
+            `${cluster.length} vouchers of the same supplier with the same voucher number and ` +
+            `amount within ${SAME_NUMBER_WINDOW_DAYS} days; possibly booked twice.`,
+        });
+      }
     }
     if (!same) {
       findings.push({
@@ -111,8 +137,9 @@ export function findDuplicates(
         code: "SAME_NUMBER",
         documents: [...group].sort(byDate).map(voucherRef),
         detail:
-          `${group.length} vouchers of the same supplier with the same voucher number but ` +
-          "different amounts; check whether one corrects or repeats the other.",
+          `${group.length} vouchers of the same supplier with the same voucher number, but with ` +
+          `different amounts or more than ${SAME_NUMBER_WINDOW_DAYS} days apart; check whether ` +
+          "one corrects or repeats the other.",
       });
     }
   }
@@ -234,7 +261,10 @@ export const findDuplicateVouchers = defineTool({
         findings,
         page,
         truncated: run.truncated,
-        ...run.noteField([vouchers.length === 0 && "No vouchers in the period."]),
+        ...run.noteField([
+          euroNote(vouchers),
+          vouchers.length === 0 && "No vouchers in the period.",
+        ]),
       },
       {
         summary:
@@ -293,8 +323,9 @@ const median = (values: number[]): number | null => {
 /**
  * Months a supplier's vouchers cover. Billing at month end drifts into the
  * next month (31.01., then 01.03. for February): a voucher on day 1-3 counts
- * for the month before when that month has none and either its own month
- * has another voucher or the month before that ends with one on day 28+.
+ * for the month before as well when that month has none and either its own
+ * month has another voucher or the month before that ends with one on day
+ * 28+. Its own month stays covered: 30.01., 01.03., 01.04. shows no gap.
  */
 export function billedMonths(dates: readonly string[]): Set<number> {
   const days = new Map<number, number[]>();
@@ -307,11 +338,7 @@ export function billedMonths(dates: readonly string[]): Set<number> {
     const inMonth = days.get(month) ?? [];
     if (!inMonth.some((day) => day <= 3) || covered.has(month - 1)) continue;
     const lateBefore = (days.get(month - 2) ?? []).some((day) => day >= 28);
-    if (inMonth.length >= 2) covered.add(month - 1);
-    else if (lateBefore) {
-      covered.add(month - 1);
-      covered.delete(month);
-    }
+    if (inMonth.length >= 2 || lateBefore) covered.add(month - 1);
   }
   return covered;
 }
@@ -441,6 +468,7 @@ export const findSubscriptionGaps = defineTool({
             `The cap was hit with ${args.historyMonths} months of history included, so months ` +
               "reported missing may simply not have been read; lower historyMonths or narrow " +
               "the period.",
+          euroNote(vouchers),
           vouchers.length === 0 && "No expense vouchers in the period.",
         ]),
       },
@@ -624,19 +652,21 @@ export const summarizeDocuments = defineTool({
         };
       });
     } else {
-      docs = (await scanVouchers(run, period, args.creditDebit))
-        .filter((v) => args.includeDrafts || v.status !== 50)
-        .map((v) => ({
-          date: v.date,
-          statusName: v.status === null ? "unknown" : (VOUCHER_STATUS[v.status] ?? "unknown"),
-          contactKey: contactKeyOf(v.supplierId, v.supplierName),
-          contactName: v.supplierName,
-          creditDebit: v.creditDebit === "C" || v.creditDebit === "D" ? v.creditDebit : null,
-          foreign: v.foreignCurrency !== null,
-          net: v.sumNet,
-          tax: v.sumTax,
-          gross: v.sumGross,
-        }));
+      const vouchers = (await scanVouchers(run, period, args.creditDebit)).filter(
+        (v) => args.includeDrafts || v.status !== 50,
+      );
+      extra.push(euroNote(vouchers));
+      docs = vouchers.map((v) => ({
+        date: v.date,
+        statusName: v.status === null ? "unknown" : (VOUCHER_STATUS[v.status] ?? "unknown"),
+        contactKey: contactKeyOf(v.supplierId, v.supplierName),
+        contactName: v.supplierName,
+        creditDebit: v.creditDebit === "C" || v.creditDebit === "D" ? v.creditDebit : null,
+        foreign: v.foreignCurrency !== null,
+        net: v.sumNet,
+        tax: v.sumTax,
+        gross: v.sumGross,
+      }));
     }
     const { groups: all, totals } = summarize(docs, args.groupBy);
     const groups = all.slice(args.offset, args.offset + args.limit);
