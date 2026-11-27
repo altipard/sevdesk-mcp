@@ -153,8 +153,8 @@ CLI), shows a plan and asks once:
     token:   ask for it once and store it in the macOS keychain
     mode:    read (--mode=write or SEVDESK_MODE=write to allow changes)
     clients: Claude Desktop, Claude Code
-             an existing "sevdesk" entry is updated (command, SEVDESK_MODE; other
-             env kept); JSON files are backed up first
+             an existing "sevdesk" entry is updated (command and SEVDESK_MODE set,
+             args removed, other env kept); files are backed up first
 
   Go ahead? [Y/n]
 ```
@@ -163,7 +163,8 @@ The token is read once with hidden input, checked for the 32-hex format and agai
 sevdesk API (a rejected token is asked for again), and goes to the keychain, never into a
 client configuration. A token already in the keychain is kept. A Claude Code entry with its
 own command or env stays unchanged unless you pass `--replace-entries`: carrying its env over
-would put the values on a command line, and they are never printed. Changing JSON configurations
+would put the values on a command line, and they are never printed. Remote (URL) entries are
+never changed. Changing JSON configurations
 needs `jq` or `python3`; files that are not valid JSON are left alone and the installer
 prints the entry to add by hand. Without a terminal, or with `--no-setup`, it installs only
 and prints the next steps.
@@ -181,7 +182,7 @@ and prints the next steps.
 | `--no-setup` | Install only, skip the keychain and MCP client setup. |
 | `--mode=MODE` | Mode for the client entries: `read` (default), `write` or `full`. |
 | `--replace-token` | Ask for a new token even if one is already in the keychain. |
-| `--replace-entries` | Replace a Claude Code entry that has its own command or env (its env is not kept). |
+| `--replace-entries` | Replace a Claude Code entry that has its own command or env (its env is not kept; `~/.claude.json` is copied first, mode 600). |
 | `--no-verify` | Store the token without checking it against the sevdesk API. |
 | `-h`, `--help` | Show the help. |
 
