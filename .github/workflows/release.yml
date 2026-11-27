@@ -398,7 +398,8 @@ jobs:
           NAME: ${{ steps.server.outputs.name }}
         run: |
           encoded=$(printf '%s' "$NAME" | jq -sRr @uri)
-          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+          status=$(curl -sS --proto '=https' --tlsv1.2 --connect-timeout 15 --retry 2 \
+            -o /dev/null -w '%{http_code}' \
             "https://registry.modelcontextprotocol.io/v0.1/servers/$encoded/versions/$VERSION")
           case "$status" in
             200)
