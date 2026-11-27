@@ -373,6 +373,7 @@ const emptyTotals = (currency: string | null): Totals => ({
 /** Why a scan stopped before sevdesk had no more invoices. */
 type ScanStop =
   | { reason: "deadline"; status: 200 | 750 }
+  | { reason: "cancelled"; status: 200 | 750 }
   | { reason: "failed"; status: 200 | 750; offset: number; error: SevdeskError };
 
 interface StatusScan {
@@ -397,10 +398,15 @@ async function scanStatus(
   const { sevdesk } = call;
   const invoices: InvoiceSummary[] = [];
   for (let offset = 0; offset < MAX_RECEIVABLES_SCANNED; offset += SCAN_PAGE) {
+    // The MCP client cancelled: nobody reads the answer, stop sending.
+    if (call.signal.aborted) {
+      return { invoices, truncated: false, stop: { reason: "cancelled", status } };
+    }
     const remaining = state.deadline - Date.now();
     if (remaining <= 0) return { invoices, truncated: false, stop: { reason: "deadline", status } };
-    // Also cuts a page that hangs, so the deadline holds within a page too.
-    const signal = AbortSignal.timeout(remaining);
+    // Also cuts a page that hangs, so the deadline holds within a page too,
+    // and ends a page (or its wait for the rate limiter) on cancel.
+    const signal = AbortSignal.any([call.signal, AbortSignal.timeout(remaining)]);
     const first = state.requests === 0;
     state.requests++;
     let body: unknown;
@@ -422,6 +428,9 @@ async function scanStatus(
       // A local policy refusal is never a partial answer; nor is a failure
       // before anything was collected.
       if (error instanceof SevdeskError && error.kind === "policy") throw error;
+      if (call.signal.aborted) {
+        return { invoices, truncated: false, stop: { reason: "cancelled", status } };
+      }
       if (first) throw error;
       if (signal.aborted)
         return { invoices, truncated: false, stop: { reason: "deadline", status } };
@@ -442,9 +451,11 @@ function stopNote(stop: ScanStop, checked: number): string {
   const cause =
     stop.reason === "deadline"
       ? `Stopped after ${RECEIVABLES_DEADLINE_MS / 1000} s with ${checked} invoices checked`
-      : `Reading invoices failed at offset ${stop.offset} of status ${stop.status} ` +
-        `(${stop.error.kind}${stop.error.status !== undefined ? ` ${stop.error.status}` : ""}) ` +
-        `after ${checked} invoices`;
+      : stop.reason === "cancelled"
+        ? `The call was cancelled after ${checked} invoices`
+        : `Reading invoices failed at offset ${stop.offset} of status ${stop.status} ` +
+          `(${stop.error.kind}${stop.error.status !== undefined ? ` ${stop.error.status}` : ""}) ` +
+          `after ${checked} invoices`;
   const skipped =
     stop.status === 200 ? " Partially paid invoices (status 750) were not queried." : "";
   return `${cause}; receivables and totals are incomplete.${skipped} Narrow by contactId.`;

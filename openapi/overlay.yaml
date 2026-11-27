@@ -140,6 +140,11 @@ actions:
   - target: "$.paths['/Part'].get.parameters"
     description: Pagination and embed on GET /Part
     update: *listParameters
+  - target: "$.paths['/CreditNote'].get.parameters"
+    description: Pagination on GET /CreditNote (audit tools page through the credit notes of a period)
+    update:
+      - $ref: "#/components/parameters/limit"
+      - $ref: "#/components/parameters/offset"
   - target: "$.paths['/CommunicationWay'].get.parameters"
     description: Pagination on GET /CommunicationWay (e-mail search pages through it)
     update:

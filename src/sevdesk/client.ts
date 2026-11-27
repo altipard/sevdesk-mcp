@@ -464,12 +464,17 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
 
       const rateLimited = response.status === 429;
       const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
+      // Retry-After 0 (or a date in the past) still gets a minimal pause.
+      const delay =
+        retryAfter === undefined
+          ? backoffDelay((rateLimited ? rateLimitRetries : otherRetries) + 1, policy.retry)
+          : Math.max(policy.retry.baseDelayMs, retryAfter);
       // sevdesk throttles the token, not this call: hold back the other
       // calls of the token as well, whether or not this one is retried.
-      // Capped like our own wait, so a huge header cannot lock the token.
-      if (rateLimited && retryAfter !== undefined) {
-        policy.limiter.pause(Math.min(retryAfter, policy.retry.maxDelayMs));
-      }
+      // For as long as this call would wait (Retry-After with its minimum,
+      // else the backoff). Capped like our own wait, so a huge header
+      // cannot lock the token.
+      if (rateLimited) policy.limiter.pause(Math.min(delay, policy.retry.maxDelayMs));
 
       // Retries of other answers are bounded by maxRetries and GET only;
       // a 429 by its own budget, for every method.
@@ -478,11 +483,6 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
         : canRetry && isRetryableStatus(response.status);
       if (!retryStatus) return response;
 
-      // Retry-After 0 (or a date in the past) still gets a minimal pause.
-      const delay =
-        retryAfter === undefined
-          ? backoffDelay((rateLimited ? rateLimitRetries : otherRetries) + 1, policy.retry)
-          : Math.max(policy.retry.baseDelayMs, retryAfter);
       // A server asking for a longer pause than we are willing to wait, or
       // one past the deadline, gets its error passed through as is.
       if (delay > policy.retry.maxDelayMs || !fitsDeadline(delay)) return response;

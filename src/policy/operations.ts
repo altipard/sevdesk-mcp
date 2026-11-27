@@ -420,6 +420,8 @@ export const OPERATIONS = {
       { name: "endDate", in: "query", type: "integer", required: false },
       { name: "contact[id]", in: "query", type: "integer", required: false },
       { name: "contact[objectName]", in: "query", type: "string", required: false },
+      { name: "limit", in: "query", type: "integer", required: false },
+      { name: "offset", in: "query", type: "integer", required: false },
     ],
   },
   createcreditNote: {

@@ -42,9 +42,10 @@ Retries:
   without running it, so repeating it cannot create or send anything twice. The wait is
   the `Retry-After` header (at least 0.5 s), otherwise an exponential backoff from 0.5 s
   with jitter. A `Retry-After` above 10 s, or one that would pass the deadline, is not
-  waited for: the 429 is returned with the hint ("Retry in N s"). A 429 with `Retry-After`
-  also holds back every other call of the same token for that time (at most 10 s), since
-  sevdesk throttles the token, not the single call. The 429 retries come on top of the
+  waited for: the 429 is returned with the hint ("Retry in N s"). Every 429 also holds back
+  the other calls of the same token, since sevdesk throttles the token, not the single call:
+  for the `Retry-After` time, or without the header for the backoff this call would wait (at
+  most 10 s either way). The 429 retries come on top of the
   ones below, so a 503 earlier in the same call does not use them up.
 - **502, 503, 504, timeouts, network errors**: retried up to 3 times for reads only. Writes
   and reads with a side effect (exports, sending) are sent once; their error says that the
@@ -52,7 +53,10 @@ Retries:
 - **500 and other errors**: never retried.
 
 Each attempt has a 30 s timeout, and the whole call, waits and retries included, ends
-after 60 s. Aborting a call (the client cancels the tool call) also ends any wait.
+after 60 s. When the client cancels a tool call, the audit tools (`summarize_documents`,
+`audit_vat`, `reverse_charge_report`, `find_duplicate_vouchers`, `find_subscription_gaps`,
+`reconcile_transactions`) and `list_open_receivables` stop sending, and a wait for pacing or
+a retry ends at once; other tools finish their few requests.
 
 What the mode and tool lists mean in practice: [Security](security.md). The live smoke:
 [Development](development.md#live-smoke-test).

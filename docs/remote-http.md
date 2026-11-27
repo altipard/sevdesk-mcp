@@ -30,7 +30,10 @@ authorization server (identity provider).
   `SEVDESK_API_TOKEN` only (no keychain lookup). Everyone with a valid access token acts as
   that sevdesk user, within their scopes. Since the pacing bucket belongs to the token, all
   callers share one bucket and its pace (`SEVDESK_RATE_LIMIT`, see
-  [Configuration](configuration.md#pacing-and-retries)): a busy caller slows the others. The
+  [Configuration](configuration.md#pacing-and-retries)): a busy caller slows the others.
+  Audit tools read many documents within 45 s, so audits running in parallel share that
+  budget and stop earlier, with `truncated: true` and a note. The operator can raise
+  `SEVDESK_RATE_LIMIT` if the sevdesk account allows a faster pace. The
   pace holds per process: several replicas together send up to their number times
   `SEVDESK_RATE_LIMIT`.
 - **Host and Origin.** `MCP_ALLOWED_HOSTS` is the allowlist for the `Host` header (DNS

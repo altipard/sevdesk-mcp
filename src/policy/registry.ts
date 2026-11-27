@@ -24,6 +24,12 @@ export interface ToolDeps {
 
 export interface ToolCall extends ToolDeps {
   readonly ctx: ServerContext;
+  /**
+   * Aborts when the MCP client cancels the call (ctx.mcpReq.signal). Tools
+   * that send many requests pass it on, so a cancelled call stops using
+   * the token's shared request budget.
+   */
+  readonly signal: AbortSignal;
 }
 
 /** All four hints, always explicit: clients must not fall back to defaults. */
@@ -300,7 +306,7 @@ export function registerTools(
       async (input: Record<string, unknown>, ctx: ServerContext) => {
         const { confirmation_token: token, ...rest } = input;
         const args = (confirm ? rest : input) as z.infer<typeof definition.inputSchema>;
-        const call: ToolCall = { ...deps, config, sevdesk, ctx };
+        const call: ToolCall = { ...deps, config, sevdesk, ctx, signal: ctx.mcpReq.signal };
         const previewCall: ToolCall = { ...call, sevdesk: previewClient };
         let operationId: OperationId | undefined;
         try {

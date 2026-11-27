@@ -1,5 +1,11 @@
-import { describe, expect, it } from "vitest";
-import { MAX_AUDIT_DOCUMENTS, MAX_AUDIT_POSITIONS } from "../../src/tools/audit-common.js";
+import { describe, expect, it, vi } from "vitest";
+import {
+  AUDIT_CONCURRENCY,
+  AUDIT_DEADLINE_MS,
+  CONTACT_RESERVE_MS,
+  MAX_AUDIT_DOCUMENTS,
+  MAX_AUDIT_POSITIONS,
+} from "../../src/tools/audit-common.js";
 import { addDays, berlinDateTime, todayIso, unixSeconds } from "../../src/tools/format.js";
 import { TOOLS } from "../../src/tools/index.js";
 import { BOOKKEEPING_1_MESSAGE } from "../../src/tools/tax-rules.js";
@@ -274,10 +280,12 @@ describe("audit_vat", () => {
     expect(data.note).toContain("Booking accounts were not checked");
   });
 
-  it(`reads positions for at most ${MAX_AUDIT_POSITIONS} vouchers and marks the answer truncated`, async () => {
-    const vouchers = Array.from({ length: MAX_AUDIT_POSITIONS + 1 }, (_, i) =>
-      voucher({ id: String(10_000 + i) }),
-    );
+  it(`reads positions for at most ${MAX_AUDIT_POSITIONS} vouchers, likely reverse charge cases first`, async () => {
+    // The last voucher is the only likely 13b case: expense, rule 9, no tax.
+    const vouchers = [
+      ...Array.from({ length: MAX_AUDIT_POSITIONS }, (_, i) => voucher({ id: String(10_000 + i) })),
+      voucher({ id: "19999", sumNet: "20", sumTax: "0", sumGross: "20" }),
+    ];
     api.server.use(
       version("2.0"),
       http.get(sevdeskUrl("/Voucher"), paged(vouchers)),
@@ -293,11 +301,229 @@ describe("audit_vat", () => {
       truncated: boolean;
       note: string;
     }>(await c.call("audit_vat", MARCH));
-    expect(requestsTo("/VoucherPos")).toHaveLength(MAX_AUDIT_POSITIONS);
+    const read = requestsTo("/VoucherPos");
+    expect(read).toHaveLength(MAX_AUDIT_POSITIONS);
+    expect(queryOf(read[0])["voucher[id]"]).toBe("19999");
     expect(data.checked.positionsRead).toBe(MAX_AUDIT_POSITIONS);
     expect(data.truncated).toBe(true);
-    expect(data.note).toContain(`first ${MAX_AUDIT_POSITIONS} of ${MAX_AUDIT_POSITIONS + 1}`);
+    expect(data.note).toContain(
+      `Positions were read for ${MAX_AUDIT_POSITIONS} of ${MAX_AUDIT_POSITIONS + 1} vouchers`,
+    );
+    expect(data.note).toContain("supplier countries for 0 of 0 suppliers");
+    expect(data.note).not.toContain("reverse charge check");
   }, 30_000);
+
+  it("ends the positions phase early to keep time for the supplier lookups", async () => {
+    const start = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"], now: start });
+    try {
+      const vouchers = Array.from({ length: 10 }, (_, i) =>
+        voucher({ id: String(9000 + i), sumNet: "20", sumTax: "0", sumGross: "20" }),
+      );
+      api.server.use(
+        version("2.0"),
+        http.get(sevdeskUrl("/Voucher"), () => HttpResponse.json(list(vouchers))),
+        http.get(sevdeskUrl("/ReceiptGuidance/forAllAccounts"), () => HttpResponse.json(list([]))),
+        http.get(sevdeskUrl("/VoucherPos"), ({ request }) => {
+          // The first answer arrives 36 s into the call: past the positions phase.
+          vi.setSystemTime(start + AUDIT_DEADLINE_MS - CONTACT_RESERVE_MS + 1000);
+          const id = Number(new URL(request.url).searchParams.get("voucher[id]"));
+          return HttpResponse.json(
+            list([voucherPosition({ voucher: ref(id, "Voucher"), taxRate: "0", sumTax: "0" })]),
+          );
+        }),
+        http.get(sevdeskUrl("/Contact/2003"), () =>
+          HttpResponse.json(
+            list([
+              contact({
+                id: "2003",
+                vatNumber: "IE1234567X",
+                addresses: [address({ country: ref(13, "StaticCountry") })],
+              }),
+            ]),
+          ),
+        ),
+      );
+      const c = await connect();
+      const data = structured<{
+        findings: Array<{ code: string }>;
+        checked: { positionsRead: number; suppliersLookedUp: number };
+        note: string;
+      }>(await c.call("audit_vat", MARCH));
+      const read = requestsTo("/VoucherPos").length;
+      // Only the requests already in flight when the phase ended.
+      expect(read).toBeLessThanOrEqual(AUDIT_CONCURRENCY);
+      expect(data.checked.positionsRead).toBe(read);
+      expect(requestsTo("/Contact/2003")).toHaveLength(1);
+      expect(data.checked.suppliersLookedUp).toBe(1);
+      expect(data.findings.map((f) => f.code)).toContain("FOREIGN_SUPPLIER_DOMESTIC_RULE");
+      expect(data.note).toContain(`Positions were read for ${read} of 10 vouchers`);
+      expect(data.note).toContain("supplier countries for 1 of 1 suppliers");
+      expect(data.note).toContain(
+        `The reverse charge check (section 13b UStG) was not done for ${10 - read} expense`,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("counts reverse charge cases whose supplier country could not be read", async () => {
+    api.server.use(
+      version("2.0"),
+      http.get(sevdeskUrl("/Voucher"), () =>
+        HttpResponse.json(
+          list([voucher({ id: "8001", sumNet: "20", sumTax: "0", sumGross: "20" })]),
+        ),
+      ),
+      http.get(sevdeskUrl("/ReceiptGuidance/forAllAccounts"), () => HttpResponse.json(list([]))),
+      http.get(sevdeskUrl("/VoucherPos"), () =>
+        HttpResponse.json(
+          list([voucherPosition({ voucher: ref(8001, "Voucher"), taxRate: "0", sumTax: "0" })]),
+        ),
+      ),
+      http.get(sevdeskUrl("/Contact/2003"), () => sevdeskError(503)),
+    );
+    const c = await connect();
+    const data = structured<{
+      findings: Array<{ code: string }>;
+      note: string;
+      truncated: boolean;
+    }>(await c.call("audit_vat", MARCH));
+    expect(data.findings.map((f) => f.code)).not.toContain("FOREIGN_SUPPLIER_DOMESTIC_RULE");
+    expect(data.truncated).toBe(true);
+    expect(data.note).toContain("supplier countries for 0 of 1 suppliers");
+    expect(data.note).toContain("was not done for 1 expense voucher(s) with rule 9 or 10");
+  });
+
+  it("reports a reverse charge case with a free-text supplier without truncating", async () => {
+    api.server.use(
+      version("2.0"),
+      http.get(sevdeskUrl("/Voucher"), () =>
+        HttpResponse.json(
+          list([
+            voucher({
+              id: "8001",
+              supplier: null,
+              supplierName: "Cloud Ltd",
+              sumNet: "20",
+              sumTax: "0",
+              sumGross: "20",
+            }),
+          ]),
+        ),
+      ),
+      http.get(sevdeskUrl("/ReceiptGuidance/forAllAccounts"), () => HttpResponse.json(list([]))),
+      http.get(sevdeskUrl("/VoucherPos"), () =>
+        HttpResponse.json(
+          list([voucherPosition({ voucher: ref(8001, "Voucher"), taxRate: "0", sumTax: "0" })]),
+        ),
+      ),
+    );
+    const c = await connect();
+    const data = structured<{ note: string; truncated: boolean }>(await c.call("audit_vat", MARCH));
+    expect(api.requests.filter((r) => pathOf(r).startsWith("/Contact"))).toHaveLength(0);
+    // Nothing was cut and narrowing the period would not help.
+    expect(data.truncated).toBe(false);
+    expect(data.note).toContain("1 expense voucher(s) with rule 9 or 10 and only 0 % positions");
+    expect(data.note).toContain("Link the supplier contact");
+    expect(data.note).not.toContain("Positions were read");
+    expect(data.note).not.toContain("Narrow the period");
+  });
+
+  it("keeps truncation for a missing country next to a free-text supplier", async () => {
+    api.server.use(
+      version("2.0"),
+      http.get(sevdeskUrl("/Voucher"), () =>
+        HttpResponse.json(
+          list([
+            voucher({ id: "8001", sumNet: "20", sumTax: "0", sumGross: "20" }),
+            voucher({
+              id: "8002",
+              supplier: null,
+              supplierName: "Cloud Ltd",
+              sumNet: "30",
+              sumTax: "0",
+              sumGross: "30",
+            }),
+          ]),
+        ),
+      ),
+      http.get(sevdeskUrl("/ReceiptGuidance/forAllAccounts"), () => HttpResponse.json(list([]))),
+      http.get(sevdeskUrl("/VoucherPos"), ({ request }) => {
+        const id = Number(new URL(request.url).searchParams.get("voucher[id]"));
+        return HttpResponse.json(
+          list([voucherPosition({ voucher: ref(id, "Voucher"), taxRate: "0", sumTax: "0" })]),
+        );
+      }),
+      http.get(sevdeskUrl("/Contact/2003"), () => sevdeskError(503)),
+    );
+    const c = await connect();
+    const data = structured<{ note: string; truncated: boolean }>(await c.call("audit_vat", MARCH));
+    expect(data.truncated).toBe(true);
+    // The missing country counts as unchecked, the free-text supplier gets its own note.
+    expect(data.note).toContain("supplier countries for 0 of 1 suppliers");
+    expect(data.note).toContain("was not done for 1 expense voucher(s) with rule 9 or 10");
+    expect(data.note).toContain("Narrow the period");
+    expect(data.note).toContain("1 expense voucher(s) with rule 9 or 10 and only 0 % positions");
+  });
+
+  it("sends nothing more after a 429 the retries could not get past", async () => {
+    const vouchers = Array.from({ length: 6 }, (_, i) => voucher({ id: String(7000 + i) }));
+    api.server.use(
+      version("2.0"),
+      http.get(sevdeskUrl("/Voucher"), () => HttpResponse.json(list(vouchers))),
+      http.get(sevdeskUrl("/ReceiptGuidance/forAllAccounts"), () => HttpResponse.json(list([]))),
+      http.get(sevdeskUrl("/VoucherPos"), () => sevdeskError(429)),
+    );
+    const c = await connect();
+    const data = structured<{
+      checked: { positionsRead: number };
+      note: string;
+      truncated: boolean;
+    }>(await c.call("audit_vat", MARCH));
+    const asked = new Set(requestsTo("/VoucherPos").map((r) => queryOf(r)["voucher[id]"]));
+    // The first wave was in flight; the vouchers after it were never asked for.
+    expect(asked.size).toBeLessThanOrEqual(AUDIT_CONCURRENCY);
+    expect(asked.has("7005")).toBe(false);
+    expect(data.checked.positionsRead).toBe(0);
+    expect(data.truncated).toBe(true);
+    expect(data.note).toContain("sevdesk answered 429 (rate limit)");
+    expect(data.note).not.toContain("Reading voucher positions failed");
+  });
+
+  it("fails with the rate limit error when the version check used it up", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Tools/bookkeepingSystemVersion"), () => sevdeskError(429)),
+      http.get(sevdeskUrl("/Voucher"), () => HttpResponse.json(list([]))),
+    );
+    const c = await connect();
+    const result = await c.call("audit_vat", MARCH);
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("rate limit");
+    expect(requestsTo("/Voucher")).toHaveLength(0);
+  });
+
+  it("stops sending when the client cancels the call", async () => {
+    const vouchers = Array.from({ length: 20 }, (_, i) => voucher({ id: String(6000 + i) }));
+    const controller = new AbortController();
+    api.server.use(
+      version("2.0"),
+      http.get(sevdeskUrl("/Voucher"), () => HttpResponse.json(list(vouchers))),
+      http.get(sevdeskUrl("/ReceiptGuidance/forAllAccounts"), () => HttpResponse.json(list([]))),
+      http.get(sevdeskUrl("/VoucherPos"), async ({ request }) => {
+        controller.abort();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const id = Number(new URL(request.url).searchParams.get("voucher[id]"));
+        return HttpResponse.json(list([voucherPosition({ voucher: ref(id, "Voucher") })]));
+      }),
+    );
+    const c = await connect();
+    await expect(
+      c.client.callTool({ name: "audit_vat", arguments: MARCH }, { signal: controller.signal }),
+    ).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(requestsTo("/VoucherPos").length).toBeLessThanOrEqual(AUDIT_CONCURRENCY);
+  });
 });
 
 describe("reverse_charge_report", () => {
@@ -352,7 +578,11 @@ describe("reverse_charge_report", () => {
       totals: Array<Record<string, unknown>>;
       documents: Array<Record<string, unknown>>;
       page: { total: number };
+      note: string;
     }>(result);
+    // Invoice 6 has no 13b rule, so only the credit note is subtracted.
+    expect(data.note).toContain("1 credit note(s) are subtracted in the sums");
+    expect(data.note).not.toContain("cancellation");
     expect(data.totals.map((t) => [t.category, t.documents, t.net])).toEqual([
       ["nets_to_zero", 1, 100],
       ["payable", 1, 40],
@@ -362,6 +592,8 @@ describe("reverse_charge_report", () => {
     expect(queryOf(requestsTo("/CreditNote")[0])).toEqual({
       startDate: String(unixSeconds("2026-03-01")),
       endDate: String(unixSeconds("2026-03-31", true)),
+      limit: "100",
+      offset: "0",
     });
     expect((result.structuredContent as { disclaimer: string }).disclaimer).toContain(
       "document date",
@@ -638,31 +870,76 @@ describe("summarize_documents", () => {
     );
   });
 
-  it("marks the answer truncated when sevdesk returns a full unpaged list of credit notes", async () => {
+  it("pages through the credit notes of the period and says they are subtracted", async () => {
+    const creditNotes = Array.from({ length: 150 }, (_, i) => ({
+      id: String(i + 1),
+      creditNoteDate: "2026-03-05T00:00:00+01:00",
+      status: "200",
+      sumNet: "1",
+      sumTax: "0",
+      sumGross: "1",
+    }));
     api.server.use(
       http.get(sevdeskUrl("/Invoice"), () => HttpResponse.json(list([]))),
-      http.get(sevdeskUrl("/CreditNote"), () =>
-        HttpResponse.json(
-          list(
-            Array.from({ length: 100 }, (_, i) => ({
-              id: String(i + 1),
-              creditNoteDate: "2026-03-05T00:00:00+01:00",
-              status: "200",
-              sumNet: "1",
-              sumTax: "0",
-              sumGross: "1",
-            })),
-          ),
-        ),
-      ),
+      http.get(sevdeskUrl("/CreditNote"), paged(creditNotes)),
     );
     const c = await connect();
-    const data = structured<{ documents: number; truncated: boolean; note: string }>(
+    const data = structured<{
+      documents: number;
+      totals: Array<{ gross: number }>;
+      truncated: boolean;
+      note: string;
+    }>(await c.call("summarize_documents", { documentType: "invoices", ...MARCH }));
+    expect(requestsTo("/CreditNote").map((r) => queryOf(r))).toEqual([
+      expect.objectContaining({ limit: "100", offset: "0" }),
+      expect.objectContaining({ limit: "100", offset: "100" }),
+    ]);
+    expect(data.documents).toBe(150);
+    expect(data.totals[0]?.gross).toBe(-150);
+    expect(data.truncated).toBe(false);
+    expect(data.note).toContain("150 credit note(s) are subtracted in the sums");
+  });
+
+  it("does not count credit notes twice when sevdesk ignores limit/offset", async () => {
+    const page = Array.from({ length: 100 }, (_, i) => ({
+      id: String(i + 1),
+      creditNoteDate: "2026-03-05T00:00:00+01:00",
+      status: "200",
+      sumNet: "1",
+      sumTax: "0",
+      sumGross: "1",
+    }));
+    api.server.use(
+      http.get(sevdeskUrl("/Invoice"), () => HttpResponse.json(list([]))),
+      http.get(sevdeskUrl("/CreditNote"), () => HttpResponse.json(list(page))),
+    );
+    const c = await connect();
+    const data = structured<{
+      documents: number;
+      totals: Array<{ gross: number }>;
+      truncated: boolean;
+      note: string;
+    }>(await c.call("summarize_documents", { documentType: "invoices", ...MARCH }));
+    expect(requestsTo("/CreditNote")).toHaveLength(2);
+    expect(data.documents).toBe(100);
+    expect(data.totals[0]?.gross).toBe(-100);
+    expect(data.truncated).toBe(true);
+    expect(data.note).toContain("sevdesk repeated the same credit notes on the next page");
+  });
+
+  it("adds no sign note when neither cancellations nor credit notes are summed", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Invoice"), () =>
+        HttpResponse.json(list([invoice({ id: "1", invoiceDate: "2026-03-05T00:00:00+01:00" })])),
+      ),
+      http.get(sevdeskUrl("/CreditNote"), () => HttpResponse.json(list([]))),
+    );
+    const c = await connect();
+    const data = structured<{ documents: number; note?: string }>(
       await c.call("summarize_documents", { documentType: "invoices", ...MARCH }),
     );
-    expect(data.documents).toBe(100);
-    expect(data.truncated).toBe(true);
-    expect(data.note).toContain("100 credit notes");
+    expect(data.documents).toBe(1);
+    expect(data.note ?? "").not.toContain("subtracted");
   });
 
   it("refuses creditDebit for invoices", async () => {
@@ -729,6 +1006,31 @@ describe("summarize_documents", () => {
     api.server.use(http.get(sevdeskUrl("/Voucher"), () => sevdeskError(500)));
     const failed = await c.call("summarize_documents", { documentType: "vouchers", ...MARCH });
     expect(failed.isError).toBe(true);
+  });
+});
+
+describe("list_open_receivables cancellation", () => {
+  it("stops paging when the client cancels the call", async () => {
+    const controller = new AbortController();
+    api.server.use(
+      http.get(sevdeskUrl("/Invoice"), async ({ request }) => {
+        controller.abort();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const offset = Number(new URL(request.url).searchParams.get("offset") ?? 0);
+        return HttpResponse.json(
+          list(Array.from({ length: 100 }, (_, i) => invoice({ id: String(offset + i + 1) }))),
+        );
+      }),
+    );
+    const c = await connect();
+    await expect(
+      c.client.callTool(
+        { name: "list_open_receivables", arguments: {} },
+        { signal: controller.signal },
+      ),
+    ).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(requestsTo("/Invoice")).toHaveLength(1);
   });
 });
 

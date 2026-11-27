@@ -8,6 +8,7 @@ import {
   euroNote,
   mapAuditVoucher,
   mapLimited,
+  signNote,
 } from "../../src/tools/audit-common.js";
 import {
   billedMonths,
@@ -23,6 +24,8 @@ import {
   checkVoucher,
   classifyReverseCharge,
   countryOf,
+  coverageNote,
+  freeTextSupplierNote,
   reverseChargeTotals,
 } from "../../src/tools/audit-vat.js";
 import { agingBucketOf } from "../../src/tools/invoices.js";
@@ -98,6 +101,121 @@ describe("voucher euro amounts", () => {
     expect(euroNote([v])).toContain("1 voucher(s)");
     // A euro voucher without accounting sums is fine.
     expect(mapAuditVoucher(raw({ currency: "EUR" })).euroUnconfirmed).toBe(false);
+  });
+
+  it("keeps sumNet etc. for a euro voucher whatever its accounting sums say", () => {
+    // The spec's own example: sumNet 100 next to sumNetAccounting 0.
+    const v = mapAuditVoucher(
+      raw({
+        currency: "EUR",
+        sumNetAccounting: "0",
+        sumTaxAccounting: "0",
+        sumGrossAccounting: "0",
+      }),
+    );
+    expect(v).toMatchObject({ sumNet: 110, sumTax: 0, sumGross: 110, euroUnconfirmed: false });
+    const other = mapAuditVoucher(
+      raw({ currency: null, sumNetAccounting: "90", sumGrossAccounting: "90" }),
+    );
+    expect(other).toMatchObject({ sumNet: 110, sumGross: 110, foreignCurrency: null });
+  });
+
+  it("derives the euro tax when a foreign voucher has accounting net and gross only", () => {
+    // sumTax 21 is in USD; euro net 100 and gross 119 leave a euro tax of 19.
+    const v = mapAuditVoucher(
+      raw({
+        sumNet: "110",
+        sumTax: "21",
+        sumGross: "131",
+        sumNetAccounting: "100",
+        sumTaxAccounting: null,
+        sumGrossAccounting: "119",
+      }),
+    );
+    expect(v).toMatchObject({ sumNet: 100, sumTax: 19, sumGross: 119, euroUnconfirmed: false });
+    expect(checkVoucher({ voucher: v }).map((f) => f.code)).not.toContain("NET_PLUS_TAX_NOT_GROSS");
+  });
+
+  it("falls back for a foreign voucher whose accounting sums are 0, not for a tax of 0", () => {
+    const zero = mapAuditVoucher(
+      raw({ sumNetAccounting: "0", sumTaxAccounting: "0", sumGrossAccounting: "0" }),
+    );
+    expect(zero).toMatchObject({ sumNet: 110, sumGross: 110, euroUnconfirmed: true });
+    expect(euroNote([zero])).toContain("missing or 0");
+    // A voucher of 0 in every field is no reason to doubt the accounting sums.
+    expect(
+      mapAuditVoucher(
+        raw({
+          sumNet: "0",
+          sumGross: "0",
+          sumNetAccounting: "0",
+          sumTaxAccounting: "0",
+          sumGrossAccounting: "0",
+        }),
+      ).euroUnconfirmed,
+    ).toBe(false);
+  });
+});
+
+describe("audit_vat coverage note", () => {
+  const full = {
+    vouchers: 10,
+    positionsRead: 10,
+    suppliers: 2,
+    countriesRead: 2,
+    reverseChargeUnchecked: 0,
+  };
+
+  it("is absent when everything was read", () => {
+    expect(coverageNote(full)).toBeUndefined();
+  });
+
+  it("names the numbers and the unchecked reverse charge cases", () => {
+    const note = coverageNote({
+      ...full,
+      positionsRead: 7,
+      countriesRead: 1,
+      reverseChargeUnchecked: 3,
+    });
+    expect(note).toContain("Positions were read for 7 of 10 vouchers");
+    expect(note).toContain("supplier countries for 1 of 2 suppliers");
+    expect(note).toContain("not done for 3 expense voucher(s) with rule 9 or 10 and no tax");
+    expect(coverageNote({ ...full, countriesRead: 1 })).not.toContain("not done");
+  });
+});
+
+describe("free-text supplier note", () => {
+  it("names the count without asking to narrow the period", () => {
+    expect(freeTextSupplierNote(0)).toBeUndefined();
+    const note = freeTextSupplierNote(2);
+    expect(note).toContain("2 expense voucher(s) with rule 9 or 10");
+    expect(note).not.toContain("Narrow");
+  });
+
+  it("leaves the coverage note to what was not read", () => {
+    const full = { vouchers: 3, positionsRead: 3, suppliers: 1, countriesRead: 1 };
+    expect(coverageNote({ ...full, reverseChargeUnchecked: 0 })).toBeUndefined();
+    expect(coverageNote({ ...full, countriesRead: 0, reverseChargeUnchecked: 1 })).toContain(
+      "Narrow the period",
+    );
+  });
+});
+
+describe("sign note", () => {
+  const doc = (kind: "invoice" | "credit_note", invoiceType: string | null) => ({
+    kind,
+    invoiceType,
+  });
+
+  it("appears only when cancellations or credit notes are in the sums", () => {
+    expect(signNote([doc("invoice", "RE"), doc("invoice", null)])).toBeUndefined();
+    expect(signNote([doc("invoice", "SR")])).toBe(
+      "1 cancellation invoice(s) (SR) are subtracted in the sums, whatever sign sevdesk stores " +
+        "(the API does not document it); check them if a total looks off.",
+    );
+    expect(
+      signNote([doc("invoice", "SR"), doc("credit_note", null), doc("credit_note", null)]),
+    ).toContain("1 cancellation invoice(s) (SR) and 2 credit note(s) are subtracted");
   });
 });
 
