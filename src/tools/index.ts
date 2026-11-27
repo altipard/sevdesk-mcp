@@ -1,5 +1,11 @@
 import { type ToolDefinition, withOperations } from "../policy/registry.js";
 import { getAccountInfo } from "./account.js";
+import {
+  findDuplicateVouchers,
+  findSubscriptionGaps,
+  summarizeDocuments,
+} from "./audit-documents.js";
+import { auditVat, reverseChargeReport } from "./audit-vat.js";
 import { listBankAccounts, searchTransactions } from "./banking.js";
 import { createContact, updateContact } from "./contact-writes.js";
 import { getContact, searchContacts } from "./contacts.js";
@@ -17,6 +23,7 @@ import {
 import { getInvoice, listOpenReceivables, searchInvoices } from "./invoices.js";
 import { searchOrders } from "./orders.js";
 import { searchParts } from "./parts.js";
+import { reconcileTransactions } from "./reconcile.js";
 import { getReport } from "./reports.js";
 import { bookVoucherPayment, createVoucher } from "./voucher-writes.js";
 import { getVoucher, searchVouchers } from "./vouchers.js";
@@ -45,6 +52,12 @@ export const TOOLS: readonly ToolDefinition[] = [
   searchParts,
   withOperations(getTaxGuidance, ["forRevenue", "forExpense", "forAccountNumber", "forTaxRule"]),
   withOperations(getReport, ["reportOrder", "reportContact", "reportVoucher"]),
+  summarizeDocuments,
+  auditVat,
+  reverseChargeReport,
+  findDuplicateVouchers,
+  findSubscriptionGaps,
+  reconcileTransactions,
   createContact,
   updateContact,
   createInvoiceDraft,

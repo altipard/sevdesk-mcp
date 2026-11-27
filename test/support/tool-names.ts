@@ -1,5 +1,6 @@
 /**
- * Expected curated read tools (numbers 1-15 of the curated list), in
+ * Expected curated read tools (numbers 1-15 of the curated list, then the
+ * audit and analysis tools), in
  * registration order. Written out instead of derived from TOOLS, so adding
  * or dropping a tool needs a deliberate change here.
  */
@@ -19,4 +20,10 @@ export const READ_TOOLS = [
   "search_parts",
   "get_tax_guidance",
   "get_report",
+  "summarize_documents",
+  "audit_vat",
+  "reverse_charge_report",
+  "find_duplicate_vouchers",
+  "find_subscription_gaps",
+  "reconcile_transactions",
 ] as const;

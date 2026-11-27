@@ -19,6 +19,22 @@ import {
   text,
   totalOf,
 } from "./format.js";
+import {
+  EXPENSE_TAX_RULES,
+  GUIDANCE_RATES,
+  REVENUE_TAX_RULE_IDS,
+  REVENUE_TAX_RULES,
+  VOUCHER_REVENUE_TAX_RULES,
+} from "./tax-rules.js";
+
+export {
+  EXPENSE_TAX_RULES,
+  REVENUE_TAX_RULE_IDS,
+  REVENUE_TAX_RULES,
+  type TaxRuleInfo,
+  VOUCHER_REVENUE_TAX_RULES,
+  VOUCHER_TAX_RULE_IDS,
+} from "./tax-rules.js";
 
 /**
  * Shared parts of the curated write tools: annotations, reference IDs
@@ -119,29 +135,7 @@ export function afterPartialWrite(done: string, failedStep: string, error: unkno
 }
 
 // ---------------------------------------------------------------------------
-// Tax rules (sevdesk-Update 2.0, revenue; from the "Tax Rules" section of the spec)
-
-export interface TaxRuleInfo {
-  readonly name: string;
-  /** Allowed position tax rates; null where they depend on the country (OSS). */
-  readonly rates: readonly number[] | null;
-}
-
-export const REVENUE_TAX_RULES: Readonly<Record<number, TaxRuleInfo>> = {
-  1: { name: "Umsatzsteuerpflichtige Umsätze", rates: [0, 7, 19] },
-  2: { name: "Ausfuhren", rates: [0] },
-  3: { name: "Innergemeinschaftliche Lieferungen", rates: [0, 7, 19] },
-  4: { name: "Steuerfreie Umsätze §4 UStG", rates: [0] },
-  5: { name: "Reverse Charge gem. §13b UStG", rates: [0] },
-  11: { name: "Steuer nicht erhoben nach §19 UStG (Kleinunternehmer)", rates: [0] },
-  17: { name: "Nicht im Inland steuerbare Leistung", rates: [0] },
-  18: { name: "One Stop Shop (Waren)", rates: null },
-  19: { name: "One Stop Shop (elektronische Dienstleistungen)", rates: null },
-  20: { name: "One Stop Shop (sonstige Dienstleistungen)", rates: null },
-  21: { name: "Reverse Charge gem. §18b UStG", rates: [0] },
-};
-
-export const REVENUE_TAX_RULE_IDS = Object.keys(REVENUE_TAX_RULES).map(Number);
+// Tax rules (tables in tax-rules.ts)
 
 export const taxRuleInput = z
   .number()
@@ -155,14 +149,6 @@ export const taxRuleInput = z
       "4 tax-free §4 UStG, 5 reverse charge §13b, 11 small business §19 UStG, 17 not taxable in " +
       "Germany, 18-20 One Stop Shop, 21 reverse charge §18b. Default 1.",
   );
-
-const GUIDANCE_RATES: Readonly<Record<string, number>> = {
-  ZERO: 0,
-  FIVE: 5,
-  SEVEN: 7,
-  SIXTEEN: 16,
-  NINETEEN: 19,
-};
 
 export const taxCheckSchema = z.object({
   id: z.number().int(),
@@ -781,29 +767,7 @@ export function paymentTypeMismatch(
 }
 
 // ---------------------------------------------------------------------------
-// Voucher tax rules and booking accounts (from the "Tax Rules" section of the spec)
-
-/** Expense tax rules (sevdesk-Update 2.0) for debit vouchers. */
-export const EXPENSE_TAX_RULES: Readonly<Record<number, TaxRuleInfo>> = {
-  8: { name: "Innergemeinschaftliche Erwerbe", rates: [0, 7, 19] },
-  9: { name: "Vorsteuerabziehbare Aufwendungen", rates: [0, 7, 19] },
-  10: { name: "Nicht vorsteuerabziehbare Aufwendungen", rates: [0] },
-  12: { name: "Reverse Charge gem. §13b Abs. 2 UStG mit Vorsteuerabzug", rates: [0] },
-  13: { name: "Reverse Charge gem. §13b UStG ohne Vorsteuerabzug", rates: [0] },
-  14: { name: "Reverse Charge gem. §13b Abs. 1 EU Umsätze", rates: [0] },
-};
-
-/** Revenue tax rules a credit voucher may use; 18-21 are documented as not for vouchers. */
-export const VOUCHER_REVENUE_TAX_RULES: Readonly<Record<number, TaxRuleInfo>> = Object.fromEntries(
-  [1, 2, 3, 4, 5, 11, 17].map((id) => [id, REVENUE_TAX_RULES[id] as TaxRuleInfo]),
-);
-
-export const VOUCHER_TAX_RULE_IDS = [
-  ...Object.keys(EXPENSE_TAX_RULES),
-  ...Object.keys(VOUCHER_REVENUE_TAX_RULES),
-]
-  .map(Number)
-  .sort((a, b) => a - b);
+// Voucher tax rules and booking accounts (tables in tax-rules.ts)
 
 export interface VoucherTaxPosition {
   readonly accountDatevId: number;
