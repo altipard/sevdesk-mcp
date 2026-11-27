@@ -26,6 +26,8 @@ assistant looks up the answer in sevdesk. For example:
 - "Did the payment from ACME arrive?"
 - "Which customers still owe us money, and how much?"
 - "Show me all receipts from last month that are not booked yet."
+- "Check my June bookkeeping: drafts, payments without a receipt, VAT problems."
+- "Are my foreign software subscriptions booked as reverse charge?"
 - "Draft an invoice for ACME: 8 hours of consulting at 95 euros." (needs write mode)
 
 > [!IMPORTANT]
@@ -119,6 +121,9 @@ program and from there to its provider.
 - **Bank:** see your accounts and balances, find transactions, book payments.
 - **Reports:** sevdesk's list reports as PDF, and which tax rates and booking accounts fit
   together.
+- **Checks:** VAT and reverse charge (13b) check, duplicate receipts, missing monthly
+  subscriptions, bank payments without a receipt, summaries per month or customer, how
+  long invoices are overdue. These are hints for you to check, not tax advice.
 
 Full list of tools: [docs/tools.md](docs/tools.md).
 
