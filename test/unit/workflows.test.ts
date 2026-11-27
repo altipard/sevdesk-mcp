@@ -94,3 +94,20 @@ describe("release workflow", () => {
     expect(step).toContain('gh release upload "$VERSION" "assets/$name"');
   });
 });
+
+describe("ci workflow", () => {
+  const ci = workflows.find((w) => w.name === "ci.yml")?.text ?? "";
+
+  // A broken bundle must fail the pull request, not only the release after the merge.
+  it("builds and smoke-tests the Claude Desktop extension on every run", () => {
+    const start = ci.search(/^ {2}mcpb:$/m);
+    expect(start).toBeGreaterThan(-1);
+    const rest = ci.slice(start + 1);
+    const next = rest.search(/^ {2}[\w-]+:$/m);
+    const job = next === -1 ? rest : rest.slice(0, next);
+    expect(job).not.toMatch(/^\s+if:/m);
+    expect(job).toContain("npm ci --ignore-scripts");
+    expect(job.indexOf("npm run build:mcpb")).toBeGreaterThan(-1);
+    expect(job.indexOf("npm run smoke:mcpb")).toBeGreaterThan(job.indexOf("npm run build:mcpb"));
+  });
+});
