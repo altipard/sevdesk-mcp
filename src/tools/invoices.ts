@@ -287,9 +287,34 @@ export const getInvoice = defineTool({
 export const MAX_RECEIVABLES_SCANNED = 1000;
 const SCAN_PAGE = 100;
 
+/**
+ * Aging buckets by days overdue: not yet due, then 0-30, 31-60, 61-90 and
+ * over 90 days past the due date.
+ */
+export const AGING_BUCKETS = ["not_due", "0-30", "31-60", "61-90", "over_90"] as const;
+type AgingBucket = (typeof AGING_BUCKETS)[number];
+
+export function agingBucketOf(overdue: boolean, daysOverdue: number): AgingBucket {
+  if (!overdue) return "not_due";
+  if (daysOverdue <= 30) return "0-30";
+  if (daysOverdue <= 60) return "31-60";
+  if (daysOverdue <= 90) return "61-90";
+  return "over_90";
+}
+
 const receivableSchema = invoiceSummarySchema.extend({
   overdue: z.boolean(),
   daysOverdue: z.number().int().describe("Days past the due date, 0 if not yet due."),
+  agingBucket: z
+    .enum(AGING_BUCKETS)
+    .describe("not_due, or days overdue: 0-30, 31-60, 61-90, over_90."),
+});
+
+const agingSchema = z.object({
+  currency: z.string().nullable(),
+  bucket: z.enum(AGING_BUCKETS),
+  count: z.number().int(),
+  openAmount: z.number(),
 });
 
 const totalsSchema = z.object({
@@ -430,8 +455,9 @@ export const listOpenReceivables = defineTool({
   title: "List open sevdesk receivables",
   description:
     "Lists invoices customers still have to pay (status open or partially paid) with open " +
-    "amount, due date and days overdue, sorted by due date, plus totals per currency and per " +
-    "invoice type. Reminders (MA) and cancellations (SR) are left out unless listed in " +
+    "amount, due date, days overdue and aging bucket, sorted by due date, plus totals per " +
+    "currency and per invoice type and open amounts per aging bucket (not due, 0-30, 31-60, " +
+    "61-90, over 90 days overdue). Reminders (MA) and cancellations (SR) are left out unless listed in " +
     "invoiceTypes, because they would count amounts twice, and so are recurring-invoice " +
     "templates (WKR), whose invoices appear as RE. Stops after " +
     `${RECEIVABLES_DEADLINE_MS / 1000} s, or when a later page fails, and marks the answer as ` +
@@ -462,6 +488,12 @@ export const listOpenReceivables = defineTool({
     totalsByType: z
       .array(typeTotalsSchema)
       .describe("The same totals split by invoice type and currency."),
+    aging: z
+      .array(agingSchema)
+      .describe(
+        "Open amount per currency and aging bucket (not_due, 0-30, 31-60, 61-90, over_90 days " +
+          "overdue), over all matching receivables; every bucket is listed per currency.",
+      ),
     page: pageSchema,
     truncated: z
       .boolean()
@@ -491,13 +523,34 @@ export const listOpenReceivables = defineTool({
       .filter((invoice) => (invoice.openAmount ?? 0) > 0)
       .map((invoice) => {
         const days = invoice.dueDate === null ? 0 : daysBetween(invoice.dueDate, asOf);
-        return { ...invoice, overdue: days > 0, daysOverdue: Math.max(0, days) };
+        const daysOverdue = Math.max(0, days);
+        return {
+          ...invoice,
+          overdue: days > 0,
+          daysOverdue,
+          agingBucket: agingBucketOf(days > 0, daysOverdue),
+        };
       })
       .filter((invoice) => !args.overdueOnly || invoice.overdue)
       .filter((invoice) =>
         invoice.invoiceType === null ? untypedIncluded : types.has(invoice.invoiceType),
       )
       .sort((a, b) => (a.dueDate ?? "9999").localeCompare(b.dueDate ?? "9999") || a.id - b.id);
+
+    const aging = new Map<string, z.infer<typeof agingSchema>>();
+    for (const invoice of all) {
+      for (const bucket of AGING_BUCKETS) {
+        const key = `${invoice.currency ?? ""}\u0000${bucket}`;
+        if (!aging.has(key)) {
+          aging.set(key, { currency: invoice.currency, bucket, count: 0, openAmount: 0 });
+        }
+      }
+      const entry = aging.get(`${invoice.currency ?? ""}\u0000${invoice.agingBucket}`);
+      if (entry) {
+        entry.count++;
+        entry.openAmount = cents(entry.openAmount + (invoice.openAmount ?? 0));
+      }
+    }
 
     const totals = new Map<string, Totals>();
     const byType = new Map<string, z.infer<typeof typeTotalsSchema>>();
@@ -539,6 +592,7 @@ export const listOpenReceivables = defineTool({
             (a.invoiceType ?? "").localeCompare(b.invoiceType ?? "") ||
             (a.currency ?? "").localeCompare(b.currency ?? ""),
         ),
+        aging: [...aging.values()],
         page,
         truncated,
         ...(notes.length > 0 && { note: notes.join(" ") }),
