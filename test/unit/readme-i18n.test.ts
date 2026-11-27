@@ -58,6 +58,23 @@ function linkTargets(text: string): string[] {
     });
 }
 
+/** Inline code spans outside code blocks, sorted: commands and file names stay as they are. */
+function inlineCode(text: string): string[] {
+  return [...prose(text).matchAll(/`([^`\n]+)`/g)].map((m) => m[1] ?? "").sort();
+}
+
+/** List items per section: the text before the first ## heading, then one count per ##. */
+function listItemsPerSection(text: string): number[] {
+  return prose(text)
+    .split(/^##\s/m)
+    .map((section) => [...section.matchAll(/^\s*[-*]\s+\S/gm)].length);
+}
+
+/** GitHub callouts such as > [!IMPORTANT]. */
+function callouts(text: string): string[] {
+  return [...prose(text).matchAll(/^> \[!(\w+)\]/gm)].map((m) => m[1] ?? "");
+}
+
 /** The first line after the HTML header: not blank, not HTML, not indented header text. */
 function firstProseLine(text: string): string | undefined {
   return text.split("\n").find((line) => line.trim() !== "" && !/^(\s|<)/.test(line));
@@ -73,10 +90,29 @@ describe("README translations", () => {
     expect(headings(de)).toHaveLength(headings(en).length);
   });
 
-  it("link to the same targets", () => {
-    const targets = linkTargets(en);
+  // Sorted lists, not sets: a link dropped where the other file has it twice still counts.
+  it("link to the same targets, as often", () => {
+    const targets = linkTargets(en).sort();
     expect(targets.length).toBeGreaterThan(0);
-    expect(new Set(linkTargets(de))).toEqual(new Set(targets));
+    expect(linkTargets(de).sort()).toEqual(targets);
+  });
+
+  it("keep every inline command and file name", () => {
+    const spans = inlineCode(en);
+    expect(spans.length).toBeGreaterThan(0);
+    expect(inlineCode(de)).toEqual(spans);
+  });
+
+  it("have as many list items in each section", () => {
+    const counts = listItemsPerSection(en);
+    expect(counts.reduce((a, b) => a + b, 0)).toBeGreaterThan(0);
+    expect(listItemsPerSection(de)).toEqual(counts);
+  });
+
+  it("have the same callouts in the same order", () => {
+    const kinds = callouts(en);
+    expect(kinds.length).toBeGreaterThan(0);
+    expect(callouts(de)).toEqual(kinds);
   });
 
   it("keep every code block identical", () => {
@@ -110,6 +146,14 @@ describe("README drift helpers", () => {
     const text = "## A\n\n```sh\n## not a heading [x](y.md)\n```\n";
     expect(headings(text)).toEqual(["A"]);
     expect(linkTargets(text)).toEqual([]);
+  });
+
+  it("read inline code, list items and callouts outside code blocks", () => {
+    const text =
+      "Intro\n- a\n\n## One\n\n- `x y`\n  - b\n\n> [!NOTE]\n> `z`\n\n```sh\n- `no`\n> [!TIP]\n```\n";
+    expect(inlineCode(text)).toEqual(["x y", "z"]);
+    expect(listItemsPerSection(text)).toEqual([1, 2]);
+    expect(callouts(text)).toEqual(["NOTE"]);
   });
 
   it("drop the language switcher and read HTML links", () => {
