@@ -68,7 +68,7 @@ supplier booked with rule 9 is often a reverse charge case booked as a normal ex
 `reverse_charge_report` splits the 13b tax base (net amounts) into:
 
 - nets_to_zero: rules 12 and 14. You owe the tax and deduct it as input tax in the same
-  return, so it costs nothing, but it must appear in the VAT return.
+  return, so it usually nets to zero, but it must appear in the VAT return.
 - payable: rule 13. You owe the tax without input tax deduction; it is a real cost.
 - revenue: rule 5. Your own sales where your customer owes the tax.
 

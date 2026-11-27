@@ -27,18 +27,35 @@ import { mapVoucherSummary } from "./vouchers.js";
 
 /** Documents read per list (vouchers, invoices, transactions) and call. */
 export const MAX_AUDIT_DOCUMENTS = 2000;
+/*
+ * Request budget at the default pace (SEVDESK_RATE_LIMIT 4/s, burst 4):
+ * 45 s allow about 4 + 45 * 4 = 184 requests per call, shared with every
+ * other call of the token. audit_vat spends a few on the version, the
+ * voucher pages and the tax guidance, then reads positions until
+ * AUDIT_DEADLINE_MS - CONTACT_RESERVE_MS (35 s: about 140 requests) and
+ * keeps the last 10 s (about 40 requests) for supplier lookups. The caps
+ * sit below both, so at the default pace they, not the clock, end a call
+ * of a normal month.
+ */
 /** Vouchers whose positions are read per audit_vat call (one request each). */
-export const MAX_AUDIT_POSITIONS = 500;
+export const MAX_AUDIT_POSITIONS = 130;
 /** Supplier contacts looked up per audit_vat call (one request each). */
-export const MAX_AUDIT_CONTACTS = 200;
-/** Requests in flight at once; the client's rate limiter does the rest. */
-export const AUDIT_CONCURRENCY = 2;
+export const MAX_AUDIT_CONTACTS = 30;
+/**
+ * Requests in flight at once: the burst of the default bucket, so latency
+ * does not hold the pace below the rate limit; the limiter does the rest.
+ */
+export const AUDIT_CONCURRENCY = 4;
 /**
  * Time for all requests of one audit call, like RECEIVABLES_DEADLINE_MS:
  * below the 60 s request timeout of MCP clients, so a partial answer still
  * arrives.
  */
 export const AUDIT_DEADLINE_MS = 45_000;
+/** Time at the end of an audit_vat call kept for supplier lookups after the positions. */
+export const CONTACT_RESERVE_MS = 10_000;
+/** Upper bound for the bookkeeping version check, inside the deadline. */
+export const VERSION_TIMEOUT_MS = 10_000;
 
 const SCAN_PAGE = 100;
 
@@ -72,14 +89,31 @@ export const auditFields = {
   note: z.string().optional(),
 };
 
+/** Why an audit call stopped sending requests altogether. */
+type StopReason = "deadline" | "cancelled" | "rate_limited";
+
+/** Outcome of one request of an audit call (see AuditRun.attempt). */
+export type Attempt =
+  | { readonly kind: "ok"; readonly body: unknown }
+  /** Not sent: the call had stopped before (deadline, cancel, rate limit). */
+  | { readonly kind: "skipped" }
+  | { readonly kind: "deadline" | "cancelled"; readonly error?: unknown }
+  /** Cut by the request's own earlier limit (`until`); the call goes on. */
+  | { readonly kind: "cut"; readonly error?: unknown }
+  | { readonly kind: "error"; readonly error: SevdeskError };
+
 /**
  * One audit call: shared deadline and the limits it ran into. A limit is
  * recorded once, with a note naming it; any recorded limit marks the
- * answer truncated.
+ * answer truncated. The deadline, a cancel by the MCP client and a 429
+ * that the client's retries could not get past stop the call: every later
+ * request is skipped, so a throttled token is not pressed further.
  */
 export class AuditRun {
   readonly deadline: number;
   private readonly limits = new Map<string, string>();
+  private stop: StopReason | undefined;
+  private stopError: SevdeskError | undefined;
 
   constructor(
     readonly call: ToolCall,
@@ -100,49 +134,111 @@ export class AuditRun {
     return [...this.limits.values()];
   }
 
+  /** The call stopped sending (deadline, cancel or rate limit). */
+  get stopped(): boolean {
+    return this.stop !== undefined;
+  }
+
+  private stopFor(reason: StopReason, error?: SevdeskError): void {
+    if (this.stop !== undefined) return;
+    this.stop = reason;
+    this.stopError = error;
+    this.hit(
+      reason,
+      reason === "deadline"
+        ? `Stopped after ${AUDIT_DEADLINE_MS / 1000} s; not everything was read. Narrow the period.`
+        : reason === "cancelled"
+          ? "The call was cancelled; nothing more was read."
+          : "sevdesk answered 429 (rate limit) after the client's retries; the remaining requests " +
+            "of this call were skipped, so not everything was read. Try again in a minute.",
+    );
+  }
+
   /**
-   * One request under the deadline. A local policy refusal always throws;
-   * other sevdesk failures throw when `mustSucceed` (nothing useful without
-   * the answer) and are otherwise recorded, returning undefined. The note
-   * names the error kind and status, never upstream text.
+   * One request under the deadline, the MCP client's cancel and, if given,
+   * an earlier limit `until` (epoch ms) of its own. Nothing is recorded
+   * for a failed or cut request; the deadline, a cancel and a 429 stop the
+   * call (see the class). A local policy refusal always throws.
    */
-  async request(
-    what: string,
-    send: (signal: AbortSignal) => Promise<unknown>,
-    mustSucceed = false,
-  ): Promise<{ body: unknown } | undefined> {
-    const remaining = this.deadline - Date.now();
-    if (remaining <= 0) {
-      this.hitDeadline();
-      return undefined;
+  async attempt(send: (signal: AbortSignal) => Promise<unknown>, until?: number): Promise<Attempt> {
+    if (this.stop !== undefined) return { kind: "skipped" };
+    const cancel = this.call.signal;
+    if (cancel.aborted) {
+      this.stopFor("cancelled");
+      return { kind: "cancelled" };
     }
-    const signal = AbortSignal.timeout(remaining);
+    const now = Date.now();
+    const remaining = this.deadline - now;
+    if (remaining <= 0) {
+      this.stopFor("deadline");
+      return { kind: "deadline" };
+    }
+    if (until !== undefined && until <= now) return { kind: "cut" };
+    const deadline = AbortSignal.timeout(remaining);
+    const cut =
+      until !== undefined && until < this.deadline ? AbortSignal.timeout(until - now) : undefined;
+    const signal = AbortSignal.any(cut ? [cancel, deadline, cut] : [cancel, deadline]);
     try {
-      return { body: await send(signal) };
+      return { kind: "ok", body: await send(signal) };
     } catch (error) {
       if (error instanceof SevdeskError && error.kind === "policy") throw error;
-      if (mustSucceed) throw error;
-      if (signal.aborted) {
-        this.hitDeadline();
-        return undefined;
+      if (cancel.aborted) {
+        this.stopFor("cancelled");
+        return { kind: "cancelled", error };
       }
+      if (deadline.aborted) {
+        this.stopFor("deadline");
+        return { kind: "deadline", error };
+      }
+      if (cut?.aborted) return { kind: "cut", error };
       if (error instanceof SevdeskError) {
-        const status = error.status === undefined ? "" : ` ${error.status}`;
-        this.hit(
-          `failed:${what}`,
-          `Reading ${what} failed (${error.kind}${status}); results without them are incomplete.`,
-        );
-        return undefined;
+        if (error.kind === "rate_limited") this.stopFor("rate_limited", error);
+        return { kind: "error", error };
       }
       throw error;
     }
   }
 
-  private hitDeadline(): void {
-    this.hit(
-      "deadline",
-      `Stopped after ${AUDIT_DEADLINE_MS / 1000} s; not everything was read. Narrow the period.`,
-    );
+  /**
+   * One request (see attempt). Failures throw when `mustSucceed` (nothing
+   * useful without the answer), except after a cancel, whose answer nobody
+   * reads; otherwise they are recorded and the result is undefined. A
+   * request cut by `until` is not recorded: the caller accounts for it. The
+   * note names the error kind and status, never upstream text.
+   */
+  async request(
+    what: string,
+    send: (signal: AbortSignal) => Promise<unknown>,
+    mustSucceed = false,
+    until?: number,
+  ): Promise<{ body: unknown } | undefined> {
+    const result = await this.attempt(send, until);
+    switch (result.kind) {
+      case "ok":
+        return { body: result.body };
+      case "skipped":
+        if (mustSucceed && this.stopError !== undefined) throw this.stopError;
+        return undefined;
+      case "deadline":
+      case "cut":
+        if (mustSucceed && result.error !== undefined) throw result.error;
+        return undefined;
+      case "cancelled":
+        return undefined;
+      case "error": {
+        const { error } = result;
+        if (mustSucceed) throw error;
+        // A 429 has its own note (stopFor).
+        if (error.kind !== "rate_limited") {
+          const status = error.status === undefined ? "" : ` ${error.status}`;
+          this.hit(
+            `failed:${what}`,
+            `Reading ${what} failed (${error.kind}${status}); results without them are incomplete.`,
+          );
+        }
+        return undefined;
+      }
+    }
   }
 
   /** Set once the first scan of the call started; only that scan's first page must succeed. */
@@ -152,16 +248,22 @@ export class AuditRun {
    * Every object of a paged list, up to `cap`. The first page of the call's
    * first scan must succeed; any later failure or the deadline keeps what
    * was read and is recorded. The cap is recorded only when sevdesk has
-   * more after it (one probe request of a single object).
+   * more after it (one probe request of a single object). With
+   * `guardRepeats`, for lists whose paging the upstream spec does not
+   * declare, objects seen on an earlier page are dropped and a full page
+   * with nothing new ends the scan, so a list that ignored limit/offset is
+   * never counted twice.
    */
   async scan(
     what: string,
     send: (page: { limit: number; offset: number }, signal: AbortSignal) => Promise<unknown>,
     cap: number = MAX_AUDIT_DOCUMENTS,
+    guardRepeats = false,
   ): Promise<Raw[]> {
     const first = !this.scanned;
     this.scanned = true;
     const items: Raw[] = [];
+    const seen = new Set<number>();
     for (let offset = 0; ; offset += SCAN_PAGE) {
       if (items.length >= cap) {
         const probe = await this.request(what, (signal) => send({ limit: 1, offset: cap }, signal));
@@ -181,8 +283,26 @@ export class AuditRun {
       );
       if (answer === undefined) break;
       const page = objectsOf(answer.body);
-      items.push(...page);
+      const fresh = guardRepeats
+        ? page.filter((raw) => {
+            const id = integer(raw.id);
+            return id === null || !seen.has(id);
+          })
+        : page;
+      for (const raw of fresh) {
+        const id = integer(raw.id);
+        if (id !== null) seen.add(id);
+      }
+      items.push(...fresh);
       if (page.length < limit) break;
+      if (fresh.length === 0) {
+        this.hit(
+          `paging:${what}`,
+          `sevdesk repeated the same ${what} on the next page; only the ${items.length} distinct ` +
+            "ones were used and more may exist. Narrow the period.",
+        );
+        break;
+      }
     }
     return items.slice(0, cap);
   }
@@ -272,12 +392,15 @@ export interface AuditVoucher {
   readonly creditDebit: string | null;
   /** Document currency if not EUR. */
   readonly foreignCurrency: string | null;
-  /** Euro sums: the *Accounting fields where sevdesk sends them, else sumNet etc. */
+  /**
+   * Euro sums: sumNet etc.; for a foreign-currency voucher the *Accounting
+   * fields where sevdesk sends them (not missing, not 0).
+   */
   readonly sumNet: number | null;
   readonly sumTax: number | null;
   readonly sumGross: number | null;
   /**
-   * Foreign-currency voucher without the *Accounting sums: its sums are
+   * Foreign-currency voucher without usable *Accounting sums: its sums are
    * sumNet etc., whose currency the spec does not state.
    */
   readonly euroUnconfirmed: boolean;
@@ -289,9 +412,12 @@ export interface AuditVoucher {
 /**
  * Vouchers have no *ForeignCurrency sums, only sumNetAccounting,
  * sumTaxAccounting and sumGrossAccounting, documented as "usually the same
- * as sumNet": they differ for foreign currency, so they are read as the euro
- * amounts. Without them sumNet etc. are used; for a foreign-currency
- * voucher that euro amount is unconfirmed (euroUnconfirmed).
+ * as sumNet". The spec's own example has sumNet 100 next to
+ * sumNetAccounting 0, so they are not trusted for euro vouchers, whose
+ * sumNet etc. are euro anyway. For a foreign-currency voucher they are the
+ * euro amounts; if they are missing or 0 while sumGross is not, sumNet etc.
+ * are used and that euro amount is unconfirmed (euroUnconfirmed). Only net
+ * and gross decide: a tax of 0 is common.
  */
 export function mapAuditVoucher(raw: Raw): AuditVoucher {
   const summary = mapVoucherSummary(raw);
@@ -299,7 +425,8 @@ export function mapAuditVoucher(raw: Raw): AuditVoucher {
   const net = amount(raw.sumNetAccounting);
   const tax = amount(raw.sumTaxAccounting);
   const gross = amount(raw.sumGrossAccounting);
-  const accounting = net !== null && gross !== null;
+  const zero = net === 0 && gross === 0 && (summary.sumGross ?? 0) !== 0;
+  const accounting = foreignCurrency !== null && net !== null && gross !== null && !zero;
   return {
     id: summary.id,
     date: summary.voucherDate,
@@ -426,38 +553,30 @@ export async function scanInvoices(run: AuditRun, period: Period): Promise<Audit
 }
 
 /**
- * GET /CreditNote declares no limit/offset in the spec, so the client cannot
- * page it (requests outside the spec are refused). That sevdesk answers
- * such unpaged requests with at most 100 objects is an assumption, taken
- * from the other unpaged lists; a full answer is marked truncated.
+ * Credit notes dated in the period. limit/offset are documented by sevdesk
+ * for every list but declared for GET /CreditNote only by the overlay, so
+ * repeated pages are guarded against (see scan).
  */
-export const MAX_CREDIT_NOTES = 100;
-
-/** Credit notes dated in the period, one unpaged request. */
 export async function scanCreditNotes(run: AuditRun, period: Period): Promise<AuditInvoice[]> {
   const { sevdesk } = run.call;
-  const answer = await run.request("credit notes", (signal) =>
-    sevdesk.call(
-      sevdesk.api.GET("/CreditNote", {
-        params: {
-          query: {
-            startDate: unixSeconds(period.startDate),
-            endDate: unixSeconds(period.endDate, true),
+  const rows = await run.scan(
+    "credit notes",
+    (page, signal) =>
+      sevdesk.call(
+        sevdesk.api.GET("/CreditNote", {
+          params: {
+            query: {
+              startDate: unixSeconds(period.startDate),
+              endDate: unixSeconds(period.endDate, true),
+              ...page,
+            },
           },
-        },
-        signal,
-      }),
-    ),
+          signal,
+        }),
+      ),
+    MAX_AUDIT_DOCUMENTS,
+    true,
   );
-  if (answer === undefined) return [];
-  const rows = objectsOf(answer.body);
-  if (rows.length >= MAX_CREDIT_NOTES) {
-    run.hit(
-      "cap:credit notes",
-      `sevdesk returned ${rows.length} credit notes in one answer. The API declares no paging ` +
-        "for them and a limit of 100 per answer is assumed, so more may exist. Narrow the period.",
-    );
-  }
   return rows
     .map((raw) => {
       const foreignCurrency = foreignCurrencyOf(text(raw.currency));
@@ -503,6 +622,26 @@ export function signed(value: number | null, sign: 1 | -1): number | null {
  * does not say whether an ER's sums repeat the advances it settles, so the
  * answer says the total may count them twice instead of guessing.
  */
+/**
+ * Note for answers whose sums contain cancellation invoices (SR) or credit
+ * notes: they were subtracted whatever sign sevdesk stores (revenueSign).
+ */
+export function signNote(
+  documents: readonly Pick<AuditInvoice, "kind" | "invoiceType">[],
+): string | undefined {
+  const cancellations = documents.filter((d) => d.kind === "invoice" && d.invoiceType === "SR");
+  const creditNotes = documents.filter((d) => d.kind === "credit_note");
+  const parts = [
+    cancellations.length > 0 && `${cancellations.length} cancellation invoice(s) (SR)`,
+    creditNotes.length > 0 && `${creditNotes.length} credit note(s)`,
+  ].filter((p): p is string => typeof p === "string");
+  if (parts.length === 0) return undefined;
+  return (
+    `${parts.join(" and ")} are subtracted in the sums, whatever sign sevdesk stores (the API ` +
+    "does not document it); check them if a total looks off."
+  );
+}
+
 export function partialInvoiceNote(invoices: readonly AuditInvoice[]): string | undefined {
   const types = new Set(invoices.map((i) => i.invoiceType));
   if (!types.has("ER") || !(types.has("AR") || types.has("TR"))) return undefined;
@@ -592,8 +731,8 @@ export function euroNote(vouchers: readonly AuditVoucher[]): string | undefined 
   const count = vouchers.filter((v) => v.euroUnconfirmed).length;
   if (count === 0) return undefined;
   return (
-    `${count} voucher(s) in another currency came without euro accounting sums; their amounts ` +
-    "are sevdesk's sumNet/sumGross, whose currency is unconfirmed."
+    `${count} voucher(s) in another currency came without euro accounting sums (missing or 0); their ` +
+    "amounts are sevdesk's sumNet/sumGross, whose currency is unconfirmed."
   );
 }
 

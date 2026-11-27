@@ -20,6 +20,7 @@ import {
   scanVouchers,
   severityRank,
   signed,
+  signNote,
   supplierKey,
   voucherRef,
 } from "./audit-common.js";
@@ -636,7 +637,7 @@ export const summarizeDocuments = defineTool({
       const creditNotes = (await scanCreditNotes(run, period)).filter(
         (c) => args.includeDrafts || c.status !== 100,
       );
-      extra.push(partialInvoiceNote(invoices));
+      extra.push(partialInvoiceNote(invoices), signNote([...invoices, ...creditNotes]));
       docs = [...invoices, ...creditNotes].map((i) => {
         const sign = revenueSign(i);
         return {

@@ -1,12 +1,13 @@
 import { z } from "zod";
-import { defineTool, type ToolCall } from "../policy/registry.js";
-import { SevdeskError } from "../sevdesk/errors.js";
+import { defineTool } from "../policy/registry.js";
 import {
   AUDIT_CONCURRENCY,
+  AUDIT_DEADLINE_MS,
   type AuditInvoice,
   AuditRun,
   type AuditVoucher,
   auditFields,
+  CONTACT_RESERVE_MS,
   checkPeriod,
   type DocumentRef,
   documentRefSchema,
@@ -28,7 +29,9 @@ import {
   scanVouchers,
   severityRank,
   signed,
+  signNote,
   supplierKey,
+  VERSION_TIMEOUT_MS,
   voucherRef,
 } from "./audit-common.js";
 import {
@@ -64,27 +67,69 @@ import { MAX_VOUCHER_POSITIONS } from "./vouchers.js";
 // Bookkeeping version
 
 /**
- * Refuses bookkeeping 1.0 accounts (taxType instead of taxRule). If the
- * version cannot be read, the check goes on as 2.0 and says so.
+ * Refuses bookkeeping 1.0 accounts (taxType instead of taxRule). Runs as
+ * the call's first request, within its deadline and at most
+ * VERSION_TIMEOUT_MS. If the version cannot be read, the check goes on as
+ * 2.0 and says so; the answer is not truncated by that alone.
  */
-async function requireBookkeeping2({
-  sevdesk,
-}: ToolCall): Promise<{ version: string | null; note?: string }> {
-  let body: unknown;
-  try {
-    body = await sevdesk.call(sevdesk.api.GET("/Tools/bookkeepingSystemVersion"));
-  } catch (error) {
-    if (error instanceof SevdeskError && error.kind !== "policy") {
-      return {
-        version: null,
-        note: `The bookkeeping version could not be read (${error.kind}); bookkeeping 2.0 was assumed.`,
-      };
-    }
-    throw error;
+async function requireBookkeeping2(
+  run: AuditRun,
+): Promise<{ version: string | null; note?: string }> {
+  const { sevdesk } = run.call;
+  const result = await run.attempt(
+    (signal) => sevdesk.call(sevdesk.api.GET("/Tools/bookkeepingSystemVersion", { signal })),
+    Date.now() + VERSION_TIMEOUT_MS,
+  );
+  if (result.kind !== "ok") {
+    const reason =
+      result.kind === "error"
+        ? result.error.kind
+        : result.kind === "cut" || result.kind === "deadline"
+          ? "timeout"
+          : result.kind;
+    return {
+      version: null,
+      note: `The bookkeeping version could not be read (${reason}); bookkeeping 2.0 was assumed.`,
+    };
   }
-  const version = text(asRecord(asRecord(body).objects).version);
+  const version = text(asRecord(asRecord(result.body).objects).version);
   if (version === "1.0") throw badInput(BOOKKEEPING_1_MESSAGE);
   return { version };
+}
+
+/**
+ * Header of a likely reverse charge case: expense voucher with a domestic
+ * rule (9 or 10) and no tax. Its positions are read first.
+ */
+const reverseChargeHeader = (v: AuditVoucher): boolean =>
+  v.creditDebit === "D" && (v.taxRuleId === 9 || v.taxRuleId === 10) && v.sumTax === 0;
+
+/**
+ * The note when audit_vat could not read everything for its checks, with
+ * the numbers: which vouchers lack positions, which suppliers their
+ * country, and how many possible reverse charge cases stay unchecked.
+ */
+export function coverageNote(input: {
+  vouchers: number;
+  positionsRead: number;
+  suppliers: number;
+  countriesRead: number;
+  reverseChargeUnchecked: number;
+}): string | undefined {
+  const { vouchers, positionsRead, suppliers, countriesRead, reverseChargeUnchecked } = input;
+  if (positionsRead >= vouchers && countriesRead >= suppliers) return undefined;
+  const unchecked =
+    reverseChargeUnchecked > 0
+      ? ` The reverse charge check (section 13b UStG) was not done for ${reverseChargeUnchecked} ` +
+        "expense voucher(s) with rule 9 or 10 and no tax."
+      : "";
+  return (
+    `Positions were read for ${positionsRead} of ${vouchers} vouchers (likely reverse charge ` +
+    `cases first) and supplier countries for ${countriesRead} of ${suppliers} suppliers ` +
+    `(at most ${MAX_AUDIT_POSITIONS} and ${MAX_AUDIT_CONTACTS} per call within ` +
+    `${AUDIT_DEADLINE_MS / 1000} s); vouchers without positions were checked on their header ` +
+    `only.${unchecked} Narrow the period.`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -573,13 +618,14 @@ export const auditVat = defineTool({
   description:
     "Checks the vouchers of a period for likely VAT booking mistakes (bookkeeping 2.0): foreign " +
     "supplier booked with a domestic expense rule and only 0 % positions (possible reverse " +
-    "charge, section 13b UStG, with the fitting rule suggested), tax rule from the wrong side, " +
+    "charge, section 13b UStG, with candidate rules to check), tax rule from the wrong side, " +
     "rule not allowed for the booking account (sevdesk tax guidance), rate contradicting the " +
     "rule, sums that do not add up, and suppliers booked with different rules. Each finding has " +
     "severity, code, the voucher, detail and suggestion, most severe first. The findings are " +
-    `hints to check, not tax advice. Reads at most ${MAX_AUDIT_POSITIONS} vouchers' positions ` +
-    "and stops early on caps or time, marking the answer truncated. Refuses bookkeeping 1.0 " +
-    "accounts." +
+    `hints to check, not tax advice. Reads positions for at most ${MAX_AUDIT_POSITIONS} ` +
+    `vouchers (likely reverse charge cases first) and looks up at most ${MAX_AUDIT_CONTACTS} ` +
+    "suppliers; stops early on caps or time, marking the answer truncated with the numbers " +
+    "read. Refuses bookkeeping 1.0 accounts." +
     FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "getVouchers",
@@ -620,8 +666,8 @@ export const auditVat = defineTool({
   async handler(args, call) {
     const period = checkPeriod(args);
     const { sevdesk } = call;
-    const version = await requireBookkeeping2(call);
     const run = new AuditRun(call);
+    const version = await requireBookkeeping2(run);
     const vouchers = await scanVouchers(run, period);
 
     let guidance: Guidance | undefined;
@@ -635,55 +681,54 @@ export const auditVat = defineTool({
       }
     }
 
-    if (vouchers.length > MAX_AUDIT_POSITIONS) {
-      run.hit(
-        "cap:positions",
-        `Positions were read for the first ${MAX_AUDIT_POSITIONS} of ${vouchers.length} ` +
-          "vouchers (cap); the rest were checked on their header only. Narrow the period.",
-      );
-    }
-    const withPositions = vouchers.slice(0, MAX_AUDIT_POSITIONS);
+    // Likely reverse charge cases first: they need positions and then the
+    // supplier's country. The positions phase ends CONTACT_RESERVE_MS before
+    // the deadline, so the lookups are not left without time.
+    const ordered = [
+      ...vouchers.filter(reverseChargeHeader),
+      ...vouchers.filter((v) => !reverseChargeHeader(v)),
+    ];
+    const positionsEnd = run.deadline - CONTACT_RESERVE_MS;
     const positions = new Map<number, PositionsRead>();
-    await mapLimited(withPositions, AUDIT_CONCURRENCY, async (voucher) => {
-      const answer = await run.request("voucher positions", (signal) =>
-        sevdesk.call(
-          sevdesk.api.GET("/VoucherPos", {
-            params: { query: { "voucher[id]": voucher.id, "voucher[objectName]": "Voucher" } },
-            signal,
-          }),
-        ),
+    await mapLimited(ordered.slice(0, MAX_AUDIT_POSITIONS), AUDIT_CONCURRENCY, async (voucher) => {
+      if (run.stopped || Date.now() >= positionsEnd) return;
+      const answer = await run.request(
+        "voucher positions",
+        (signal) =>
+          sevdesk.call(
+            sevdesk.api.GET("/VoucherPos", {
+              params: { query: { "voucher[id]": voucher.id, "voucher[objectName]": "Voucher" } },
+              signal,
+            }),
+          ),
+        false,
+        positionsEnd,
       );
       if (answer !== undefined) positions.set(voucher.id, mapPositions(answer.body, voucher.id));
     });
 
     // Countries only matter for the reverse charge check: expense vouchers
     // with a domestic rule and nothing but 0 % positions.
+    const zeroOnly = (v: AuditVoucher) => {
+      const read = positions.get(v.id);
+      return (
+        read !== undefined &&
+        read.positions.length > 0 &&
+        read.positions.every((p) => p.taxRate === 0)
+      );
+    };
+    const domesticExpense = (v: AuditVoucher) =>
+      v.creditDebit === "D" && (v.taxRuleId === 9 || v.taxRuleId === 10);
     const candidates = [
       ...new Set(
         vouchers
-          .filter((v) => {
-            const read = positions.get(v.id);
-            return (
-              v.creditDebit === "D" &&
-              (v.taxRuleId === 9 || v.taxRuleId === 10) &&
-              v.supplierId !== null &&
-              read !== undefined &&
-              read.positions.length > 0 &&
-              read.positions.every((p) => p.taxRate === 0)
-            );
-          })
+          .filter((v) => domesticExpense(v) && v.supplierId !== null && zeroOnly(v))
           .map((v) => v.supplierId as number),
       ),
     ];
-    if (candidates.length > MAX_AUDIT_CONTACTS) {
-      run.hit(
-        "cap:contacts",
-        `Only the first ${MAX_AUDIT_CONTACTS} of ${candidates.length} suppliers were looked up ` +
-          "for their country (cap).",
-      );
-    }
     const countries = new Map<number, SupplierCountry>();
     await mapLimited(candidates.slice(0, MAX_AUDIT_CONTACTS), AUDIT_CONCURRENCY, async (id) => {
+      if (run.stopped) return;
       const answer = await run.request("supplier contacts", (signal) =>
         sevdesk.call(
           sevdesk.api.GET("/Contact/{contactId}", {
@@ -695,6 +740,24 @@ export const auditVat = defineTool({
       const raw = answer === undefined ? undefined : objectsOf(answer.body)[0];
       if (raw !== undefined) countries.set(id, countryOf(raw));
     });
+
+    // Possible reverse charge cases the check could not decide: positions
+    // missing for a voucher without tax, or the supplier's country missing.
+    const reverseChargeUnchecked = vouchers.filter(
+      (v) =>
+        domesticExpense(v) &&
+        (positions.has(v.id)
+          ? zeroOnly(v) && v.supplierId !== null && !countries.has(v.supplierId)
+          : v.sumTax === 0 || v.sumTax === null),
+    ).length;
+    const coverage = coverageNote({
+      vouchers: vouchers.length,
+      positionsRead: positions.size,
+      suppliers: candidates.length,
+      countriesRead: countries.size,
+      reverseChargeUnchecked,
+    });
+    if (coverage !== undefined) run.hit("coverage", coverage);
 
     const all = sortFindings([
       ...vouchers.flatMap((voucher) =>
@@ -760,7 +823,7 @@ export const auditVat = defineTool({
 const CATEGORY_MEANING: Readonly<Record<ReverseChargeKind, string>> = {
   nets_to_zero: "Tax owed by you and deducted as input tax in the same return (nets to zero).",
   payable: "Tax owed by you without input tax deduction (a real cost).",
-  revenue: "Own sales where the customer owes the tax (field 60 of the VAT return).",
+  revenue: "Own sales where the customer owes the tax.",
 };
 
 const REVERSE_CHARGE_RULES: Readonly<Record<ReverseChargeKind, number[]>> = {
@@ -913,8 +976,8 @@ export const reverseChargeReport = defineTool({
   annotations: READ_ANNOTATIONS,
   async handler(args, call) {
     const period: Period = checkPeriod(args);
-    const version = await requireBookkeeping2(call);
     const run = new AuditRun(call);
+    const version = await requireBookkeeping2(run);
     const vouchers = await scanVouchers(run, period);
     const invoices = await scanInvoices(run, period);
     const creditNotes = await scanCreditNotes(run, period);
@@ -932,6 +995,10 @@ export const reverseChargeReport = defineTool({
     const revenueInvoices = invoices.filter(
       (i) => i.taxRuleId !== null && TAX_RULES[i.taxRuleId]?.reverseCharge === "revenue",
     );
+    const counted = new Set(classified.map((c) => `${c.document.type}:${c.document.id}`));
+    const subtracted = [...invoices, ...creditNotes].filter((i) =>
+      counted.has(`${i.kind}:${i.id}`),
+    );
     return present(
       {
         period,
@@ -945,6 +1012,7 @@ export const reverseChargeReport = defineTool({
           version.note,
           euroNote(vouchers),
           partialInvoiceNote(revenueInvoices),
+          signNote(subtracted),
           classified.length === 0 && "No reverse charge documents in the period.",
         ]),
       },
