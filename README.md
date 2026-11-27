@@ -48,17 +48,20 @@ it. Paste your token into the dialog that opens. Done.
 claude plugin install sevdesk --marketplace altipard/sevdesk-mcp
 ```
 
-**Cursor, VS Code and others** (macOS and Linux). Run one of these lines in a terminal:
+**Cursor, VS Code and others** (macOS and Linux). With Node.js 24 or newer, run the npx
+command in a terminal, otherwise the curl command:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.sh | sh  # without Node.js
-npx -y @altipard/sevdesk-mcp setup  # or, with Node.js 24 or newer
+npx -y @altipard/sevdesk-mcp setup
 ```
 
-The setup shows a menu with the programs it found already selected. The space bar changes
-the selection, Enter confirms. It then asks for the mode and your token, checks the
-token with sevdesk and stores it in your keychain. It can also set up Claude Desktop and
-Claude Code, so do not also add the extension or plugin, or you get two sevdesk servers.
+```sh
+curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.sh | sh
+```
+
+The setup preselects the programs it found: space changes the selection, Enter confirms.
+It asks for the mode and token, checks the token and stores it in your keychain. It also
+covers Claude Desktop and Claude Code; adding the extension or plugin too gives two servers.
 
 **Windows** (untested): use the Claude Desktop extension. Manual setup, checksums and all
 other options: [docs/install.md](docs/install.md).
@@ -123,8 +126,8 @@ Full list of tools: [docs/tools.md](docs/tools.md).
   Node.js is older than 24 (Claude Code, npx). Store the token again or rerun the setup.
 - **Error 401 from sevdesk:** the token is wrong. Copy it again from sevdesk. In Claude
   Desktop, paste it into the extension settings. Elsewhere, store it again with the
-  command above or rerun the setup with
-  [`--replace-token`](docs/install.md#setup-options).
+  command above or run `npx -y @altipard/sevdesk-mcp setup --replace-token` (curl
+  install: `sevdesk-mcp setup --replace-token`, see [options](docs/install.md#setup-options)).
 - **Some tools are missing:** you are in read mode. Write tools need
   [write mode](docs/security.md#modes-per-client).
 
