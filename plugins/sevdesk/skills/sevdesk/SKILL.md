@@ -27,9 +27,9 @@ are German (Rechnung, Beleg, Angebot, Skonto).
    object. If a call fails or times out, check in sevdesk (search tools) before retrying.
 5. **Read before you write.** Look up IDs with the search tools; never guess a contact,
    invoice, voucher or account ID.
-6. **Configuration belongs to the user.** Never change or raise the mode (plugin settings,
-   pluginConfigs in settings.json), SEVDESK_ENABLE_TOOLS, released operations or any other
-   server or client configuration yourself, not even when a tool is missing. Tell the user
+6. **Configuration belongs to the user.** Never change or raise the mode (SEVDESK_MODE in the
+   client entry, the extension or plugin settings), SEVDESK_ENABLE_TOOLS, released operations
+   or any other server or client configuration yourself, not even when a tool is missing. Tell the user
    what would be needed and let them decide.
 7. **The server's tool list is authoritative.** If a tool named here is missing, or the
    server offers one this skill does not describe, the server is older or newer than this
@@ -37,7 +37,8 @@ are German (Rechnung, Beleg, Angebot, Skonto).
 
 ## Modes: what the server allows
 
-The server runs in one mode, chosen in the plugin settings (default read).
+The server runs in one mode, set where it was installed: SEVDESK_MODE in the client entry,
+the Claude Desktop extension settings or the plugin settings (default read).
 `get_account_info` reports the active mode; call it first when tools seem missing.
 
 | Mode | Adds | Confirmation |
@@ -138,5 +139,6 @@ Status codes, tax rules, payment types and documented pitfalls:
 - 401 from sevdesk: the server runs, but the token is wrong or revoked. The user replaces it
   in the keychain or in SEVDESK_API_TOKEN. Never ask them to paste the token into the chat.
 - Some tools missing or "needs write rights": the mode is too low or the operator switched
-  tools off. Only the user changes that, in the plugin settings (`/plugin`, configure
-  sevdesk), then reloads plugins.
+  tools off. Only the user changes that, where the server was installed (SEVDESK_MODE in the
+  client entry, e.g. with `sevdesk-mcp setup`; the extension settings; or the plugin settings
+  via `/plugin`), then restarts or reloads the client.
