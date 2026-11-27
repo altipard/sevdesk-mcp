@@ -3,10 +3,10 @@ import { connect } from "../../support/harness.js";
 import { READ_TOOLS } from "../../support/tool-names.js";
 
 describe("tool listing in read mode", () => {
-  it("lists the 15 read tools plus the fallback and nothing that writes", async () => {
+  it("lists the 21 read tools plus the fallback and nothing that writes", async () => {
     const c = await connect({ mode: "read" });
     const { tools } = await c.client.listTools();
-    expect(READ_TOOLS).toHaveLength(15);
+    expect(READ_TOOLS).toHaveLength(21);
     expect(tools.map((t) => t.name)).toEqual([...READ_TOOLS, "sevdesk_api_request"]);
     for (const tool of tools) {
       expect(tool.annotations, tool.name).toEqual({
@@ -46,6 +46,12 @@ describe("tool listing in read mode", () => {
       "search_transactions",
       "search_parts",
       "get_tax_guidance",
+      "summarize_documents",
+      "audit_vat",
+      "reverse_charge_report",
+      "find_duplicate_vouchers",
+      "find_subscription_gaps",
+      "reconcile_transactions",
     ]);
     for (const tool of paged) {
       expect(tool.inputSchema.properties?.limit, tool.name).toMatchObject({
