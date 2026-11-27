@@ -53,16 +53,16 @@ export interface KeychainOptions {
 }
 
 /**
- * A copy of `env` without the server's secrets. The rest stays: PATH finds
- * secret-tool, and the Secret Service needs the D-Bus session variables.
+ * A copy of `env` without the server's secrets, for any child process. The rest stays: PATH
+ * finds secret-tool, and the Secret Service needs the D-Bus session variables.
  */
-/** A copy of `env` without the server's secrets, for any child process. */
 export function withoutSecrets(
   env: Record<string, string | undefined>,
 ): Record<string, string | undefined> {
   return childEnv(env);
 }
 
+/** withoutSecrets under the name the keychain functions here use. */
 function childEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
   const copy = { ...env };
   for (const name of SECRET_ENV_VARIABLES) delete copy[name];

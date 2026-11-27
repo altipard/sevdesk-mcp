@@ -6,6 +6,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -491,8 +492,7 @@ describe("runSetup with prompts", () => {
         { select: "global" },
         { select: "read" },
         { confirm: true },
-        // The entry sets SEVDESK_API_TOKEN: keep it this time.
-        { multiselect: [] },
+        // No new token: the entry's SEVDESK_API_TOKEN stays, so nothing is asked about it.
         { password: "" },
         { confirm: false },
         { confirm: true },
@@ -612,7 +612,7 @@ describe("runSetup with prompts", () => {
     expect(tree()).toEqual(before);
   });
 
-  it("offers to remove SEVDESK_API_TOKEN from entries, showing only its name", async () => {
+  const tokenEntry = () => {
     const entry = {
       command: BIN,
       args: [],
@@ -620,45 +620,123 @@ describe("runSetup with prompts", () => {
     };
     mkdirSync(dirname(cursorFile), { recursive: true });
     writeFileSync(cursorFile, JSON.stringify({ mcpServers: { sevdesk: entry } }));
+  };
+  const envToken = () => json(cursorFile).mcpServers.sevdesk.env.SEVDESK_API_TOKEN;
+
+  it("offers to remove SEVDESK_API_TOKEN after the token step, nothing preselected, name only", async () => {
+    tokenEntry();
     const result = await run([], {
       steps: [
         { multiselect: ["cursor"] },
         { select: "global" },
         { select: "read" },
-        { multiselect: ["cursor"] },
         { password: TOKEN },
+        { multiselect: ["cursor"] },
         { confirm: false },
         { confirm: true },
       ],
     });
     expect(result.code).toBe(EXIT.ok);
-    expect(result.asked[3]).toMatchObject({ kind: "multiselect", initial: ["cursor"] });
-    expect(result.asked[3]?.message).toContain("SEVDESK_API_TOKEN");
-    expect(json(cursorFile).mcpServers.sevdesk.env).toEqual({ SEVDESK_MODE: "read" });
+    expect(result.asked.map((a) => a.kind)).toEqual([
+      "multiselect",
+      "select",
+      "select",
+      "password",
+      "multiselect",
+      "confirm",
+      "confirm",
+    ]);
+    expect(result.asked[4]).toMatchObject({ initial: [] });
+    expect(result.asked[4]?.message).toContain("SEVDESK_API_TOKEN");
+    expect(result.stored).toEqual([TOKEN]);
+    expect(envToken()).toBeUndefined();
     expect(result.output).toContain("removes SEVDESK_API_TOKEN from the entry's env");
     expect(result.output).toContain("the backup still holds SEVDESK_API_TOKEN in plain text");
     expect(result.output).not.toContain(OTHER);
   });
 
-  it("keeps the env token without prompts unless --remove-env-token, and warns", async () => {
-    const entry = {
-      command: BIN,
-      args: [],
-      env: { SEVDESK_MODE: "read", SEVDESK_API_TOKEN: OTHER },
-    };
-    mkdirSync(dirname(cursorFile), { recursive: true });
-    writeFileSync(cursorFile, JSON.stringify({ mcpServers: { sevdesk: entry } }));
-    const kept = await run(["--yes", "--agents=cursor"], { interactive: false });
+  it("keeps the env token when nothing is selected", async () => {
+    tokenEntry();
+    await run([], {
+      keychain: { status: "found", token: TOKEN },
+      steps: [
+        { multiselect: ["cursor"] },
+        { select: "global" },
+        { select: "read" },
+        { multiselect: [] },
+        { confirm: false },
+        { confirm: true },
+      ],
+    });
+    expect(envToken()).toBe(OTHER);
+  });
+
+  it("removes it without prompts with --remove-env-token when the keychain holds a token", async () => {
+    tokenEntry();
+    const kept = await run(["--yes", "--agents=cursor"], {
+      interactive: false,
+      keychain: { status: "found", token: TOKEN },
+    });
     expect(kept.output).toContain(
       "keeps SEVDESK_API_TOKEN in the entry's env: it wins over the keychain token (--remove-env-token removes it)",
     );
     expect(kept.output).not.toContain(OTHER);
-    expect(json(cursorFile).mcpServers.sevdesk.env.SEVDESK_API_TOKEN).toBe(OTHER);
+    expect(envToken()).toBe(OTHER);
     const removed = await run(["--yes", "--agents=cursor", "--remove-env-token"], {
       interactive: false,
+      keychain: { status: "found", token: TOKEN },
     });
     expect(removed.code).toBe(EXIT.ok);
-    expect(json(cursorFile).mcpServers.sevdesk.env).toEqual({ SEVDESK_MODE: "read" });
+    expect(envToken()).toBeUndefined();
+  });
+
+  it.each([
+    ["--skip-token", ["--skip-token"], { status: "found", token: TOKEN } as KeychainResult],
+    ["no keychain", [], { status: "unavailable" } as KeychainResult],
+    ["no token stored", [], { status: "missing", detail: "no entry" } as KeychainResult],
+  ])(
+    "keeps the env token with --remove-env-token when there is no keychain token (%s)",
+    async (_label, extra, keychain) => {
+      tokenEntry();
+      const result = await run(["--yes", "--agents=cursor", "--remove-env-token", ...extra], {
+        interactive: false,
+        keychain,
+      });
+      expect(envToken()).toBe(OTHER);
+      expect(result.output).toContain("there is no token in the keychain to use instead");
+      expect(result.output).toContain("there is no keychain token to use instead");
+    },
+  );
+
+  it("does not ask about the env token after Enter at the token prompt, and keeps it", async () => {
+    tokenEntry();
+    const result = await run([], {
+      steps: [
+        { multiselect: ["cursor"] },
+        { select: "global" },
+        { select: "read" },
+        { password: "" },
+        { confirm: false },
+        { confirm: true },
+      ],
+    });
+    expect(result.asked.filter((a) => a.message.includes("SEVDESK_API_TOKEN"))).toEqual([]);
+    expect(envToken()).toBe(OTHER);
+  });
+
+  it("keeps the env token when storing the new token fails, and says so", async () => {
+    tokenEntry();
+    const result = await run(["--yes", "--agents=cursor", "--remove-env-token", "--token-stdin"], {
+      interactive: false,
+      stdin: TOKEN,
+      storeResult: { status: "failed", reason: "the keychain tool failed" },
+    });
+    expect(result.code).toBe(EXIT.failed);
+    expect(envToken()).toBe(OTHER);
+    expect(result.output).toContain(
+      "Cursor: SEVDESK_API_TOKEN stays in the entry's env, because storing the token in the keychain failed.",
+    );
+    expect(result.output).not.toContain("in plain text");
   });
 
   it("warns about the binary path in project files and keeps their backups out of the project", async () => {
@@ -684,5 +762,15 @@ describe("runSetup with prompts", () => {
     expect(result.output).toContain(
       `comments in this file are lost; the backup goes to ${dirname(codexFile)}`,
     );
+  });
+
+  it("keeps its dry-run copies in the private state directory", async () => {
+    const codexFile = configPath(addMcp, "codex", "global", project);
+    mkdirSync(dirname(codexFile), { recursive: true });
+    writeFileSync(codexFile, '# mine\nmodel = "x"\n');
+    await run(["--yes", "--agents=codex"], { interactive: false });
+    const scratch = join(home, ".local", "state", "sevdesk-mcp", "tmp");
+    expect(readdirSync(scratch)).toEqual([]);
+    expect(statSync(scratch).mode & 0o777).toBe(0o700);
   });
 });

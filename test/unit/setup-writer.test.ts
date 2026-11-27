@@ -8,6 +8,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -486,6 +487,39 @@ describe("writeEntry: token in env, comments, backups", () => {
     expect(json(join(dirname(cursorFile), all[0] ?? ""))).toEqual({
       mcpServers: { other: { command: "o" } },
     });
+  });
+});
+
+describe("writeEntry: private directories", () => {
+  it("runs the comment dry run in the private scratch directory and clears stale copies", async () => {
+    const scratch = join(home, "state", "tmp");
+    mkdirSync(join(scratch, "dry-stale"), { recursive: true });
+    writeFileSync(join(scratch, "dry-stale", "config.toml"), "old copy");
+    const old = new Date(Date.now() - 60 * 60 * 1000);
+    utimesSync(join(scratch, "dry-stale"), old, old);
+    mkdirSync(join(scratch, "dry-fresh"));
+    chmodSync(scratch, 0o755);
+    const codexFile = configPath(addMcp, "codex", "global", project);
+    write(codexFile, '# mine\nmodel = "x"\n');
+    expect(await planEntry(addMcp, request({ agent: "codex", scratchDir: scratch }))).toMatchObject(
+      {
+        commentsLost: true,
+      },
+    );
+    // Its own copy is gone, the stale one too; a recent one (another run) stays.
+    expect(readdirSync(scratch)).toEqual(["dry-fresh"]);
+    expect(statSync(scratch).mode & 0o777).toBe(0o700);
+  });
+
+  it("makes an existing backup directory private", async () => {
+    const dir = join(home, "state", "backups");
+    mkdirSync(dir, { recursive: true, mode: 0o755 });
+    chmodSync(dir, 0o755);
+    write(join(project, ".cursor", "mcp.json"), { mcpServers: {} });
+    expect((await writeEntry(addMcp, request({ scope: "project", backupDir: dir }))).status).toBe(
+      "ok",
+    );
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
   });
 });
 

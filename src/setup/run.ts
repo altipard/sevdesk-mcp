@@ -247,7 +247,7 @@ async function flow(args: SetupArgs, deps: SetupDeps, ui: Prompter | undefined):
 
   // What happens per agent
   let replaceEntries = args.replaceEntries;
-  let removeTokenFor = new Set<AgentType>(args.removeEnvToken ? selected : []);
+  let removeTokenFor = new Set<AgentType>();
   const request = (agent: AgentType): EntryRequest => ({
     agent,
     scope,
@@ -257,6 +257,7 @@ async function flow(args: SetupArgs, deps: SetupDeps, ui: Prompter | undefined):
     replaceEntries,
     removeEnvToken: removeTokenFor.has(agent),
     ...(backupDir ? { backupDir } : {}),
+    scratchDir: join(deps.stateDir, "tmp"),
   });
   const planAll = async () => {
     const out = new Map<AgentType, EntryPlan>();
@@ -277,27 +278,37 @@ async function flow(args: SetupArgs, deps: SetupDeps, ui: Prompter | undefined):
     );
     if (replaceEntries) plans = await planAll();
   }
-  // SEVDESK_API_TOKEN in an entry's env wins over the keychain: offer to remove it.
+  // Token
+  const token = await planToken(args, deps, ui, say);
+
+  // SEVDESK_API_TOKEN in an entry's env wins over the keychain. It is only removed when the
+  // keychain will hold a token afterwards, else the entry would be left without one.
+  const keychainToken = token.action === "keep" || token.action === "store";
   const withEnvToken = selected.filter((agent) => {
     const plan = plans.get(agent);
     return plan?.envToken === true && plan.action !== "skip";
   });
-  if (withEnvToken.length > 0 && ui && !args.removeEnvToken) {
-    removeTokenFor = new Set(
-      answer(
-        await ui.multiselect({
-          message: `These entries set ${ENV_TOKEN} in their env, which wins over the keychain token. Remove it from:`,
-          choices: withEnvToken.map((agent) => ({ value: agent, label: name(agent) })),
-          initial: withEnvToken,
-          required: false,
-        }),
-      ),
-    );
+  if (withEnvToken.length > 0 && keychainToken) {
+    if (args.removeEnvToken) {
+      removeTokenFor = new Set(withEnvToken);
+    } else if (ui) {
+      removeTokenFor = new Set(
+        answer(
+          await ui.multiselect({
+            message: `These entries set ${ENV_TOKEN} in their env, which wins over the keychain token. Remove it from (space selects):`,
+            choices: withEnvToken.map((agent) => ({ value: agent, label: name(agent) })),
+            initial: [],
+            required: false,
+          }),
+        ),
+      );
+    }
     if (removeTokenFor.size > 0) plans = await planAll();
+  } else if (withEnvToken.length > 0 && args.removeEnvToken) {
+    say.warn(
+      `${ENV_TOKEN} stays in the entries' env: there is no token in the keychain to use instead.`,
+    );
   }
-
-  // Token
-  const token = await planToken(args, deps, ui, say);
 
   // Skill
   const locations = skillLocations(selected.filter(supportsSkill), {
@@ -334,7 +345,9 @@ async function flow(args: SetupArgs, deps: SetupDeps, ui: Prompter | undefined):
       lines.push(
         plan.action !== "skip" && removeTokenFor.has(agent)
           ? `  removes ${ENV_TOKEN} from the entry's env (the backup still holds it)`
-          : `  keeps ${ENV_TOKEN} in the entry's env: it wins over the keychain token` +
+          : !keychainToken
+            ? `  keeps ${ENV_TOKEN} in the entry's env: there is no keychain token to use instead`
+            : `  keeps ${ENV_TOKEN} in the entry's env: it wins over the keychain token` +
               (plan.action === "skip" ? "" : " (--remove-env-token removes it)"),
       );
     }
@@ -360,7 +373,13 @@ async function flow(args: SetupArgs, deps: SetupDeps, ui: Prompter | undefined):
   // Apply: Ctrl-C waits until this is done, so no step stops halfway.
   const { value: result, interrupted } = await deps.holdInterrupts(async () => {
     let stored: StoreResult | undefined;
+    let keptEnvToken: AgentType[] = [];
     if (token.action === "store") stored = await deps.keychain.store(token.token);
+    if (token.action === "store" && stored?.status !== "stored") {
+      // No token in the keychain after all: the env token stays where it was.
+      keptEnvToken = [...removeTokenFor];
+      removeTokenFor = new Set();
+    }
     const entries = new Map<AgentType, EntryOutcome>();
     for (const agent of selected) {
       const plan = plans.get(agent);
@@ -380,7 +399,7 @@ async function flow(args: SetupArgs, deps: SetupDeps, ui: Prompter | undefined):
     }
     const skills: SkillOutcome[] = [];
     if (skill) for (const location of locations) skills.push(await installSkill(location.dir));
-    return { stored, entries, skills };
+    return { stored, entries, skills, keptEnvToken };
   });
 
   // Report
@@ -396,6 +415,11 @@ async function flow(args: SetupArgs, deps: SetupDeps, ui: Prompter | undefined):
         `Storing the token failed${result.stored?.status === "failed" ? `: ${result.stored.reason}` : ""}; the keychain may be unchanged.`,
       );
     }
+  }
+  for (const agent of result.keptEnvToken) {
+    say.warn(
+      `${name(agent)}: ${ENV_TOKEN} stays in the entry's env, because storing the token in the keychain failed.`,
+    );
   }
   for (const [agent, outcome] of result.entries) {
     switch (outcome.status) {

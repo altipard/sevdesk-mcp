@@ -4,6 +4,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rename,
   rm,
@@ -45,6 +46,11 @@ export interface EntryRequest {
    * a user directory, so they do not end up in the repository.
    */
   backupDir?: string;
+  /**
+   * Private directory for the dry run that predicts lost comments (the setup's state
+   * directory); the system temp directory when unset.
+   */
+  scratchDir?: string;
 }
 
 /** The env variable that, set in an entry, wins over the keychain token. */
@@ -239,6 +245,28 @@ async function inspect(addMcp: AddMcp, request: EntryRequest): Promise<Inspectio
   );
 }
 
+/** Age after which a dry-run copy is taken as left over from an interrupted setup. */
+const STALE_DRY_RUN_MS = 10 * 60 * 1000;
+
+/**
+ * A fresh directory for one dry run. In the private scratch directory (mode 700) a run that
+ * was interrupted leaves its copy only there, and it is removed by the next setup.
+ */
+async function dryRunDir(scratch: string | undefined): Promise<string> {
+  if (!scratch) return mkdtemp(join(tmpdir(), "sevdesk-mcp-dry-"));
+  await mkdir(scratch, { recursive: true, mode: 0o700 });
+  await chmod(scratch, 0o700);
+  for (const name of await readdir(scratch)) {
+    if (!name.startsWith("dry-")) continue;
+    const path = join(scratch, name);
+    const info = await stat(path).catch(() => undefined);
+    if (info && Date.now() - info.mtimeMs > STALE_DRY_RUN_MS) {
+      await rm(path, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+  return mkdtemp(join(scratch, "dry-"));
+}
+
 function countComments(text: string, format: string): number {
   return format === "json" ? countJsoncComments(text) : countHashComments(text);
 }
@@ -258,7 +286,7 @@ async function predictCommentLoss(
   const format = addMcp.agents[request.agent].format;
   const before = countComments(original, format);
   if (before === 0) return false;
-  const dir = await mkdtemp(join(tmpdir(), "sevdesk-mcp-dry-"));
+  const dir = await dryRunDir(request.scratchDir);
   try {
     const copy = join(dir, basename(path));
     await writeFile(copy, original, { mode: 0o600 });
@@ -338,6 +366,8 @@ async function backup(path: string, content: string, now: Date, dir?: string): P
   let base = `${path}.backup-${timestamp(now)}`;
   if (dir) {
     await mkdir(dir, { recursive: true, mode: 0o700 });
+    // mkdir sets the mode only on a directory it creates.
+    await chmod(dir, 0o700);
     const hash = createHash("sha256").update(path).digest("hex").slice(0, 8);
     base = join(dir, `${basename(path)}.${hash}.backup-${timestamp(now)}`);
   }
