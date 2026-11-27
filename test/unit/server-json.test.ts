@@ -75,11 +75,13 @@ describe("server.json for the MCP registry", () => {
     expect(token?.description).toContain(`account ${KEYCHAIN_ACCOUNT}`);
   });
 
-  it("offers exactly the server's modes with read as the default", () => {
+  // full needs SEVDESK_ENABLE_TOOLS, which the registry entry cannot set, so it is not offered.
+  it("offers only server modes the registry can set, with read as the default", () => {
     const mode = env("SEVDESK_MODE");
     expect(mode).toMatchObject({ isSecret: false, isRequired: false, default: "read" });
-    expect(mode?.choices).toEqual([...MODES]);
+    expect(mode?.choices).toEqual(["read", "write"]);
+    expect(MODES).toEqual(expect.arrayContaining(mode?.choices ?? []));
     expect(configSource).toMatch(/\.default\("read"\)/);
-    expect(mode?.description).toContain("SEVDESK_ENABLE_TOOLS");
+    expect(mode?.description).not.toMatch(/\bfull\b/);
   });
 });

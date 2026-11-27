@@ -29,11 +29,11 @@
         },
         {
           "name": "SEVDESK_MODE",
-          "description": "read (default): only reads. write: also drafts, contacts, payments and status changes; bookings and status changes need a confirmation. full: also irreversible actions, each of which must also be listed in SEVDESK_ENABLE_TOOLS.",
+          "description": "read (default): only reads. write: also drafts, contacts, payments and status changes; bookings and status changes need a confirmation.",
           "isRequired": false,
           "isSecret": false,
           "default": "read",
-          "choices": ["read", "write", "full"]
+          "choices": ["read", "write"]
         }
       ]
     }
