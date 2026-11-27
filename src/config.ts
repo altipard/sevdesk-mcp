@@ -19,6 +19,11 @@ export const MIN_CONFIRM_SECRET_LENGTH = 32;
  */
 export const DEFAULT_RATE_LIMIT = 4;
 export const MAX_RATE_LIMIT = 100;
+/**
+ * Below this, one slot takes longer than a call may wait (60 s deadline),
+ * so every call after the first would time out.
+ */
+export const MIN_RATE_LIMIT = 0.05;
 
 export interface Config {
   sevdeskApiToken: string;
@@ -194,8 +199,8 @@ const envSchema = z.object({
       .trim()
       .regex(/^\d+(\.\d+)?$/, { error: "must be a number of requests per second, e.g. 4 or 0.5" })
       .transform(Number)
-      .refine((value) => value <= MAX_RATE_LIMIT, {
-        error: `must be between 0 (off) and ${MAX_RATE_LIMIT}`,
+      .refine((value) => value === 0 || (value >= MIN_RATE_LIMIT && value <= MAX_RATE_LIMIT), {
+        error: `must be 0 (off) or between ${MIN_RATE_LIMIT} and ${MAX_RATE_LIMIT}`,
       })
       .default(DEFAULT_RATE_LIMIT),
   ),

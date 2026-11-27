@@ -298,6 +298,103 @@ describe("retries on 429", () => {
   });
 });
 
+describe("429 budget and the shared bucket", () => {
+  it("gives a 429 its own retries after 5xx retries of a GET", async () => {
+    answers = [json(503), json(503), json(429), json(429), json(429), json(200, {}, { ok: 1 })];
+    const client = setup({ retry: { baseDelayMs: 100 } });
+    await expect(client.call(client.api.GET("/Part"))).resolves.toEqual({ ok: 1 });
+    expect(seen).toHaveLength(6);
+  });
+
+  it("bounds a mix of 5xx and 429 by both budgets", async () => {
+    answers = Array.from({ length: 20 }, (_, i) => () => json(i % 2 === 0 ? 503 : 429));
+    const client = setup({
+      retry: { maxRetries: 2, maxRateLimitRetries: 2, baseDelayMs: 10 },
+    });
+    await captureError(client.call(client.api.GET("/Part")));
+    expect(seen).toHaveLength(5);
+  });
+
+  it("holds back other calls of the token after a 429 with Retry-After", async () => {
+    const shared = registry();
+    const one = setup({ rateLimit: 4, rateLimiters: shared, retry: { maxRateLimitRetries: 0 } });
+    const two = setup({ rateLimit: 4, rateLimiters: shared });
+    const other = setup({ rateLimit: 4, rateLimiters: shared, token: "f".repeat(32) });
+    answers = [json(429, { "Retry-After": "2" })];
+
+    await captureError(one.call(one.api.POST("/Contact", { body: {} as never })));
+    await other.call(other.api.GET("/Part"));
+    expect(limiterWaits).toEqual([]);
+    await two.call(two.api.GET("/Part"));
+    expect(limiterWaits).toEqual([2000]);
+  });
+
+  it("caps the hold at maxDelayMs for a huge Retry-After", async () => {
+    const client = setup({ rateLimit: 4, deadlineMs: 60_000 });
+    answers = [json(429, { "Retry-After": "120" })];
+    await captureError(client.call(client.api.GET("/Part")));
+    await client.call(client.api.GET("/Part"));
+    expect(limiterWaits).toEqual([10_000]);
+  });
+
+  it("does not hold the token after a 429 without Retry-After", async () => {
+    const client = setup({ rateLimit: 4, retry: { maxRateLimitRetries: 0 } });
+    answers = [json(429)];
+    await captureError(client.call(client.api.GET("/Part")));
+    await client.call(client.api.GET("/Part"));
+    expect(limiterWaits).toEqual([]);
+  });
+});
+
+describe("retrying uploads on 429", () => {
+  it("sends a FormData file upload again in full", async () => {
+    answers = [json(429, { "Retry-After": "1" }), json(201, {}, { objects: [{ filename: "x" }] })];
+    const client = setup();
+    const form = new FormData();
+    form.append(
+      "file",
+      new Blob([new Uint8Array([37, 80, 68, 70, 1, 2, 3])], { type: "application/pdf" }),
+      "beleg.pdf",
+    );
+
+    await client.call(
+      client.api.POST("/Voucher/Factory/uploadTempFile", {
+        body: form as never,
+        bodySerializer: (body: unknown) => body as FormData,
+      }),
+    );
+
+    expect(seen).toHaveLength(2);
+    expect(seen[0]?.body).toContain('filename="beleg.pdf"');
+    expect(seen[0]?.body).toContain("%PDF");
+    expect(seen[1]?.body).toBe(seen[0]?.body);
+  });
+
+  it("sends a streamed body again in full", async () => {
+    answers = [json(429, { "Retry-After": "1" }), json(201)];
+    const client = setup();
+    const chunks = ["first ", "second"];
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const next = chunks.shift();
+        if (next === undefined) controller.close();
+        else controller.enqueue(new TextEncoder().encode(next));
+      },
+    });
+
+    await client.call(
+      client.api.POST("/Contact", {
+        body: stream as never,
+        // fetch needs duplex for a stream body; openapi-fetch passes it on.
+        duplex: "half",
+        bodySerializer: (body: unknown) => body as ReadableStream,
+      }),
+    );
+
+    expect(seen.map((s) => s.body)).toEqual(["first second", "first second"]);
+  });
+});
+
 describe("writes stay single-shot on everything but 429", () => {
   it.each([500, 502, 503, 504])("sends a POST answered with %i once", async (status) => {
     answers = [json(status), json(200)];

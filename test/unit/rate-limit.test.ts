@@ -161,6 +161,72 @@ describe("scope", () => {
   });
 });
 
+describe("pause", () => {
+  it("holds back new requests of the token for the given time", async () => {
+    const registry = createRateLimiterRegistry();
+    const limiter = registry.limiterFor(TOKEN_A, 4);
+    limiter.pause(2000);
+    const start = Date.now();
+    let grantedAt = 0;
+    const next = limiter.acquire(signal(), NO_LIMIT).then(() => {
+      grantedAt = Date.now();
+    });
+    await vi.advanceTimersByTimeAsync(5000);
+    await next;
+    expect(grantedAt - start).toBe(2000);
+    // Another token is not affected.
+    await expect(registry.limiterFor(TOKEN_B, 4).acquire(signal(), 0)).resolves.toBe(true);
+  });
+
+  it("never shortens a longer wait and ignores non-positive times", async () => {
+    const limiter = createRateLimiterRegistry().limiterFor(TOKEN_A, 1);
+    await limiter.acquire(signal(), 0);
+    limiter.pause(100);
+    limiter.pause(0);
+    limiter.pause(-5);
+    await expect(limiter.acquire(signal(), 999)).resolves.toBe(false);
+  });
+
+  it("does nothing when disabled", async () => {
+    const registry = createRateLimiterRegistry();
+    const limiter = registry.limiterFor(TOKEN_A, 0);
+    limiter.pause(5000);
+    await expect(limiter.acquire(signal(), 0)).resolves.toBe(true);
+    expect(registry.size).toBe(0);
+  });
+});
+
+describe("rates", () => {
+  it("keeps one bucket per token when a client asks for another rate", async () => {
+    const registry = createRateLimiterRegistry();
+    await registry.limiterFor(TOKEN_A, 1).acquire(signal(), 0);
+    const faster = registry.limiterFor(TOKEN_A, 2);
+    // The slot taken at rate 1 still counts; at rate 2 the next is 500 ms away.
+    await expect(faster.acquire(signal(), 499)).resolves.toBe(false);
+    const next = faster.acquire(signal(), 500);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(next).resolves.toBe(true);
+    expect(registry.size).toBe(1);
+  });
+});
+
+describe("eviction order", () => {
+  it("drops an idle full bucket behind an idle one that still has waiters", async () => {
+    const registry = createRateLimiterRegistry({ idleMs: 1000 });
+    const busy = registry.limiterFor(TOKEN_A, 0.05);
+    await busy.acquire(signal(), 0);
+    // This waiter holds a slot 20 s away, so the bucket is not full.
+    const waiting = busy.acquire(signal(), NO_LIMIT);
+    await registry.limiterFor(TOKEN_B, 1).acquire(signal(), 0);
+    await vi.advanceTimersByTimeAsync(5000);
+    await registry.limiterFor("c".repeat(32), 1).acquire(signal(), 0);
+    // A stays (waiter), B is gone, C is new.
+    expect(registry.size).toBe(2);
+    await vi.advanceTimersByTimeAsync(20_000);
+    await expect(waiting).resolves.toBe(true);
+  });
+});
+
 describe("aborting", () => {
   it("rejects at once when the signal aborted before", async () => {
     const limiter = createRateLimiterRegistry().limiterFor(TOKEN_A, 1);

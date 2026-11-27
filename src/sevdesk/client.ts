@@ -333,7 +333,11 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
     request = new Request(request, { headers });
     const method = request.method.toUpperCase();
     const mayHaveSideEffect = method !== "GET" || policy.sideEffects;
-    const maxAttempts = method === "GET" ? policy.retry.maxRetries + 1 : 1;
+    // Two budgets, so a 429 after a 503 still gets its own retries. Both
+    // are finite, so the attempts are bounded by their sum plus one.
+    const maxOtherRetries = method === "GET" ? policy.retry.maxRetries : 0;
+    let otherRetries = 0;
+    let rateLimitRetries = 0;
     const path = new URL(request.url).pathname;
     const deadline = policy.now() + policy.deadlineMs;
     // A retry only starts if, after the wait, a meaningful attempt still
@@ -365,7 +369,7 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
       const timeout = AbortSignal.timeout(attemptTimeoutMs);
       const signal = AbortSignal.any([request.signal, timeout]);
       const started = performance.now();
-      const canRetry = attempt < maxAttempts;
+      const canRetry = otherRetries < maxOtherRetries;
       let response: Response;
 
       try {
@@ -406,7 +410,7 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
           );
         }
         const kind = timeout.aborted ? "timeout" : "network";
-        const delay = backoffDelay(attempt, policy.retry);
+        const delay = backoffDelay(otherRetries + 1, policy.retry);
         const deadlineHit = canRetry && !fitsDeadline(delay);
         if (canRetry && !deadlineHit) {
           policy.logger.warn("sevdesk request failed, retrying", {
@@ -417,6 +421,7 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
             delayMs: delay,
           });
           retriedResponse = undefined;
+          otherRetries++;
           await waitUnlessAborted(policy, delay, request.signal);
           continue;
         }
@@ -457,19 +462,26 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
         });
       }
 
+      const rateLimited = response.status === 429;
+      const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
+      // sevdesk throttles the token, not this call: hold back the other
+      // calls of the token as well, whether or not this one is retried.
+      // Capped like our own wait, so a huge header cannot lock the token.
+      if (rateLimited && retryAfter !== undefined) {
+        policy.limiter.pause(Math.min(retryAfter, policy.retry.maxDelayMs));
+      }
+
       // Retries of other answers are bounded by maxRetries and GET only;
       // a 429 by its own budget, for every method.
-      const retryStatus =
-        response.status === 429
-          ? attempt <= policy.retry.maxRateLimitRetries
-          : canRetry && isRetryableStatus(response.status);
+      const retryStatus = rateLimited
+        ? rateLimitRetries < policy.retry.maxRateLimitRetries
+        : canRetry && isRetryableStatus(response.status);
       if (!retryStatus) return response;
 
-      const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
       // Retry-After 0 (or a date in the past) still gets a minimal pause.
       const delay =
         retryAfter === undefined
-          ? backoffDelay(attempt, policy.retry)
+          ? backoffDelay((rateLimited ? rateLimitRetries : otherRetries) + 1, policy.retry)
           : Math.max(policy.retry.baseDelayMs, retryAfter);
       // A server asking for a longer pause than we are willing to wait, or
       // one past the deadline, gets its error passed through as is.
@@ -483,6 +495,8 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
         delayMs: delay,
       });
       retriedResponse = response;
+      if (rateLimited) rateLimitRetries++;
+      else otherRetries++;
       await waitUnlessAborted(policy, delay, request.signal);
     }
   };

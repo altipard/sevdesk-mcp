@@ -16,6 +16,11 @@ export interface RateLimiter {
    * if it aborts before or during the wait; the slot is then given back.
    */
   acquire(signal: AbortSignal, maxWaitMs: number): Promise<boolean>;
+  /**
+   * Holds back new requests of this token for `ms`, e.g. after sevdesk
+   * answered 429 with Retry-After. Slots already reserved are kept.
+   */
+  pause(ms: number): void;
 }
 
 export interface RateLimiterRegistry {
@@ -42,15 +47,19 @@ export const DEFAULT_IDLE_MS = 10 * 60_000;
 export const DEFAULT_MAX_BUCKETS = 1000;
 
 interface Bucket {
-  readonly rate: number;
-  readonly capacity: number;
+  rate: number;
+  capacity: number;
   /** May go negative: each waiting request has reserved its slot. */
   tokens: number;
   updated: number;
+  /**
+   * Time of the last acquisition. Buckets are kept in this order in the
+   * map, which lets eviction stop at the first recent one.
+   */
   lastUsed: number;
 }
 
-const disabled: RateLimiter = { acquire: async () => true };
+const disabled: RateLimiter = { acquire: async () => true, pause: () => {} };
 
 const realSleep = (ms: number, signal: AbortSignal): Promise<void> =>
   new Promise((resolve) => {
@@ -63,8 +72,13 @@ const realSleep = (ms: number, signal: AbortSignal): Promise<void> =>
     signal.addEventListener("abort", done, { once: true });
   });
 
-function keyOf(token: string, rate: number): string {
-  return `${createHash("sha256").update(token, "utf8").digest("hex")}:${rate}`;
+/**
+ * One bucket per token, whatever the rate: clients asking for another rate
+ * switch the shared bucket to it. In practice every client passes the same
+ * config.rateLimit.
+ */
+function keyOf(token: string): string {
+  return createHash("sha256").update(token, "utf8").digest("hex");
 }
 
 /** Burst of up to one second of requests, at least one. */
@@ -91,8 +105,9 @@ export function createRateLimiterRegistry(
 
   /**
    * Drops buckets idle for `idleMs` that are full again, so a later
-   * request sees the same state as with a fresh bucket. Stops at the first
-   * bucket in use, since the rest were used more recently.
+   * request sees the same state as with a fresh bucket. A bucket with
+   * pending reservations or a pause is not full. Stops at the first bucket
+   * used recently, since the map is ordered by last use.
    */
   function evict(at: number): void {
     for (const [key, bucket] of buckets) {
@@ -112,6 +127,12 @@ export function createRateLimiterRegistry(
       bucket = { rate, capacity, tokens: capacity, updated: at, lastUsed: at };
     } else {
       buckets.delete(key);
+      if (bucket.rate !== rate) {
+        refill(bucket, at);
+        bucket.rate = rate;
+        bucket.capacity = capacityFor(rate);
+        bucket.tokens = Math.min(bucket.tokens, bucket.capacity);
+      }
     }
     buckets.set(key, bucket);
     // The cap may have dropped others to make room, never this one.
@@ -136,9 +157,8 @@ export function createRateLimiterRegistry(
     const waitMs = bucket.tokens >= 1 ? 0 : Math.ceil(((1 - bucket.tokens) / bucket.rate) * 1000);
     if (waitMs > maxWaitMs) return false;
     bucket.tokens -= 1;
-    // Counts the reserved slot as use, so a bucket with waiters is not
-    // dropped while they wait.
-    bucket.lastUsed = at + waitMs;
+    // A bucket with waiters is not full, so eviction keeps it anyway.
+    bucket.lastUsed = at;
     if (waitMs === 0) return true;
     try {
       await untilAborted(sleep(waitMs, signal), signal);
@@ -149,12 +169,23 @@ export function createRateLimiterRegistry(
     return true;
   }
 
+  function pause(key: string, rate: number, ms: number): void {
+    if (!(ms > 0)) return;
+    const at = now();
+    const bucket = bucketFor(key, rate, at);
+    refill(bucket, at);
+    // The next slot opens `ms` from now: (1 - tokens) / rate seconds.
+    bucket.tokens = Math.min(bucket.tokens, 1 - (ms / 1000) * bucket.rate);
+    bucket.lastUsed = at;
+  }
+
   return {
     limiterFor(token, requestsPerSecond) {
       if (!(requestsPerSecond > 0) || !Number.isFinite(requestsPerSecond)) return disabled;
-      const key = keyOf(token, requestsPerSecond);
+      const key = keyOf(token);
       return {
         acquire: (signal, maxWaitMs) => acquire(key, requestsPerSecond, signal, maxWaitMs),
+        pause: (ms) => pause(key, requestsPerSecond, ms),
       };
     },
     get size() {
