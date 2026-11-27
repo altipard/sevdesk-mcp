@@ -1,0 +1,41 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.altipard/sevdesk-mcp",
+  "title": "sevdesk (unofficial)",
+  "description": "Unofficial sevdesk accounting tools: invoices, contacts, vouchers, banking. Read-only by default.",
+  "repository": {
+    "url": "https://github.com/altipard/sevdesk-mcp",
+    "source": "github",
+    "id": "1473744205"
+  },
+  "websiteUrl": "https://github.com/altipard/sevdesk-mcp",
+  "version": "0.0.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@altipard/sevdesk-mcp",
+      "version": "0.0.0",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "SEVDESK_API_TOKEN",
+          "description": "sevdesk API token (Settings > Users, 32 hex characters). Optional: without it the server reads the token from the system keychain (service sevdesk-mcp, account api-token), which `npx -y @altipard/sevdesk-mcp setup` fills.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "SEVDESK_MODE",
+          "description": "read (default): only reads. write: also drafts, contacts, payments and status changes; bookings and status changes need a confirmation. full: also irreversible actions, each of which must also be listed in SEVDESK_ENABLE_TOOLS.",
+          "isRequired": false,
+          "isSecret": false,
+          "default": "read",
+          "choices": ["read", "write", "full"]
+        }
+      ]
+    }
+  ]
+}

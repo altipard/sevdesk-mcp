@@ -1,6 +1,7 @@
 {
   "name": "@altipard/sevdesk-mcp",
   "version": "0.1.0",
+  "mcpName": "io.github.altipard/sevdesk-mcp",
   "description": "Unofficial sevdesk MCP server: curated, read-only-by-default tools for the sevdesk accounting API (invoices, contacts, vouchers, banking)",
   "license": "MIT",
   "type": "module",
