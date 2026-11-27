@@ -1,0 +1,56 @@
+{
+  "manifest_version": "0.3",
+  "name": "sevdesk-mcp",
+  "display_name": "sevdesk-mcp",
+  "version": "0.0.0",
+  "description": "Unofficial, not affiliated with sevdesk GmbH. Curated, read-only-by-default tools for the sevdesk accounting API: invoices, contacts, vouchers, banking.",
+  "long_description": "Unofficial, not affiliated with sevdesk GmbH.\n\nThe API token stays on this computer and is sent only to sevdesk. The mode sets the ceiling: `read` (default) allows only reads, `write` adds drafts, master data and status changes. Tools above the mode are not registered. Irreversible actions (sending e-mail, cancellation, enshrining) need `full` plus an explicit tool release that this extension does not set, so here `full` behaves like `write`.",
+  "author": {
+    "name": "Zilicon IT Services"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/altipard/sevdesk-mcp.git"
+  },
+  "homepage": "https://github.com/altipard/sevdesk-mcp",
+  "documentation": "https://github.com/altipard/sevdesk-mcp#readme",
+  "support": "https://github.com/altipard/sevdesk-mcp/issues",
+  "icon": "icon.png",
+  "license": "MIT",
+  "keywords": ["sevdesk", "accounting", "bookkeeping", "invoices", "buchhaltung"],
+  "privacy_policies": ["https://sevdesk.de/datenschutz/"],
+  "server": {
+    "type": "node",
+    "entry_point": "dist/bin/stdio.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/dist/bin/stdio.js"],
+      "env": {
+        "SEVDESK_API_TOKEN": "${user_config.api_token}",
+        "SEVDESK_MODE": "${user_config.mode}"
+      }
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "node": ">=24"
+    }
+  },
+  "user_config": {
+    "api_token": {
+      "type": "string",
+      "title": "sevdesk API token",
+      "description": "32 hex characters; sevdesk issues one per administrator.",
+      "sensitive": true,
+      "required": true
+    },
+    "mode": {
+      "type": "string",
+      "title": "Mode",
+      "description": "read (default), write or full. read allows only reads, write adds drafts, master data and status changes. full behaves like write here: irreversible tools also need a release this extension does not set.",
+      "default": "read",
+      "required": false
+    }
+  }
+}
