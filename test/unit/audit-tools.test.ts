@@ -395,6 +395,38 @@ describe("audit_vat", () => {
     expect(data.note).toContain("was not done for 1 expense voucher(s) with rule 9 or 10");
   });
 
+  it("counts a reverse charge case with a free-text supplier as unchecked", async () => {
+    api.server.use(
+      version("2.0"),
+      http.get(sevdeskUrl("/Voucher"), () =>
+        HttpResponse.json(
+          list([
+            voucher({
+              id: "8001",
+              supplier: null,
+              supplierName: "Cloud Ltd",
+              sumNet: "20",
+              sumTax: "0",
+              sumGross: "20",
+            }),
+          ]),
+        ),
+      ),
+      http.get(sevdeskUrl("/ReceiptGuidance/forAllAccounts"), () => HttpResponse.json(list([]))),
+      http.get(sevdeskUrl("/VoucherPos"), () =>
+        HttpResponse.json(
+          list([voucherPosition({ voucher: ref(8001, "Voucher"), taxRate: "0", sumTax: "0" })]),
+        ),
+      ),
+    );
+    const c = await connect();
+    const data = structured<{ note: string; truncated: boolean }>(await c.call("audit_vat", MARCH));
+    expect(api.requests.filter((r) => pathOf(r).startsWith("/Contact"))).toHaveLength(0);
+    expect(data.truncated).toBe(true);
+    expect(data.note).toContain("Positions were read for 1 of 1 vouchers");
+    expect(data.note).toContain("was not done for 1 expense voucher(s) with rule 9 or 10");
+  });
+
   it("sends nothing more after a 429 the retries could not get past", async () => {
     const vouchers = Array.from({ length: 6 }, (_, i) => voucher({ id: String(7000 + i) }));
     api.server.use(

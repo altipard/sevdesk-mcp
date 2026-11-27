@@ -5,6 +5,7 @@ import {
   amount,
   badInput,
   berlinDateTime,
+  cents,
   integer,
   isoDate,
   isoDateOf,
@@ -437,7 +438,9 @@ export function mapAuditVoucher(raw: Raw): AuditVoucher {
     creditDebit: summary.creditDebit,
     foreignCurrency,
     sumNet: accounting ? net : summary.sumNet,
-    sumTax: accounting ? (tax ?? amount(raw.sumTax)) : amount(raw.sumTax),
+    // Without sumTaxAccounting the euro tax is gross minus net: sumTax is in
+    // the document currency and would not fit the euro net and gross.
+    sumTax: accounting ? (tax ?? cents((gross as number) - (net as number))) : amount(raw.sumTax),
     sumGross: accounting ? gross : summary.sumGross,
     euroUnconfirmed: foreignCurrency !== null && !accounting,
     openAmount: summary.openAmount,
@@ -618,11 +621,6 @@ export function signed(value: number | null, sign: 1 | -1): number | null {
 }
 
 /**
- * Final invoices (ER) next to advance or partial invoices (AR, TR): the spec
- * does not say whether an ER's sums repeat the advances it settles, so the
- * answer says the total may count them twice instead of guessing.
- */
-/**
  * Note for answers whose sums contain cancellation invoices (SR) or credit
  * notes: they were subtracted whatever sign sevdesk stores (revenueSign).
  */
@@ -642,6 +640,11 @@ export function signNote(
   );
 }
 
+/**
+ * Final invoices (ER) next to advance or partial invoices (AR, TR): the spec
+ * does not say whether an ER's sums repeat the advances it settles, so the
+ * answer says the total may count them twice instead of guessing.
+ */
 export function partialInvoiceNote(invoices: readonly AuditInvoice[]): string | undefined {
   const types = new Set(invoices.map((i) => i.invoiceType));
   if (!types.has("ER") || !(types.has("AR") || types.has("TR"))) return undefined;

@@ -117,11 +117,14 @@ export function coverageNote(input: {
   reverseChargeUnchecked: number;
 }): string | undefined {
   const { vouchers, positionsRead, suppliers, countriesRead, reverseChargeUnchecked } = input;
-  if (positionsRead >= vouchers && countriesRead >= suppliers) return undefined;
+  if (positionsRead >= vouchers && countriesRead >= suppliers && reverseChargeUnchecked === 0) {
+    return undefined;
+  }
   const unchecked =
     reverseChargeUnchecked > 0
       ? ` The reverse charge check (section 13b UStG) was not done for ${reverseChargeUnchecked} ` +
-        "expense voucher(s) with rule 9 or 10 and no tax."
+        "expense voucher(s) with rule 9 or 10 and no tax (positions, supplier country or a " +
+        "supplier contact missing)."
       : "";
   return (
     `Positions were read for ${positionsRead} of ${vouchers} vouchers (likely reverse charge ` +
@@ -747,7 +750,8 @@ export const auditVat = defineTool({
       (v) =>
         domesticExpense(v) &&
         (positions.has(v.id)
-          ? zeroOnly(v) && v.supplierId !== null && !countries.has(v.supplierId)
+          ? // A supplier typed as free text has no contact to look up.
+            zeroOnly(v) && (v.supplierId === null || !countries.has(v.supplierId))
           : v.sumTax === 0 || v.sumTax === null),
     ).length;
     const coverage = coverageNote({

@@ -119,6 +119,22 @@ describe("voucher euro amounts", () => {
     expect(other).toMatchObject({ sumNet: 110, sumGross: 110, foreignCurrency: null });
   });
 
+  it("derives the euro tax when a foreign voucher has accounting net and gross only", () => {
+    // sumTax 21 is in USD; euro net 100 and gross 119 leave a euro tax of 19.
+    const v = mapAuditVoucher(
+      raw({
+        sumNet: "110",
+        sumTax: "21",
+        sumGross: "131",
+        sumNetAccounting: "100",
+        sumTaxAccounting: null,
+        sumGrossAccounting: "119",
+      }),
+    );
+    expect(v).toMatchObject({ sumNet: 100, sumTax: 19, sumGross: 119, euroUnconfirmed: false });
+    expect(checkVoucher({ voucher: v }).map((f) => f.code)).not.toContain("NET_PLUS_TAX_NOT_GROSS");
+  });
+
   it("falls back for a foreign voucher whose accounting sums are 0, not for a tax of 0", () => {
     const zero = mapAuditVoucher(
       raw({ sumNetAccounting: "0", sumTaxAccounting: "0", sumGrossAccounting: "0" }),
