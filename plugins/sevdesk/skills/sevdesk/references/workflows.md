@@ -25,11 +25,15 @@ arguments change, show the new state and ask again.
      Show recipient, cc/bcc, subject, text, invoice number and amount; warn if the address
      is not one of the contact's. Irreversible: get an explicit yes for exactly this e-mail.
 
-From an estimate: find the order with `search_orders`. Show the plan first: order number,
-customer, the positions and totals the invoice will take over, and for partial (TR) or
-advance (AR) invoices the amountType and amount. Wait for a yes, then call
-`create_invoice_from_order` once (every call creates another invoice) and continue with
-step 5. A new estimate is `create_order_draft` with the same steps 1 to 5.
+From an estimate: find the order with `search_orders`; it returns order number, customer
+and the net and gross totals, not the positions. For the positions, call
+`sevdesk_api_request` with operationId getOrderPositionsById and params orderId (a read the
+server releases by default); if the operator removed it, show the totals only and say so.
+Show the plan first: order number, customer, positions if available, totals, and for
+partial (TR) or advance (AR) invoices the amountType and amount. Wait for a yes, then call
+`create_invoice_from_order` once (every call creates another invoice). Report the result as
+in step 5 (invoice ID, totals as sevdesk computed them, warnings) and continue with steps 6
+and 7. A new estimate is `create_order_draft` with the same steps 1 to 5.
 
 ## Record a voucher with its file and book the payment
 

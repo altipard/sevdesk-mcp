@@ -3,7 +3,9 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_CONFIRM_TTL_SECONDS, loadConfig } from "../../src/config.js";
+import { classOf } from "../../src/policy/classification.js";
 import { IDEMPOTENCY_TTL_MS } from "../../src/policy/guard.js";
+import { OPERATIONS, type OperationId } from "../../src/policy/operations.js";
 import type { ToolDefinition } from "../../src/policy/registry.js";
 import { SCOPES } from "../../src/policy/rights.js";
 import { MAX_CONTACTS_SCANNED, MAX_EMAILS_SCANNED } from "../../src/tools/contacts.js";
@@ -18,6 +20,7 @@ import {
   TRANSACTION_STATUS,
   VOUCHER_STATUS,
 } from "../../src/tools/format.js";
+import { DEFAULT_API_ALLOW } from "../../src/tools/generic.js";
 import { TOOLS } from "../../src/tools/index.js";
 import { RECEIVABLES_DEADLINE_MS } from "../../src/tools/invoices.js";
 import { MAX_VOUCHER_FILE_BYTES } from "../../src/tools/voucher-writes.js";
@@ -323,5 +326,17 @@ describe("skill values match the server", () => {
       .split(",")
       .map((scope) => scope.trim());
     expect(sorted(scopes)).toEqual(sorted(enumValues("get_tax_guidance", "scope")));
+  });
+
+  it("fallback operations the skill names are default-released reads with those params", () => {
+    const named = [...all.matchAll(/operationId (\w+) and params (\w+)/g)];
+    expect(named.length).toBeGreaterThan(0);
+    for (const [, operationId, param] of named) {
+      const id = operationId as OperationId;
+      expect(DEFAULT_API_ALLOW, operationId).toContain(id);
+      expect(classOf(id), operationId).toBe("R");
+      const params = OPERATIONS[id].params.map((spec) => spec.name);
+      expect(params, `${operationId}.${param}`).toContain(param);
+    }
   });
 });
