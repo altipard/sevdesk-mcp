@@ -66,6 +66,11 @@ writes, after you confirm:
   `$XDG_STATE_HOME/sevdesk-mcp/backups` (default `~/.local/state/sevdesk-mcp/backups`), not
   into the project. A backup keeps whatever the file held, including a token that was in
   it; the setup names such backups so you can delete them.
+- **Two short-lived copies of a configuration file**, which hold a token if the file does:
+  a test copy in `$XDG_STATE_HOME/sevdesk-mcp/tmp` (mode 0600, in a directory only you can
+  read) that shows whether writing would drop comments, and a staging file next to the
+  configuration that replaces it in one step. Both are removed when the run ends; a test
+  copy left by an interrupted run is removed by the next setup.
 - **The sevdesk skill**, if you choose it: instruction files in the program's skill folder,
   for example `~/.claude/skills/sevdesk` or `~/.agents/skills/sevdesk`.
 
