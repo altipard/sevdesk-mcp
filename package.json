@@ -60,8 +60,10 @@
     "prepack": "npm run build"
   },
   "dependencies": {
+    "@clack/prompts": "1.9.0",
     "@modelcontextprotocol/node": "2.1.2",
     "@modelcontextprotocol/server": "2.4.0",
+    "add-mcp": "2.6.1",
     "jose": "6.2.18",
     "openapi-fetch": "0.17.0",
     "redis": "6.3.1",

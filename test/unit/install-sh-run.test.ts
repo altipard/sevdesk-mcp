@@ -19,7 +19,6 @@ import { describe, expect, it } from "vitest";
 // directory, so download, checksum and installation run without network.
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
-const script = readFileSync(join(root, "install.sh"), "utf8");
 const VERSION = "9.9.9";
 const os = process.platform === "darwin" ? "darwin" : "linux";
 const arch = process.arch === "arm64" ? "arm64" : "x64";
@@ -194,76 +193,5 @@ describe("install.sh against a stub release", () => {
     expect(result.stderr).toContain("npx -y @altipard/sevdesk-mcp");
     expect(existsSync(s.curlLog)).toBe(false);
     expect(existsSync(s.installDir)).toBe(false);
-  });
-});
-
-describe("install.sh merge_json", () => {
-  /** Runs merge_json from install.sh on one file; main is not called. */
-  function merge(s: Setup, file: string) {
-    const harness = join(s.dir, "merge.sh");
-    writeFileSync(
-      harness,
-      `${script.replace(/\nmain "\$@"\n$/, "\n")}
-init_ui
-BIN_PATH="$HOME/.local/bin/sevdesk-mcp"
-MODE=read
-tmp=$(mktemp -d)
-merge_json "$1" mcpServers
-`,
-    );
-    return spawnSync("sh", [harness, file], {
-      encoding: "utf8",
-      env: { PATH: `${s.stubs}:${process.env.PATH ?? ""}`, HOME: s.home, LANG: "C" },
-      timeout: 10_000,
-    });
-  }
-
-  const backups = (dir: string) => readdirSync(dir).filter((name) => name.includes(".backup-"));
-
-  it("adds the server, keeps other entries and leaves a backup of the original", () => {
-    const s = setup();
-    const file = join(s.home, "mcp.json");
-    const original = '{"mcpServers":{"other":{"command":"x"}},"theme":"dark"}\n';
-    writeFileSync(file, original);
-    chmodSync(file, 0o600);
-    const result = merge(s, file);
-    expect(result.status).toBe(0);
-    expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({
-      mcpServers: {
-        other: { command: "x" },
-        sevdesk: { command: join(s.home, ".local/bin/sevdesk-mcp"), env: { SEVDESK_MODE: "read" } },
-      },
-      theme: "dark",
-    });
-    expect(statSync(file).mode & 0o777).toBe(0o600);
-    const [backup] = backups(s.home);
-    expect(readFileSync(join(s.home, backup ?? ""), "utf8")).toBe(original);
-    expect(result.stdout).toContain(`backup: ${join(s.home, backup ?? "")}`);
-    // No temporary file left next to the configuration.
-    expect(readdirSync(s.home).sort()).toEqual([backup, "mcp.json"].sort());
-  });
-
-  it("leaves invalid JSON untouched and prints the entry instead", () => {
-    const s = setup();
-    const file = join(s.home, "mcp.json");
-    writeFileSync(file, "{ not json");
-    const result = merge(s, file);
-    expect(readFileSync(file, "utf8")).toBe("{ not json");
-    expect(result.stdout).toContain("not valid JSON");
-    expect(result.stdout).toContain('"sevdesk"');
-    expect(backups(s.home)).toEqual([]);
-  });
-
-  it("restores the backup and names it when the write fails", () => {
-    const s = setup();
-    const file = join(s.home, "mcp.json");
-    const original = '{"mcpServers":{}}\n';
-    writeFileSync(file, original);
-    writeExecutable(join(s.stubs, "mv"), "#!/bin/sh\nexit 1\n");
-    const result = merge(s, file);
-    expect(readFileSync(file, "utf8")).toBe(original);
-    const [backup] = backups(s.home);
-    expect(result.stdout).toContain(`restored it from ${join(s.home, backup ?? "")}`);
-    expect(readdirSync(s.home).sort()).toEqual([backup, "mcp.json"].sort());
   });
 });

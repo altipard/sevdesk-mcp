@@ -1,14 +1,14 @@
 #!/bin/sh
 # sevdesk-mcp installer: downloads the release binary for this machine, checks it against the
-# release's SHA256SUMS and installs it. With a terminal it then shows a setup plan (token into the
-# system keychain, MCP clients found on this machine) and carries it out after one confirmation.
+# release's SHA256SUMS and installs it. With a terminal it then starts the guided setup of the
+# installed binary (`sevdesk-mcp setup`): agents, scope, mode, token into the system keychain.
 #
 #   curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.sh | sh
 #
 # Environment:
 #   INSTALL_DIR          target directory (default: ~/.local/bin)
 #   SEVDESK_MCP_VERSION  release to install, e.g. 0.2.0 (default: latest)
-#   SEVDESK_MODE         mode for the client entries: read, write or full (default: read)
+#   SEVDESK_MODE         mode for the client entries: read, write or full (default: the setup asks)
 #   NO_COLOR             disable colors (https://no-color.org)
 #
 # Strict POSIX sh. Everything runs inside main(), which is called on the last line, so a
@@ -19,22 +19,16 @@ set -eu
 REPO=altipard/sevdesk-mcp
 RELEASES="https://github.com/$REPO/releases"
 BIN_NAME=sevdesk-mcp
-SERVER_NAME=sevdesk
 KEYCHAIN_SERVICE=sevdesk-mcp
 KEYCHAIN_ACCOUNT=api-token
-API_CHECK_URL=https://my.sevdesk.de/api/v1/Tools/bookkeepingSystemVersion
 # Terminal the setup talks to: under `curl | sh` stdin is the script itself.
 TTY_IN=/dev/tty
 TTY_OUT=/dev/tty
-# Where macOS keeps applications installed for all users.
-MAC_APPS=/Applications
 
 tmp=''
 stage=''
-tty_state=''
 
 cleanup() {
-    restore_tty
     if [ -n "$stage" ]; then rm -f "$stage"; fi
     if [ -n "$tmp" ]; then rm -rf "$tmp"; fi
     return 0
@@ -195,11 +189,11 @@ Usage:
 
 Options:
   --dry-run        show platform, release and target without downloading or changing anything
-  --no-setup       install only, skip the keychain and MCP client setup
-  --mode=MODE      mode for the client entries: read (default), write or full
+  --no-setup       install only, skip the guided setup
+  --mode=MODE      mode for the client entries: read, write or full (default: the setup asks)
   --replace-token  ask for a new token even if one is already in the keychain
   --replace-entries
-                   replace a Claude Code entry that has its own command or env
+                   also replace a "sevdesk" entry that has its own command or settings
   --no-verify      store the token without checking it against the sevdesk API
   -h, --help       show this help
 
@@ -209,10 +203,12 @@ Environment:
   SEVDESK_MODE         same as --mode (the option wins)
   NO_COLOR             disable colors
 
-With a terminal the installer shows a setup plan and asks once before carrying it out: the
-sevdesk API token goes into the system keychain (service sevdesk-mcp, account api-token),
-never into a client configuration file, and the server is registered with the MCP clients
-found on this machine (Claude Desktop, Claude Code, Cursor, VS Code).
+With a terminal the installer then runs `sevdesk-mcp setup`, which asks for the agents
+(MCP clients found on this machine are preselected), global or project configuration, the
+mode and the sevdesk API token, shows a plan and carries it out after one confirmation. The
+token goes into the system keychain (service sevdesk-mcp, account api-token), never into a
+client configuration file. The options above are passed on; `sevdesk-mcp setup --help` lists
+all of its options, including the ones for running it without prompts.
 EOF
 }
 
@@ -384,7 +380,7 @@ install_binary() { # downloaded-file
     BIN_PATH=$target
 }
 
-# --- interactive setup ------------------------------------------------------------------------
+# --- guided setup -----------------------------------------------------------------------------
 
 # The setup talks to the terminal, not to stdin: under `curl | sh` stdin is the script itself.
 # A failed redirection of a special builtin ends a POSIX shell, so probe in a subshell.
@@ -392,485 +388,44 @@ has_tty() {
     (: </dev/tty) 2>/dev/null
 }
 
-# Opens the terminal once: fd 3 for input, fd 4 for prompts.
-open_tty() {
-    exec 3<"$TTY_IN" 4>"$TTY_OUT"
+# Returns 0 if the installed binary has the `setup` command. A release without it ignores the
+# argument and starts the server, so the probe runs like binary_version: no environment, a dummy
+# token (the keychain is not asked), an unreachable base URL, stdin closed, stopped after 10
+# seconds. Only the usage line of `setup --help` counts.
+supports_setup() {
+    out="$tmp/setup-help.out"
+    : >"$out"
+    env -i PATH=/usr/bin:/bin SEVDESK_API_TOKEN=00000000000000000000000000000000 \
+        SEVDESK_BASE_URL=http://127.0.0.1:9/api/v1 LOG_LEVEL=error \
+        "$BIN_PATH" setup --help </dev/null >"$out" 2>/dev/null &
+    pid=$!
+    (sleep 10 && kill "$pid") >/dev/null 2>&1 &
+    watchdog=$!
+    wait "$pid" 2>/dev/null || true
+    kill "$watchdog" 2>/dev/null || true
+    grep -q '^Usage: sevdesk-mcp setup' "$out"
 }
 
-# Turns echo back on after a hidden input, also when the installer is interrupted (cleanup).
-restore_tty() {
-    if [ -n "$tty_state" ]; then
-        stty "$tty_state" 2>/dev/null <&3 || true
-        tty_state=''
-        printf '\n' 2>/dev/null >&4 || true
-    fi
-}
-
-# ask "question" default(y/n) -> exit 0 for yes
-ask() {
-    if [ "$2" = y ]; then hint='[Y/n]'; else hint='[y/N]'; fi
-    printf '  %s %s ' "$1" "$hint" >&4
-    answer=''
-    # A closed or failing terminal is no consent: only Enter takes the default.
-    if ! IFS= read -r answer <&3 && [ -z "$answer" ]; then
-        printf '\n' >&4
-        return 1
-    fi
-    case "$answer" in
-        '') [ "$2" = y ] ;;
-        [Yy] | [Yy][Ee][Ss] | [Jj] | [Jj][Aa]) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-# Reads one line without echo into secret, without surrounding blanks or a trailing CR.
-# Returns 1 without reading if echo cannot be switched off: a visible token is not read.
-read_secret() {
-    secret=''
-    tty_state=$(stty -g 2>/dev/null <&3) || tty_state=''
-    if [ -z "$tty_state" ] || ! stty -echo 2>/dev/null <&3; then
-        tty_state=''
-        return 1
-    fi
-    printf '  %s ' "$1" >&4
-    read -r secret <&3 || secret=''
-    restore_tty
-    cr=$(printf '\r')
-    secret=${secret%"$cr"}
-}
-
-# sevdesk API tokens are 32 hex characters. The check also keeps anything but hex digits out of
-# the keychain command line below.
-valid_token() {
-    case "$1" in
-        '' | *[!0-9A-Fa-f]*) return 1 ;;
-    esac
-    [ "${#1}" -eq 32 ]
-}
-
-# Asks sevdesk whether it accepts the token. Sets HTTP_CODE; returns 0 accepted, 1 rejected
-# (401), 2 not checked (no connection, other status). The header goes to curl as a config file
-# on stdin (printf is a builtin), so the token is in no argument list, and curl's own messages
-# are discarded.
-check_token() {
-    HTTP_CODE=$(printf 'header = "Authorization: %s"\n' "$1" |
-        curl -sS -K - --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 15 \
-            -o /dev/null -w '%{http_code}' "$API_CHECK_URL" 2>/dev/null) || true
-    case "$HTTP_CODE" in
-        2[0-9][0-9]) return 0 ;;
-        401) return 1 ;;
-        *) return 2 ;;
-    esac
-}
-
-# Stores $1 in the keychain. The value reaches the tool on stdin only: `security -i` reads the
-# command from stdin, secret-tool reads the secret from stdin. Their output is discarded because
-# `security -i` repeats a failed command line, token included.
-keychain_store() {
-    case "$OS" in
-        darwin)
-            printf 'add-generic-password -U -s %s -a %s -l %s -w %s\n' \
-                "$KEYCHAIN_SERVICE" "$KEYCHAIN_ACCOUNT" "$KEYCHAIN_SERVICE" "$1" |
-                security -i >/dev/null 2>&1
-            ;;
-        linux)
-            printf '%s' "$1" |
-                secret-tool store --label="$KEYCHAIN_SERVICE" \
-                    service "$KEYCHAIN_SERVICE" account "$KEYCHAIN_ACCOUNT" >/dev/null 2>&1
-            ;;
-    esac
-}
-
-# Sets TOKEN_PLAN: store, keep (already stored and kept) or none (TOKEN_NOTE says why), and
-# KEYCHAIN_NAME.
-plan_token() {
-    TOKEN_NOTE=''
-    case "$OS" in
-        darwin)
-            KEYCHAIN_NAME='macOS keychain'
-            if security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" >/dev/null 2>&1; then
-                stored=1
-            else
-                stored=0
-            fi
-            ;;
-        linux)
-            KEYCHAIN_NAME='keychain (Secret Service)'
-            if ! command -v secret-tool >/dev/null 2>&1; then
-                TOKEN_PLAN=none
-                TOKEN_STORED=0
-                TOKEN_NOTE='secret-tool (libsecret) is not installed; install it (e.g. apt install libsecret-tools) and run the installer again'
-                return 0
-            fi
-            if secret-tool lookup service "$KEYCHAIN_SERVICE" account "$KEYCHAIN_ACCOUNT" >/dev/null 2>&1; then
-                stored=1
-            else
-                stored=0
-            fi
-            ;;
-    esac
-    TOKEN_STORED=$stored
-    if [ "$stored" = 1 ] && [ "$REPLACE_TOKEN" = 0 ]; then
-        TOKEN_PLAN=keep
-    else
-        TOKEN_PLAN=store
-    fi
-}
-
-# Sets TOKEN_IN_KEYCHAIN to 1 once a token is stored; otherwise it keeps its value (a token
-# stored earlier stays). Tracing is off throughout: under `sh -x` every line that handles the
-# token would print it.
-store_token() {
-    xtrace=0
-    case $- in *x*) xtrace=1; set +x ;; esac
-    store_token_steps
-    secret=''
-    if [ "$xtrace" = 1 ]; then set -x; fi
-}
-
-# Up to three attempts; an empty input skips the step.
-store_token_steps() {
-    attempt=0
-    while [ "$attempt" -lt 3 ]; do
-        attempt=$((attempt + 1))
-        if ! read_secret "Paste your sevdesk API token (input is hidden, Enter skips):"; then
-            say "Cannot hide the input on this terminal, so the token is not asked for here."
-            say "Store it yourself:"
-            print_store_command
-            return 0
-        fi
-        if [ -z "$secret" ]; then
-            say "No token entered; the keychain was not changed."
-            return 0
-        fi
-        if ! valid_token "$secret"; then
-            say "That is not a sevdesk API token: expected 32 hex characters, got ${#secret}."
-            continue
-        fi
-        if [ "$VERIFY_TOKEN" = 1 ]; then
-            status=0
-            check_token "$secret" || status=$?
-            case "$status" in
-                1)
-                    say "sevdesk rejected this token (HTTP 401). Copy it again from sevdesk."
-                    continue
-                    ;;
-                2) say "Could not check the token with sevdesk (HTTP ${HTTP_CODE:-000}); storing it anyway." ;;
-                *) say "sevdesk accepted the token." ;;
-            esac
-        fi
-        if keychain_store "$secret"; then
-            TOKEN_IN_KEYCHAIN=1
-            say "Token stored in the $KEYCHAIN_NAME (service $KEYCHAIN_SERVICE, account $KEYCHAIN_ACCOUNT)."
-        else
-            say "Storing the token failed; the keychain was not changed."
-        fi
-        return 0
-    done
-    say "No valid token after three attempts; the keychain was not changed."
-}
-
-# JSON string contents: escape backslash and double quote. Paths with control characters are
-# refused earlier.
-json_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
-# The server entry shared by all JSON configurations. Never contains the token.
-entry_json() { # extra-fields (e.g. '"type": "stdio", ')
-    printf '{ %s"command": "%s", "env": { "SEVDESK_MODE": "%s" } }' "$1" "$(json_escape "$BIN_PATH")" "$MODE"
-}
-
-print_snippet() { # file key extra-fields
-    say "Add this to $1:"
-    blank
-    printf '    { "%s": { "%s": %s } }\n' "$2" "$SERVER_NAME" "$(entry_json "$3")"
-    blank
-}
-
-# Sets merger to jq or python3, whichever actually runs. On macOS without the Command Line
-# Tools /usr/bin/python3 is only a stub that offers to install them, so it does not count (and
-# is not run, which would open that dialog).
-find_merger() {
-    merger=''
-    if command -v jq >/dev/null 2>&1 && jq -n 1 >/dev/null 2>&1; then
-        merger=jq
-        return 0
-    fi
-    command -v python3 >/dev/null 2>&1 || return 1
-    if [ "${OS:-}" = darwin ] && [ "$(command -v python3)" = /usr/bin/python3 ] &&
-        ! xcode-select -p >/dev/null 2>&1; then
-        return 1
-    fi
-    python3 -I -c pass >/dev/null 2>&1 || return 1
-    merger=python3
-}
-
-# entry_kind FILE KEY prints what FILE has under KEY.sevdesk: none, ours (this binary, env at
-# most SEVDESK_MODE), stdio (another local command, args or env), remote (url or a type other
-# than stdio) or other (not an object). Only this word leaves the merger, never a value from the
-# file. Fails without a merger or on invalid JSON.
-entry_kind() {
-    find_merger || return 1
-    case "$merger" in
-        jq)
-            jq -r --arg key "$2" --arg name "$SERVER_NAME" --arg cmd "$BIN_PATH" '
-                (.[$key] // {})[$name] as $e
-                | if $e == null then "none"
-                  elif ($e | type) != "object" then "other"
-                  elif ($e.url != null) or (($e.type // "stdio") != "stdio") then "remote"
-                  elif ($e.command == $cmd) and (($e.args // []) == [])
-                      and ((($e.env // {}) | if type == "object" then keys else ["?"] end)
-                          - ["SEVDESK_MODE"] == [])
-                  then "ours"
-                  else "stdio" end
-            ' "$1" 2>/dev/null
-            ;;
-        python3)
-            python3 -I -c '
-import json, sys
-path, key, name, cmd = sys.argv[1:]
-with open(path, encoding="utf-8") as f:
-    data = json.load(f)
-e = (data.get(key) or {}).get(name)
-env = (e.get("env") or {}) if isinstance(e, dict) else {}
-if e is None:
-    print("none")
-elif not isinstance(e, dict):
-    print("other")
-elif e.get("url") is not None or e.get("type", "stdio") != "stdio":
-    print("remote")
-elif (e.get("command") == cmd and not e.get("args") and isinstance(env, dict)
-        and set(env) <= {"SEVDESK_MODE"}):
-    print("ours")
-else:
-    print("stdio")
-' "$1" "$2" "$SERVER_NAME" "$BIN_PATH" 2>/dev/null
-            ;;
-    esac
-}
-
-# merge_json FILE KEY: points KEY.sevdesk at the binary and sets SEVDESK_MODE in its env; other
-# env variables (a token reference, SEVDESK_ENABLE_TOOLS, ...) and everything else stay. Needs
-# jq or python3; the original is backed up first and only replaced by a complete, valid result.
-merge_json() {
-    file=$1
-    key=$2
-    if ! find_merger; then
-        say "Neither jq nor a working python3 found, so $file is not changed automatically."
-        print_snippet "$file" "$key" ''
-        return 0
-    fi
-    # A remote entry (url, type other than stdio) would turn into a broken hybrid.
-    if [ -s "$file" ] && [ "$(entry_kind "$file" "$key")" = remote ]; then
-        say "The \"$SERVER_NAME\" entry in $file is a remote (URL) entry; not changing it."
-        print_snippet "$file" "$key" ''
-        return 0
-    fi
-    # Any existing content goes through the merger: if it is not valid JSON the file stays.
-    if [ -s "$file" ] || [ -L "$file" ]; then
-        if [ -L "$file" ]; then
-            say "$file is a symbolic link; not changing it."
-            print_snippet "$file" "$key" ''
-            return 0
-        fi
-        backup="$file.backup-$(date +%Y%m%d%H%M%S)"
-        cp -p "$file" "$backup" || { say "Cannot back up $file; not changing it."; return 0; }
-        src=$file
-    else
-        backup=''
-        mkdir -p "$(dirname "$file")" || { say "Cannot create $(dirname "$file")."; return 0; }
-        printf '{}\n' >"$tmp/empty.json"
-        src="$tmp/empty.json"
-    fi
-    out="$tmp/merged.json"
+# Runs `sevdesk-mcp setup` on the terminal with the options given to the installer. The setup
+# asks for everything else (agents, scope, mode, token) and does the backups, the keychain and
+# the client configurations itself. Its exit status never fails the installation.
+run_setup() {
+    set -- setup
+    # Without --mode or SEVDESK_MODE the setup asks for the mode.
+    if [ "$MODE_FLAG" = 1 ] || [ -n "${SEVDESK_MODE:-}" ]; then set -- "$@" "--mode=$MODE"; fi
+    if [ "$REPLACE_TOKEN" = 1 ]; then set -- "$@" --replace-token; fi
+    if [ "$REPLACE_ENTRIES" = 1 ]; then set -- "$@" --replace-entries; fi
+    if [ "$VERIFY_TOKEN" = 0 ]; then set -- "$@" --no-verify; fi
+    # Ctrl-C belongs to the setup now: it finishes or cancels cleanly, then the installer
+    # continues here instead of exiting under it.
+    trap ':' INT
     status=0
-    case "$merger" in
-        jq)
-            jq --arg key "$key" --arg name "$SERVER_NAME" --arg cmd "$BIN_PATH" --arg mode "$MODE" '
-                if type != "object" then error("not a JSON object") else . end
-                | .[$key] = ((.[$key] // {}) | if type == "object" then . else error("not an object") end)
-                | .[$key][$name] = ((.[$key][$name] // {})
-                    | if type == "object" then . else error("not an object") end
-                    | del(.args)
-                    | .command = $cmd
-                    | .env = ((.env // {}) | if type == "object" then . else error("not an object") end)
-                    | .env.SEVDESK_MODE = $mode)
-            ' "$src" >"$out" 2>/dev/null || status=$?
-            ;;
-        python3)
-            python3 -I -c '
-import json, sys
-src, out, key, name, cmd, mode = sys.argv[1:]
-with open(src, encoding="utf-8") as f:
-    data = json.load(f)
-if not isinstance(data, dict):
-    sys.exit(1)
-servers = data.setdefault(key, {})
-if not isinstance(servers, dict):
-    sys.exit(1)
-entry = servers.get(name, {})
-if not isinstance(entry, dict):
-    sys.exit(1)
-entry.pop("args", None)
-entry["command"] = cmd
-env = entry.get("env") or {}
-if not isinstance(env, dict):
-    sys.exit(1)
-entry["env"] = env
-env["SEVDESK_MODE"] = mode
-servers[name] = entry
-with open(out, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
-' "$src" "$out" "$key" "$SERVER_NAME" "$BIN_PATH" "$MODE" 2>/dev/null || status=$?
-            ;;
-    esac
-    if [ "$status" -ne 0 ] || [ ! -s "$out" ]; then
-        # Nothing changed, so the backup would only be clutter.
-        if [ -n "$backup" ]; then rm -f "$backup"; fi
-        say "$file is not valid JSON (or has an unexpected shape); not changing it."
-        print_snippet "$file" "$key" ''
-        return 0
-    fi
-    # Write next to the file and rename: the configuration is never half-written. The copy
-    # keeps the mode of an existing file.
-    newfile=''
-    if newfile=$(mktemp "$(dirname "$file")/.$(basename "$file").XXXXXX") &&
-        { [ -z "$backup" ] || cp -p "$file" "$newfile"; } &&
-        cat "$out" >"$newfile" &&
-        mv -f "$newfile" "$file"; then
-        say "Updated $file"
-        if [ -n "$backup" ]; then say "${DIM}backup: $backup${RST}"; fi
-        return 0
-    fi
-    if [ -n "$newfile" ]; then rm -f "$newfile"; fi
-    if [ -z "$backup" ]; then
-        say "Writing $file failed."
-    elif cp -p "$backup" "$file"; then
-        say "Writing $file failed; restored it from $backup."
-    else
-        say "Writing $file failed and restoring it failed too; the original is at $backup."
-    fi
-    print_snippet "$file" "$key" ''
-}
-
-desktop_config() {
-    case "$OS" in
-        darwin) printf '%s\n' "$HOME/Library/Application Support/Claude/claude_desktop_config.json" ;;
-        linux) printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/Claude/claude_desktop_config.json" ;;
-    esac
-}
-
-client_label() {
-    case "$1" in
-        desktop) printf 'Claude Desktop' ;;
-        code) printf 'Claude Code' ;;
-        cursor) printf 'Cursor' ;;
-        vscode) printf 'VS Code' ;;
-    esac
-}
-
-# Sets CLIENTS and MISSING (space-separated keys) from what is installed on this machine; a
-# client nobody installed gets no configuration file.
-detect_clients() {
-    CLIENTS=''
-    MISSING=''
-    desktop_dir=$(dirname "$(desktop_config)")
-    if [ -d "$desktop_dir" ] || [ -d "$MAC_APPS/Claude.app" ] || [ -d "$HOME/Applications/Claude.app" ]; then
-        CLIENTS="$CLIENTS desktop"
-    else
-        MISSING="$MISSING desktop"
-    fi
-    if command -v claude >/dev/null 2>&1; then CLIENTS="$CLIENTS code"; else MISSING="$MISSING code"; fi
-    if [ -d "$HOME/.cursor" ] || [ -d "$MAC_APPS/Cursor.app" ] || command -v cursor >/dev/null 2>&1; then
-        CLIENTS="$CLIENTS cursor"
-    else
-        MISSING="$MISSING cursor"
-    fi
-    if command -v code >/dev/null 2>&1; then CLIENTS="$CLIENTS vscode"; else MISSING="$MISSING vscode"; fi
-}
-
-# "Claude Desktop, Cursor" for a list of keys.
-client_names() {
-    names=''
-    for key in $1; do
-        if [ -n "$names" ]; then names="$names, "; fi
-        names="$names$(client_label "$key")"
-    done
-    printf '%s' "$names"
-}
-
-# Inspects the user-scope "sevdesk" entry of Claude Code in ~/.claude.json. Sets CC_ENTRY:
-#   none     no such entry
-#   ours     the command is this binary and the env holds at most SEVDESK_MODE
-#   custom   anything else (another command, args, a URL, more env); kept unless --replace-entries
-#   unknown  the file cannot be inspected (no jq/python3, invalid JSON); treated like custom
-inspect_claude_code() {
-    CC_ENTRY=none
-    cc_file="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
-    [ -f "$cc_file" ] || return 0
-    if kind=$(entry_kind "$cc_file" mcpServers); then
-        case "$kind" in
-            none | ours) CC_ENTRY=$kind ;;
-            *) CC_ENTRY=custom ;;
-        esac
-    elif grep -q "\"$SERVER_NAME\"" "$cc_file" 2>/dev/null; then
-        # The name appears somewhere: there may be an entry, so leave it alone.
-        CC_ENTRY=unknown
-    fi
-}
-
-register_claude_code() {
-    case "$CC_ENTRY" in
-        custom | unknown)
-            if [ "$REPLACE_ENTRIES" = 0 ]; then
-                say "Claude Code: kept the existing \"$SERVER_NAME\" entry (--replace-entries replaces it)."
-                return 0
-            fi
-            ;;
-    esac
-    # `claude mcp add` refuses an existing name: replace the user-scope entry, after a private
-    # copy of the file that holds it (it may contain tokens, hence mode 600).
-    cc_backup=''
-    if [ "$CC_ENTRY" != none ]; then
-        cc_backup="$cc_file.backup-$(date +%Y%m%d%H%M%S)"
-        if ! (umask 077 && cp "$cc_file" "$cc_backup"); then
-            say "Cannot back up $cc_file, so the existing Claude Code entry is kept."
-            return 0
-        fi
-        claude mcp remove --scope user "$SERVER_NAME" >/dev/null 2>&1 || true
-    fi
-    if claude mcp add --scope user "$SERVER_NAME" --env "SEVDESK_MODE=$MODE" -- "$BIN_PATH" >/dev/null 2>&1; then
-        say "Registered with Claude Code (user scope)."
-        if [ -n "$cc_backup" ]; then say "${DIM}previous entry: $cc_backup${RST}"; fi
-        return 0
-    fi
-    say "Registering with Claude Code failed. Run it yourself:"
-    say "  claude mcp add --scope user $SERVER_NAME --env SEVDESK_MODE=$MODE -- \"$BIN_PATH\""
-    if [ -n "$cc_backup" ]; then
-        say "The previous \"$SERVER_NAME\" entry was removed; $cc_file as it was before is in"
-        say "$cc_backup (mcpServers.$SERVER_NAME)."
-    fi
-}
-
-register_vscode() {
-    spec=$(printf '{"name":"%s","type":"stdio","command":"%s","env":{"SEVDESK_MODE":"%s"}}' \
-        "$SERVER_NAME" "$(json_escape "$BIN_PATH")" "$MODE")
-    if code --add-mcp "$spec" >/dev/null 2>&1; then
-        say "Registered with VS Code."
-    else
-        say "Registering with VS Code failed. Run it yourself, or use \"MCP: Add Server\":"
-        say "  code --add-mcp '$spec'"
-    fi
-}
-
-register_client() {
-    case "$1" in
-        desktop) merge_json "$(desktop_config)" mcpServers ;;
-        code) register_claude_code ;;
-        cursor) merge_json "$HOME/.cursor/mcp.json" mcpServers ;;
-        vscode) register_vscode ;;
+    "$BIN_PATH" "$@" <"$TTY_IN" >"$TTY_OUT" || status=$?
+    trap 'exit 130' INT
+    case "$status" in
+        0) ;;
+        130) say "Setup cancelled. Run it again any time: $BIN_PATH setup" ;;
+        *) say "The setup did not finish (exit $status). Run it again: $BIN_PATH setup" ;;
     esac
 }
 
@@ -882,91 +437,15 @@ print_store_command() {
 }
 
 print_next_steps() {
-    say "Next: store the token with"
-    print_store_command
-    say "and point your MCP client at $BIN_PATH (or run the installer in a terminal for guided setup)."
-}
-
-print_plan() {
-    say "${BOLD}Setup plan${RST}"
-    case "$TOKEN_PLAN" in
-        store) say "  token:   ask for it once and store it in the $KEYCHAIN_NAME" ;;
-        keep) say "  token:   keep the one already in the $KEYCHAIN_NAME (--replace-token to change it)" ;;
-        none) say "  token:   not stored: $TOKEN_NOTE" ;;
-    esac
-    if [ "$MODE" = read ]; then
-        say "  mode:    read (--mode=write or SEVDESK_MODE=write to allow changes)"
-    else
-        say "  mode:    $MODE"
-    fi
-    if [ -n "$CLIENTS" ]; then
-        say "  clients: $(client_names "$CLIENTS")"
-        say "           ${DIM}an existing \"$SERVER_NAME\" entry is updated (command and SEVDESK_MODE set,${RST}"
-        say "           ${DIM}args removed, other env kept); files are backed up first${RST}"
-        for key in $CLIENTS; do
-            case "$key" in
-                desktop) jfile=$(desktop_config) ;;
-                cursor) jfile="$HOME/.cursor/mcp.json" ;;
-                *) continue ;;
-            esac
-            if [ -s "$jfile" ] && [ "$(entry_kind "$jfile" mcpServers)" = remote ]; then
-                say "           $(client_label "$key"): the remote (URL) \"$SERVER_NAME\" entry stays unchanged"
-            fi
-        done
-        case " $CLIENTS " in
-            *" code "*)
-                case "$CC_ENTRY:$REPLACE_ENTRIES" in
-                    custom:0)
-                        say "           Claude Code: the existing \"$SERVER_NAME\" entry has its own command or env"
-                        say "           and stays unchanged (--replace-entries replaces it)" ;;
-                    unknown:0)
-                        say "           Claude Code: a possible \"$SERVER_NAME\" entry could not be read (invalid"
-                        say "           JSON, or neither jq nor python3) and stays unchanged (--replace-entries replaces it)" ;;
-                    custom:1 | unknown:1)
-                        say "           Claude Code: the existing \"$SERVER_NAME\" entry is replaced, its env is not kept;"
-                        say "           ~/.claude.json is copied first" ;;
-                esac
-                ;;
-        esac
-    else
-        say "  clients: none found (Claude Desktop, Claude Code, Cursor, VS Code)"
-    fi
-}
-
-setup() {
-    open_tty
-    plan_token
-    detect_clients
-    CC_ENTRY=none
-    case " $CLIENTS " in *" code "*) inspect_claude_code ;; esac
-    blank
-    print_plan
-    blank
-    if ! ask "Go ahead?" y; then
-        say "Skipped; nothing was changed."
-        blank
-        print_next_steps
+    if [ "${SETUP_CMD:-0}" = 1 ]; then
+        say "Next: run the guided setup in a terminal:"
+        say "  $BIN_PATH setup"
+        say "It stores the token in the keychain and registers the server with your MCP clients."
         return 0
     fi
-    blank
-    TOKEN_IN_KEYCHAIN=$TOKEN_STORED
-    if [ "$TOKEN_PLAN" = store ]; then store_token; fi
-    for key in $CLIENTS; do register_client "$key"; done
-    blank
-    if [ -n "$MISSING" ]; then
-        say "Not found: $(client_names "$MISSING"). To connect another client, see"
-        say "https://github.com/$REPO#connect-your-mcp-client"
-    fi
-    if [ "$TOKEN_IN_KEYCHAIN" = 1 ]; then
-        say "The server reads the token from the keychain; no client configuration contains it."
-    elif [ "$TOKEN_PLAN" = none ]; then
-        say "No token in the keychain: install secret-tool (e.g. apt install libsecret-tools) and"
-        say "run the installer again, or set SEVDESK_API_TOKEN in the env of each client entry."
-    else
-        say "No token in the keychain: run the installer again to store it,"
-        say "or set SEVDESK_API_TOKEN in the env of each client entry."
-    fi
-    say "Restart the MCP clients to load the server."
+    say "Next: store the token with"
+    print_store_command
+    say "and point your MCP client at $BIN_PATH."
 }
 
 # --- main -------------------------------------------------------------------------------------
@@ -1004,7 +483,7 @@ main() {
     init_ui
     # SEVDESK_MODE only matters for the setup: without one, an odd value in the environment
     # must not stop an install that worked before.
-    if [ "$MODE_FLAG" = 1 ] || { [ "$SETUP" = 1 ] && has_tty; }; then
+    if [ "$MODE_FLAG" = 1 ] || { [ "$SETUP" = 1 ] && [ -n "${SEVDESK_MODE:-}" ] && has_tty; }; then
         case "$MODE" in
             read | write | full) ;;
             *) fail "unknown mode '$MODE' (from --mode or SEVDESK_MODE); use read, write or full" ;;
@@ -1080,10 +559,15 @@ main() {
             ;;
     esac
 
-    if [ "$SETUP" = 1 ] && has_tty; then
-        setup
+    SETUP_CMD=0
+    if supports_setup; then SETUP_CMD=1; fi
+    blank
+    if [ "$SETUP" = 1 ] && [ "$SETUP_CMD" = 1 ] && has_tty; then
+        run_setup
     else
-        blank
+        if [ "$SETUP" = 1 ] && [ "$SETUP_CMD" = 0 ]; then
+            say "This release has no guided setup."
+        fi
         print_next_steps
     fi
     blank

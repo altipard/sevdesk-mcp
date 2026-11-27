@@ -132,6 +132,13 @@ class MessageSizeLimit extends Transform {
   }
 }
 
+// `sevdesk-mcp setup` configures the MCP clients instead of serving. Loaded on demand: the
+// server never imports the setup or its dependencies.
+if (process.argv[2] === "setup") {
+  const setup = await import("../setup/index.js");
+  process.exit(await setup.main(process.argv.slice(3), import.meta.url));
+}
+
 // Without SEVDESK_API_TOKEN the token comes from the system keychain, so it
 // does not have to sit in a client configuration file.
 const token = await resolveApiToken(process.env);
