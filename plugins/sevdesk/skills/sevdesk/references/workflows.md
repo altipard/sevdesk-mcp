@@ -106,6 +106,10 @@ Read only; nothing is booked or changed. Use the month as period (startDate, end
 3. Typical high finding: a supplier from abroad booked with rule 9 and 0 % VAT. A service
    from an EU business is usually rule 14, goods from the EU rule 8, a service from outside
    the EU rule 12 (or 13 without input tax deduction); see [accounting.md](accounting.md).
+   Without a usable VAT ID the finding names all four rules: ask the user what was bought
+   and where the supplier sits. Northern Ireland (XI) counts as EU for goods only. A foreign
+   address with a German VAT ID is not flagged, and rule 10 with 0 % abroad (hotels, travel)
+   is only a low finding.
 4. `reverse_charge_report` for the 13b tax base of the period, split into the parts that net
    to zero, the tax payable and own revenue.
 5. Corrections are made by the user in sevdesk; no tool changes the tax rule of a voucher.

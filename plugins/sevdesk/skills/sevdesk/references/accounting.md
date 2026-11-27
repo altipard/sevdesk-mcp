@@ -72,6 +72,16 @@ supplier booked with rule 9 is often a reverse charge case booked as a normal ex
 - payable: rule 13. You owe the tax without input tax deduction; it is a real cost.
 - revenue: rule 5. Your own sales where your customer owes the tax.
 
+Cancellation invoices (SR) and credit notes with rule 5 reduce own revenue. The API
+documentation does not say whether sevdesk stores them negative, so the tools subtract their
+amount either way. A final invoice (ER) next to advance or partial invoices (AR, TR) may
+repeat their amounts; the answer then says so instead of guessing. Documents count by their
+document date, an approximation of the tax period.
+
+The spec lists rules 12 to 14 as "0% (19%)" without saying whether sevdesk shows the
+self-assessed tax in the voucher's tax sum, so `audit_vat` skips tax amount checks for rules
+8, 12, 13 and 14 and compares only net sums.
+
 Intra-EU acquisitions of goods (rule 8) are taxed under §1a UStG, not §13b, and are not in
 the report. Whether a case is reverse charge, and with or without input tax deduction, is a
 decision for the user and their Steuerberater; the tools only point to likely cases.
