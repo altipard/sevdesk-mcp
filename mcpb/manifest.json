@@ -18,7 +18,10 @@
   "icon": "icon.png",
   "license": "MIT",
   "keywords": ["sevdesk", "accounting", "bookkeeping", "invoices", "buchhaltung"],
-  "privacy_policies": ["https://sevdesk.de/datenschutz/"],
+  "privacy_policies": [
+    "https://github.com/altipard/sevdesk-mcp/blob/main/PRIVACY.md",
+    "https://sevdesk.de/datenschutz/"
+  ],
   "server": {
     "type": "node",
     "entry_point": "dist/bin/stdio.js",

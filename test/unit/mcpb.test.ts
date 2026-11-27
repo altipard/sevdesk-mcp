@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { v0_3 } from "@anthropic-ai/mcpb";
 import { describe, expect, it } from "vitest";
@@ -61,6 +61,15 @@ describe("mcpb manifest", () => {
       expect(text).not.toMatch(/\bread\b[^.]*\bwrite\b[^.]*\bor full\b/);
     }
     expect(manifest.server.mcp_config.env).not.toHaveProperty("SEVDESK_ENABLE_TOOLS");
+  });
+
+  // The extension's own policy first, then sevdesk's for the account data it reaches.
+  it("links this repository's privacy policy and sevdesk's", () => {
+    expect(manifest.privacy_policies).toEqual([
+      `${manifest.homepage}/blob/main/PRIVACY.md`,
+      "https://sevdesk.de/datenschutz/",
+    ]);
+    expect(existsSync(file("PRIVACY.md"))).toBe(true);
   });
 
   // The tool set depends on the mode, so a static list would describe only one of them.

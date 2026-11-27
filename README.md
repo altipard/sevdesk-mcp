@@ -16,6 +16,8 @@
   <img src="https://img.shields.io/badge/node-%3E%3D24-339933?logo=node.js&logoColor=white" alt="Node.js 24 or newer">
 </p>
 
+**English** · [Deutsch](README.de.md)
+
 sevdesk-mcp connects your [sevdesk](https://sevdesk.de) account to an AI assistant such
 as Claude Desktop, Claude Code, Cursor or VS Code. You ask in plain language, and the
 assistant looks up the answer in sevdesk. For example:
@@ -144,6 +146,7 @@ More help: [docs/install.md](docs/install.md#troubleshooting), or
 - [Remote (HTTP)](docs/remote-http.md): run it as a shared server with OAuth and Redis
 - [Configuration](docs/configuration.md): all environment variables
 - [Development](docs/development.md): build, tests, releases
+- [Privacy](PRIVACY.md): what data goes where, and what the setup writes
 
 ## License
 

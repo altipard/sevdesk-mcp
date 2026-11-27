@@ -93,6 +93,64 @@ describe("release workflow", () => {
     expect(step).toMatch(/for name in "\$\{files\[@\]\}" SHA256SUMS; do/);
     expect(step).toContain('gh release upload "$VERSION" "assets/$name"');
   });
+
+  describe("MCP registry job", () => {
+    const registry = job("mcp-registry");
+    const at = (text: string) => {
+      const index = registry.indexOf(text);
+      if (index === -1) throw new Error(`mcp-registry lacks: ${text}`);
+      return index;
+    };
+
+    // Same gate as npm: no release version, no publish. The registry checks mcpName in the
+    // published package, so it can only follow the npm job.
+    it("runs only for a release and after the npm publish", () => {
+      expect(registry).toContain("needs: [version, npm]");
+      expect(registry).toMatch(/^ {4}if: needs\.version\.outputs\.version != ''$/m);
+      expect(job("npm")).toMatch(/^ {4}if: needs\.version\.outputs\.version != ''$/m);
+    });
+
+    it("gets the OIDC token for the registry login and nothing more", () => {
+      expect(registry).toMatch(/permissions:\n\s+contents: read\n\s+id-token: write\n/);
+      expect(registry).toContain("persist-credentials: false");
+    });
+
+    it("downloads a pinned mcp-publisher and checks it before running it", () => {
+      expect(registry).toMatch(/^\s+MCP_PUBLISHER_VERSION: v\d+\.\d+\.\d+$/m);
+      expect(registry).toMatch(/^\s+MCP_PUBLISHER_SHA256: [0-9a-f]{64}$/m);
+      expect(registry).not.toContain("releases/latest");
+      expect(registry).toContain(
+        "https://github.com/modelcontextprotocol/registry/releases/download/$MCP_PUBLISHER_VERSION/mcp-publisher_linux_amd64.tar.gz",
+      );
+      expect(registry).toContain("--proto '=https'");
+      const check = at('echo "$MCP_PUBLISHER_SHA256  $archive" | sha256sum -c -');
+      expect(at('tar -xzf "$archive"')).toBeGreaterThan(check);
+    });
+
+    it("stamps the release version, waits for npm, then logs in and publishes", () => {
+      const stamp = at(
+        "jq --arg v \"$VERSION\" '.version = $v | .packages[].version = $v' server.json",
+      );
+      const wait = at('npm view "$PACKAGE@$VERSION" mcpName');
+      const download = at("sha256sum -c -");
+      const login = at('"$RUNNER_TEMP/mcp-publisher" login github-oidc');
+      const publish = at('"$RUNNER_TEMP/mcp-publisher" publish');
+      expect(stamp).toBeLessThan(wait);
+      expect(wait).toBeLessThan(download);
+      expect(download).toBeLessThan(login);
+      expect(login).toBeLessThan(publish);
+    });
+
+    // A published version is immutable; a rerun of a completed release must not fail on it.
+    it("skips a version the registry already has", () => {
+      const lookup = at(
+        "https://registry.modelcontextprotocol.io/v0.1/servers/$encoded/versions/$VERSION",
+      );
+      const skip = at('is already in the MCP registry; nothing to publish"\n              exit 0');
+      expect(lookup).toBeLessThan(skip);
+      expect(skip).toBeLessThan(at("login github-oidc"));
+    });
+  });
 });
 
 describe("ci workflow", () => {

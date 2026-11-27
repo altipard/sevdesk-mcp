@@ -14,11 +14,11 @@
 # have to be published by hand. Without it the npm job fails with a 403/404.
 #
 # Order and reruns: everything is built and attested before anything is published; then npm,
-# then the GitHub release, which also creates the tag. Release assets: the four binaries, the
-# Claude Desktop extension sevdesk-mcp.mcpb and SHA256SUMS over all of them. Every publish
-# step checks what already exists and never replaces it, so "Re-run all jobs" after a partial
-# failure completes the release: a commit that already carries its release tag is resumed
-# instead of bumped again.
+# then the GitHub release, which also creates the tag, and next to it the MCP registry entry.
+# Release assets: the four binaries, the Claude Desktop extension sevdesk-mcp.mcpb and
+# SHA256SUMS over all of them. Every publish step checks what already exists and never
+# replaces it, so "Re-run all jobs" after a partial failure completes the release: a commit
+# that already carries its release tag is resumed instead of bumped again.
 name: release
 
 on:
@@ -335,6 +335,85 @@ jobs:
             exit 0
           fi
           npm publish "$TARBALL" --provenance --access public --ignore-scripts
+
+  # Lists the npm package in the official MCP registry (registry.modelcontextprotocol.io).
+  # server.json and mcpName in package.json name io.github.altipard/sevdesk-mcp; GitHub OIDC
+  # proves the io.github.altipard namespace, no secret involved. server.json keeps the 0.0.0
+  # placeholder in git like mcpb/manifest.json: the release version is stamped in here. The
+  # registry checks mcpName in the published package, so this waits until npm serves it.
+  # A version once in the registry cannot change; a rerun skips it.
+  mcp-registry:
+    needs: [version, npm]
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      # Bump both together; the checksum is from the release's registry_<version>_checksums.txt.
+      MCP_PUBLISHER_VERSION: v1.8.9
+      MCP_PUBLISHER_SHA256: 4d527ca8f1ced0394c962dc925c2a4a4addef441cbefd62501c875e9481823a8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: stamp the release version into server.json
+        id: server
+        run: |
+          name=$(jq -r .name server.json)
+          if [ "$(jq -r .mcpName package.json)" != "$name" ]; then
+            echo "::error::mcpName in package.json does not match $name in server.json"
+            exit 1
+          fi
+          jq --arg v "$VERSION" '.version = $v | .packages[].version = $v' server.json > server.json.new
+          mv server.json.new server.json
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: wait for the package on npm
+        env:
+          NAME: ${{ steps.server.outputs.name }}
+        run: |
+          for _ in $(seq 1 30); do
+            published=$(NPM_CONFIG_USERCONFIG=/dev/null npm view "$PACKAGE@$VERSION" mcpName 2>/dev/null || true)
+            if [ "$published" = "$NAME" ]; then exit 0; fi
+            sleep 10
+          done
+          echo "::error::npm does not serve $PACKAGE@$VERSION with mcpName $NAME"
+          exit 1
+
+      - name: download mcp-publisher
+        run: |
+          archive="$RUNNER_TEMP/mcp-publisher.tar.gz"
+          curl -fsS --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 15 --retry 2 -L \
+            -o "$archive" \
+            "https://github.com/modelcontextprotocol/registry/releases/download/$MCP_PUBLISHER_VERSION/mcp-publisher_linux_amd64.tar.gz"
+          echo "$MCP_PUBLISHER_SHA256  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" mcp-publisher
+
+      - name: publish
+        env:
+          NAME: ${{ steps.server.outputs.name }}
+        run: |
+          encoded=$(printf '%s' "$NAME" | jq -sRr @uri)
+          status=$(curl -sS --proto '=https' --tlsv1.2 --connect-timeout 15 --retry 2 \
+            -o /dev/null -w '%{http_code}' \
+            "https://registry.modelcontextprotocol.io/v0.1/servers/$encoded/versions/$VERSION")
+          case "$status" in
+            200)
+              echo "$NAME $VERSION is already in the MCP registry; nothing to publish"
+              exit 0
+              ;;
+            404) ;;
+            *)
+              echo "::error::MCP registry lookup answered HTTP $status"
+              exit 1
+              ;;
+          esac
+          "$RUNNER_TEMP/mcp-publisher" login github-oidc
+          "$RUNNER_TEMP/mcp-publisher" publish
 
   github-release:
     needs: [version, attest, npm]
