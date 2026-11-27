@@ -74,8 +74,15 @@ describe("install.sh", () => {
     const flag = run(["--dry-run", "--mode=admin"]);
     expect(flag.status).toBe(1);
     expect(flag.stderr).toContain("unknown mode 'admin'");
-    expect(run(["--dry-run"], { SEVDESK_MODE: "Write" }).status).toBe(1);
     // The option wins over the environment.
     expect(run(["--dry-run", "--mode=read"], { SEVDESK_MODE: "bogus" }).status).toBe(0);
+    // Without setup the variable is not used, so it cannot break an install.
+    expect(run(["--dry-run", "--no-setup"], { SEVDESK_MODE: "bogus" }).status).toBe(0);
+  });
+
+  it("accepts the setup options", () => {
+    const result = run(["--dry-run", "--no-setup", "--replace-token", "--no-verify"]);
+    expect(result.status).toBe(0);
+    expect(run(["--help"]).stdout).toMatch(/--replace-token[\s\S]*--no-verify/);
   });
 });

@@ -18,7 +18,9 @@ import { describe, expect, it } from "vitest";
 // Runs the interactive setup of install.sh (setup and the functions it calls) without main and
 // without a terminal: the harness points the terminal at files, and stubs stand in for the
 // keychain tools, curl, stty and the client CLIs. Nothing real is called: PATH holds only the
-// stubs, /usr/bin and /bin, and every tool the setup may run from there is stubbed.
+// stubs, /usr/bin and /bin, and every tool the setup may run from there is stubbed. A client
+// CLI installed in /usr/bin or /bin would be detected and run, so the tests skip on such a
+// system.
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const script = readFileSync(join(root, "install.sh"), "utf8");
@@ -28,6 +30,10 @@ function writeExecutable(path: string, content: string) {
   writeFileSync(path, content);
   chmodSync(path, 0o755);
 }
+
+const realClient = ["claude", "code", "cursor"].some(
+  (cli) => existsSync(`/usr/bin/${cli}`) || existsSync(`/bin/${cli}`),
+);
 
 /** jq or python3 from the developer's PATH, for merge_json. */
 const merger = spawnSync("sh", ["-c", "command -v jq || command -v python3"], {
@@ -169,7 +175,7 @@ function runSetup(
 const desktopConfig = (env: Env) =>
   join(env.home, "Library/Application Support/Claude/claude_desktop_config.json");
 
-describe("install.sh setup", () => {
+describe.skipIf(realClient)("install.sh setup", () => {
   it("shows one plan for the detected clients and carries it out after a single confirmation", () => {
     const env = prepare({ clis: ["claude"] });
     mkdirSync(dirname(desktopConfig(env)), { recursive: true });
@@ -254,6 +260,16 @@ describe("install.sh setup", () => {
     expect(existsSync(join(env.home, ".cursor/mcp.json"))).toBe(false);
   });
 
+  it("takes a closed terminal as no", () => {
+    const env = prepare({ clis: ["claude"] });
+    mkdirSync(join(env.home, ".cursor"));
+    const result = runSetup(env, [], { clis: ["claude"] });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Skipped; nothing was changed.");
+    expect(result.calls).not.toMatch(/^(claude|curl|stty) /m);
+    expect(existsSync(join(env.home, ".cursor/mcp.json"))).toBe(false);
+  });
+
   it("asks again for input that is not a 32-hex token", () => {
     const env = prepare();
     const result = runSetup(env, ["", "not-a-token", TOKEN.slice(1), TOKEN]);
@@ -322,17 +338,19 @@ describe("install.sh setup", () => {
     expect(config.mcpServers.sevdesk.env).toEqual({ SEVDESK_MODE: "write" });
   });
 
-  it("explains a missing secret-tool in the plan", () => {
-    const env = prepare({ os: "linux", secretTool: false });
-    // A real secret-tool in /usr/bin would be found; the test is only meaningful without one.
-    if (existsSync("/usr/bin/secret-tool")) return;
-    const result = runSetup(env, [""], { os: "linux", secretTool: false });
-    expect(result.status).toBe(0);
-    expect(result.stdout).toContain(
-      "token:   not stored: secret-tool (libsecret) is not installed",
-    );
-    expect(result.tty).not.toContain("Paste your sevdesk API token");
-  });
+  // A real secret-tool in /usr/bin or /bin would be found.
+  it.skipIf(existsSync("/usr/bin/secret-tool") || existsSync("/bin/secret-tool"))(
+    "explains a missing secret-tool in the plan",
+    () => {
+      const env = prepare({ os: "linux", secretTool: false });
+      const result = runSetup(env, [""], { os: "linux", secretTool: false });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(
+        "token:   not stored: secret-tool (libsecret) is not installed",
+      );
+      expect(result.tty).not.toContain("Paste your sevdesk API token");
+    },
+  );
 
   it("restores the terminal when interrupted during the hidden token prompt", async () => {
     const env = prepare();

@@ -409,7 +409,11 @@ ask() {
     if [ "$2" = y ]; then hint='[Y/n]'; else hint='[y/N]'; fi
     printf '  %s %s ' "$1" "$hint" >&4
     answer=''
-    IFS= read -r answer <&3 || answer=''
+    # A closed or failing terminal is no consent: only Enter takes the default.
+    if ! IFS= read -r answer <&3 && [ -z "$answer" ]; then
+        printf '\n' >&4
+        return 1
+    fi
     case "$answer" in
         '') [ "$2" = y ] ;;
         [Yy] | [Yy][Ee][Ss] | [Jj] | [Jj][Aa]) return 0 ;;
@@ -798,12 +802,13 @@ main() {
     REPLACE_TOKEN=0
     VERIFY_TOKEN=1
     MODE=${SEVDESK_MODE:-read}
+    MODE_FLAG=0
     for arg in "$@"; do
         case "$arg" in
             -h | --help) usage; exit 0 ;;
             --dry-run) DRY_RUN=1 ;;
             --no-setup) SETUP=0 ;;
-            --mode=*) MODE=${arg#--mode=} ;;
+            --mode=*) MODE=${arg#--mode=}; MODE_FLAG=1 ;;
             --replace-token) REPLACE_TOKEN=1 ;;
             --no-verify) VERIFY_TOKEN=0 ;;
             *) printf 'sevdesk-mcp installer: unknown option %s (see --help)\n' "$arg" >&2; exit 2 ;;
@@ -811,10 +816,14 @@ main() {
     done
 
     init_ui
-    case "$MODE" in
-        read | write | full) ;;
-        *) fail "unknown mode '$MODE' (from --mode or SEVDESK_MODE); use read, write or full" ;;
-    esac
+    # SEVDESK_MODE only matters for the setup: without one, an odd value in the environment
+    # must not stop an install that worked before.
+    if [ "$MODE_FLAG" = 1 ] || { [ "$SETUP" = 1 ] && has_tty; }; then
+        case "$MODE" in
+            read | write | full) ;;
+            *) fail "unknown mode '$MODE' (from --mode or SEVDESK_MODE); use read, write or full" ;;
+        esac
+    fi
     trap cleanup EXIT
     trap 'exit 129' HUP
     trap 'exit 130' INT
