@@ -345,7 +345,7 @@ prepare_dest() {
 
 fetch_sums() {
     fetch "$RELEASES/download/$VERSION/SHA256SUMS" "$tmp/SHA256SUMS" ||
-        fail "could not download SHA256SUMS of release $VERSION. Nothing was installed."
+        fail "could not download SHA256SUMS of release $VERSION (does release $VERSION exist for $OS-$ARCH?). Nothing was installed."
 }
 
 # Sets USE_ARCHIVE: 1 when the release lists the .tar.xz archive of the asset with exactly
@@ -361,35 +361,52 @@ prefer_archive() {
     if [ "${#listed}" -eq 64 ]; then USE_ARCHIVE=1; fi
 }
 
-verify_checksum() { # asset, already in $tmp
+verify_checksum() { # name, downloaded into $tmp
     say "Verifying checksum..."
-    expected=$(checksum_for "$asset")
+    expected=$(checksum_for "$1")
     # Exactly one SHA-256: anything else (missing, duplicate, malformed) is refused.
     case "$expected" in
-        '' | *[!0-9a-f]*) fail "no valid checksum for $asset in SHA256SUMS. Nothing was installed." ;;
+        '' | *[!0-9a-f]*) fail "no valid checksum for $1 in SHA256SUMS. Nothing was installed." ;;
     esac
-    [ "${#expected}" -eq 64 ] || fail "no valid checksum for $asset in SHA256SUMS. Nothing was installed."
-    actual=$(sha256_of "$tmp/$asset") || fail "could not compute the checksum of $asset. Nothing was installed."
+    [ "${#expected}" -eq 64 ] || fail "no valid checksum for $1 in SHA256SUMS. Nothing was installed."
+    actual=$(sha256_of "$tmp/$1") || fail "could not compute the checksum of $1. Nothing was installed."
     [ "$actual" = "$expected" ] ||
-        fail "checksum mismatch for $asset; the download is corrupt or has been tampered with. Nothing was installed."
+        fail "checksum mismatch for $1; the download is corrupt or has been tampered with. Nothing was installed."
 }
 
 # Unpacks the checksum-verified archive $1 into $tmp/unpacked and sets EXTRACTED to the
-# binary. The archive must hold exactly one entry: a regular file named sevdesk-mcp - no
-# path, no symlink, nothing else - so nothing can land outside the directory and no other
-# file is ever used.
+# binary. Returns 1 when the file cannot be read as a tar at all, so the caller can still
+# fall back to the single binary; a readable archive of the wrong content is a hard stop.
+# The content must be exactly one entry: a regular file named sevdesk-mcp - the -tv line
+# starts with "-", so links and directories never pass - and after unpacking the directory
+# holds that one file and nothing else, never through a symlink or a path.
 extract_archive() { # asset
-    entries=$(tar -tf "$tmp/$1") || fail "could not read $1. Nothing was installed."
-    if [ "$entries" != "$BIN_NAME" ]; then
+    listing=$(tar -tf "$tmp/$1" 2>/dev/null) || return 1
+    if [ "$listing" != "$BIN_NAME" ]; then
         fail "$1 does not hold exactly one file named $BIN_NAME. Nothing was installed."
     fi
+    detail=$(tar -tvf "$tmp/$1" 2>/dev/null) || return 1
+    case "$detail" in
+        -*) ;;
+        *) fail "$1 does not hold a regular file named $BIN_NAME. Nothing was installed." ;;
+    esac
     dir="$tmp/unpacked"
     mkdir "$dir" || fail "cannot create $dir. Nothing was installed."
     tar -xf "$tmp/$1" -C "$dir" || fail "could not unpack $1. Nothing was installed."
-    if [ "$(ls -A "$dir")" != "$BIN_NAME" ] || [ -L "$dir/$BIN_NAME" ] || [ ! -f "$dir/$BIN_NAME" ]; then
-        fail "$1 does not hold a regular file named $BIN_NAME. Nothing was installed."
+    count=0
+    only=''
+    for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+        # An unmatched glob stays literal; -L also catches broken symlinks.
+        if [ -e "$entry" ] || [ -L "$entry" ]; then
+            count=$((count + 1))
+            only=$entry
+        fi
+    done
+    target="$dir/$BIN_NAME"
+    if [ "$count" -ne 1 ] || [ "$only" != "$target" ] || [ -L "$target" ] || [ ! -f "$target" ]; then
+        fail "$1 does not hold exactly one regular file named $BIN_NAME. Nothing was installed."
     fi
-    EXTRACTED="$dir/$BIN_NAME"
+    EXTRACTED=$target
 }
 
 # Prints the version a freshly downloaded sevdesk-mcp binary reports in its MCP initialize
@@ -606,15 +623,29 @@ main() {
     fetch_sums
     prefer_archive
     if [ "$USE_ARCHIVE" = 1 ]; then
-        asset="$asset.tar.xz"
+        archive="$asset.tar.xz"
+        # Before anything is unpacked, two failures only cost the preference, not the
+        # install: a release that lists an archive it does not serve (yet), and a tar that
+        # cannot read the xz. Both fall back to the single binary. A wrong checksum and an
+        # archive of the wrong content never fall back; verify_checksum and extract_archive
+        # stop there.
+        if ! fetch "$RELEASES/download/$VERSION/$archive" "$tmp/$archive" 2>/dev/null; then
+            say "Could not download $archive; falling back to $asset."
+            USE_ARCHIVE=0
+        else
+            verify_checksum "$archive"
+            if extract_archive "$archive"; then
+                install_binary "$EXTRACTED"
+            else
+                say "This tar cannot read $archive; falling back to $asset."
+                USE_ARCHIVE=0
+            fi
+        fi
     fi
-    fetch "$RELEASES/download/$VERSION/$asset" "$tmp/$asset" ||
-        fail "download failed: $RELEASES/download/$VERSION/$asset (does release $VERSION exist for $OS-$ARCH?)"
-    verify_checksum
-    if [ "$USE_ARCHIVE" = 1 ]; then
-        extract_archive "$asset"
-        install_binary "$EXTRACTED"
-    else
+    if [ "$USE_ARCHIVE" = 0 ]; then
+        fetch "$RELEASES/download/$VERSION/$asset" "$tmp/$asset" ||
+            fail "download failed: $RELEASES/download/$VERSION/$asset (does release $VERSION exist for $OS-$ARCH?)"
+        verify_checksum "$asset"
         install_binary "$tmp/$asset"
     fi
 

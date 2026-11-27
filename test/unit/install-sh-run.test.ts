@@ -17,7 +17,9 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 // Runs install.sh end to end against a stub curl that serves release files from a fixture
-// directory, so download, checksum, unpacking and installation run without network.
+// directory, so download, checksum, unpacking, fallback and installation run without
+// network. PATH is either the host's or a directory of symlinks to exactly the core tools
+// install.sh runs, so tests can also simulate systems that lack one of them (e.g. xz).
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const VERSION = "9.9.9";
@@ -35,6 +37,12 @@ function assetNames(platform: { os: string; arch: string }) {
   const asset = `sevdesk-mcp-${os}-${arch}`;
   return { asset, archive: `${asset}.tar.xz` };
 }
+
+const onDarwin = process.platform === "darwin";
+const hasXz = spawnSync("/bin/sh", ["-c", "command -v xz"], { encoding: "utf8" })
+  .stdout.trim()
+  .startsWith("/");
+const hostReadsXz = onDarwin || hasXz; // bsdtar has liblzma; GNU tar shells out to xz
 
 /** A stand-in binary that answers initialize like the real server. */
 function fakeBinary(version: string): string {
@@ -56,15 +64,16 @@ function writeExecutable(path: string, content: string) {
 interface TarMember {
   name: string;
   data?: string;
-  type?: "file" | "symlink" | "dir";
+  type?: "file" | "symlink" | "hardlink" | "dir";
   linkname?: string;
   mode?: string;
 }
 
 /**
  * USTAR bytes with exactly these members. Crafted by hand rather than packed with the host
- * tar: both tar implementations refuse to *store* names like "../evil", while these tests
- * need archives that hold them, and both read plain USTAR back.
+ * tar: both tar implementations refuse to *store* names like "../evil" or odd member types
+ * the tests need, while both read plain USTAR back. It also keeps the crafted fixtures
+ * independent of xz support on the host.
  */
 function ustar(members: TarMember[]): Buffer {
   const blocks: Buffer[] = [];
@@ -78,7 +87,9 @@ function ustar(members: TarMember[]): Buffer {
     header.write(`${data.length.toString(8).padStart(11, "0")}\0`, 124, 12, "latin1");
     header.write("00000000000\0", 136, 12, "latin1");
     header.write("        ", 148, 8, "latin1"); // checksum placeholder while summing
-    header.write(m.type === "symlink" ? "2" : m.type === "dir" ? "5" : "0", 156, 1, "latin1");
+    const typeflag =
+      m.type === "symlink" ? "2" : m.type === "hardlink" ? "1" : m.type === "dir" ? "5" : "0";
+    header.write(typeflag, 156, 1, "latin1");
     header.write(m.linkname ?? "", 157, 100, "latin1");
     header.write("ustar\0", 257, 6, "latin1");
     header.write("00", 263, 2, "latin1");
@@ -94,6 +105,11 @@ function ustar(members: TarMember[]): Buffer {
   }
   blocks.push(Buffer.alloc(1024));
   return Buffer.concat(blocks);
+}
+
+/** A plain (uncompressed) tar with one regular member "sevdesk-mcp"; both tars read it. */
+function regularArchive(binary: string): Buffer {
+  return ustar([{ name: "sevdesk-mcp", data: binary, mode: "755" }]);
 }
 
 /** A real tar.xz with one member "sevdesk-mcp" holding these bytes, packed by the host tar. */
@@ -118,15 +134,18 @@ interface Setup {
 interface SetupOptions {
   /** binaryVersion: what the fake binary reports; checksum overrides the SHA256SUMS line of
    * the asset; latestUrl the URL the "latest" lookup ends at. archive: "valid" packs the
-   * binary with the host tar, a Buffer serves raw bytes under the .tar.xz name (for crafted
-   * archives); archiveChecksum overrides the archive's line. No archive option: the release
-   * has none, like before the .tar.xz assets existed. platform stubs uname, to exercise
-   * another platform's path. */
+   * binary with the host tar, "listed-missing" only lists it in SHA256SUMS (404 on download),
+   * a Buffer serves raw bytes under the .tar.xz name (for crafted archives);
+   * archiveChecksum overrides the archive's line; sumsExtra appends another line. noSums:
+   * the release has no SHA256SUMS at all. platform stubs uname, to exercise another
+   * platform's path. */
   binaryVersion?: string;
   checksum?: string;
   latestUrl?: string;
-  archive?: "valid" | Buffer;
+  archive?: "valid" | "listed-missing" | Buffer;
   archiveChecksum?: string;
+  sumsExtra?: string;
+  noSums?: boolean;
   platform?: { os: string; arch: string };
 }
 
@@ -143,11 +162,16 @@ function setup(options: SetupOptions = {}): Setup {
   writeFileSync(join(release, asset), binary);
   let sums = `${options.checksum ?? sha256(binary)}  ${asset}\n${"0".repeat(64)}  sevdesk-mcp-other\n`;
   if (options.archive) {
-    const bytes = options.archive === "valid" ? tarXz(dir, binary) : options.archive;
-    writeFileSync(join(release, archive), bytes);
-    sums += `${options.archiveChecksum ?? sha256(bytes)}  ${archive}\n`;
+    if (options.archive === "listed-missing") {
+      sums += `${sha256(binary)}  ${archive}\n`;
+    } else {
+      const bytes = options.archive === "valid" ? tarXz(dir, binary) : options.archive;
+      writeFileSync(join(release, archive), bytes);
+      sums += `${options.archiveChecksum ?? sha256(bytes)}  ${archive}\n`;
+      if (options.sumsExtra) sums += options.sumsExtra;
+    }
   }
-  writeFileSync(join(release, "SHA256SUMS"), sums);
+  if (!options.noSums) writeFileSync(join(release, "SHA256SUMS"), sums);
   if (options.platform) {
     writeExecutable(
       join(stubs, "uname"),
@@ -192,6 +216,7 @@ const CORE_TOOLS = [
   "env",
   "grep",
   "head",
+  "ldd",
   "ls",
   "mkdir",
   "mktemp",
@@ -201,7 +226,9 @@ const CORE_TOOLS = [
   "sha256sum",
   "shasum",
   "sleep",
+  "sysctl",
   "tar",
+  "uname",
   "xz",
 ];
 
@@ -218,15 +245,17 @@ function coreDir(s: Setup, exclude: string[]): string {
   return dir;
 }
 
-/** Run the installer; excludeTools replaces PATH with the stubs plus symlinked core tools. */
+/** Run the installer. core (or a without list) replaces PATH with the stubs plus symlinked
+ * core tools; stubs win over same-named symlinks, so uname/ldd overrides stay effective. */
 function install(
   s: Setup,
   extraEnv: Record<string, string> = {},
-  opts: { excludeTools?: string[] } = {},
+  opts: { core?: boolean; without?: string[] } = {},
 ) {
-  const path = opts.excludeTools
-    ? `${s.stubs}:${coreDir(s, opts.excludeTools)}`
-    : `${s.stubs}:${process.env.PATH ?? ""}`;
+  const path =
+    opts.core || opts.without
+      ? `${s.stubs}:${coreDir(s, opts.without ?? [])}`
+      : `${s.stubs}:${process.env.PATH ?? ""}`;
   return spawnSync("/bin/sh", [join(root, "install.sh"), "--no-setup"], {
     cwd: s.dir,
     encoding: "utf8",
@@ -268,9 +297,11 @@ describe("install.sh against a stub release", () => {
     expect(again.stdout).toContain(`Replaced the existing ${bin} with sevdesk-mcp ${VERSION}`);
   });
 
-  it("prefers the tar.xz archive when SHA256SUMS lists one", () => {
+  // A real xz archive, so this covers the whole read path; GNU tar needs its xz command,
+  // which is why the Linux host must have one for the test to run.
+  it.skipIf(!hostReadsXz)("prefers the tar.xz archive when SHA256SUMS lists one", () => {
     const s = setup({ archive: "valid" });
-    const result = install(s, { SEVDESK_MCP_VERSION: VERSION });
+    const result = install(s, { SEVDESK_MCP_VERSION: VERSION }, { core: true });
     expect(result.stderr).toBe("");
     expect(result.status).toBe(0);
     const bin = join(s.installDir, "sevdesk-mcp");
@@ -285,23 +316,89 @@ describe("install.sh against a stub release", () => {
     expect(readdirSync(s.installDir)).toEqual(["sevdesk-mcp"]);
   });
 
-  it("unpacks the archive on Linux when xz is in PATH", () => {
+  it.skipIf(!hasXz)("unpacks the archive on Linux when xz is in PATH", () => {
     const s = setup({ archive: "valid", platform: { os: "Linux", arch: hostPlatform.arch } });
-    const result = install(s, { SEVDESK_MCP_VERSION: VERSION });
+    const result = install(s, { SEVDESK_MCP_VERSION: VERSION }, { core: true });
     expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain("falling back");
+    expect(readFileSync(join(s.installDir, "sevdesk-mcp"), "utf8")).toBe(fakeBinary(VERSION));
+    expect(readFileSync(s.curlLog, "utf8")).toContain(`/${s.archive}\n`);
+  });
+
+  // The macOS branch does not need the xz command (bsdtar carries liblzma); only runnable
+  // where a tar without external xz still reads xz, i.e. on macOS itself.
+  it.skipIf(!onDarwin)("unpacks the archive on macOS even without xz in PATH", () => {
+    const s = setup({
+      archive: "valid",
+      platform: { os: "Darwin", arch: hostPlatform.arch },
+    });
+    const result = install(s, { SEVDESK_MCP_VERSION: VERSION }, { without: ["xz"] });
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain("falling back");
     expect(readFileSync(join(s.installDir, "sevdesk-mcp"), "utf8")).toBe(fakeBinary(VERSION));
     expect(readFileSync(s.curlLog, "utf8")).toContain(`/${s.archive}\n`);
   });
 
   it("falls back to the single binary on Linux without xz", () => {
-    const s = setup({ archive: "valid", platform: { os: "Linux", arch: "x86_64" } });
-    const result = install(s, { SEVDESK_MCP_VERSION: VERSION }, { excludeTools: ["xz"] });
+    const s = setup({
+      archive: regularArchive(fakeBinary(VERSION)),
+      platform: { os: "Linux", arch: "x86_64" },
+    });
+    const result = install(s, { SEVDESK_MCP_VERSION: VERSION }, { without: ["xz"] });
     expect(result.status).toBe(0);
     const log = readFileSync(s.curlLog, "utf8");
     expect(log).not.toContain(s.archive);
     expect(log).toContain(`/${s.asset}\n`);
     expect(readFileSync(join(s.installDir, "sevdesk-mcp"), "utf8")).toBe(fakeBinary(VERSION));
   });
+
+  // Listed in SHA256SUMS but not served yet (a rerun of the release job uploads it last):
+  // the download failure costs only the preference, the single binary still installs.
+  it("falls back to the single binary when the archive download fails", () => {
+    const s = setup({ archive: "listed-missing" });
+    const result = install(s, { SEVDESK_MCP_VERSION: VERSION });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`Could not download ${s.archive}; falling back to`);
+    const log = readFileSync(s.curlLog, "utf8");
+    expect(log).toContain(`/${s.archive}\n`);
+    expect(log).toContain(`/${s.asset}\n`);
+    expect(readFileSync(join(s.installDir, "sevdesk-mcp"), "utf8")).toBe(fakeBinary(VERSION));
+  });
+
+  // A tar that cannot read the file at all (busybox without xz, a tar without xz support
+  // despite the xz command) is a pre-unpack failure as well: short note, then the binary.
+  it("falls back to the single binary when tar cannot read the archive", () => {
+    const s = setup({ archive: Buffer.from("this is not a tar archive") });
+    const result = install(s, { SEVDESK_MCP_VERSION: VERSION });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`This tar cannot read ${s.archive}; falling back to`);
+    const log = readFileSync(s.curlLog, "utf8");
+    expect(log).toContain(`/${s.archive}\n`);
+    expect(log).toContain(`/${s.asset}\n`);
+    expect(readFileSync(join(s.installDir, "sevdesk-mcp"), "utf8")).toBe(fakeBinary(VERSION));
+  });
+
+  // A checksum line that is not exactly one valid SHA-256 is not a promise to install the
+  // archive; the binary path is taken without ever downloading it.
+  const dupArchive = regularArchive(fakeBinary(VERSION));
+  const { archive: hostArchive } = assetNames(hostPlatform);
+  const badArchiveLines: [string, SetupOptions][] = [
+    [
+      "a duplicated line",
+      { archive: dupArchive, sumsExtra: `${sha256(dupArchive)}  ${hostArchive}\n` },
+    ],
+    ["a malformed line", { archive: dupArchive, archiveChecksum: `zz${"f".repeat(62)}` }],
+    ["a too short line", { archive: dupArchive, archiveChecksum: "f".repeat(63) }],
+  ];
+  for (const [what, options] of badArchiveLines) {
+    it(`takes the single binary when the archive has ${what} in SHA256SUMS`, () => {
+      const s = setup(options);
+      const result = install(s, { SEVDESK_MCP_VERSION: VERSION });
+      expect(result.status).toBe(0);
+      expect(readFileSync(s.curlLog, "utf8")).not.toContain(s.archive);
+      expect(readFileSync(join(s.installDir, "sevdesk-mcp"), "utf8")).toBe(fakeBinary(VERSION));
+    });
+  }
 
   it("says so when no release is published yet", () => {
     const s = setup({ latestUrl: "https://github.com/altipard/sevdesk-mcp/releases" });
@@ -312,6 +409,17 @@ describe("install.sh against a stub release", () => {
     expect(readFileSync(s.curlLog, "utf8")).toBe(
       "https://github.com/altipard/sevdesk-mcp/releases/latest\n",
     );
+  });
+
+  // The sums are the first payload now, so their failure names the platform question too.
+  it("points at the release question when SHA256SUMS cannot be downloaded", () => {
+    const s = setup({ noSums: true });
+    const result = install(s, { SEVDESK_MCP_VERSION: VERSION });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("could not download SHA256SUMS");
+    expect(result.stderr).toContain(`does release ${VERSION} exist for`);
+    expect(result.stderr).toContain("Nothing was installed.");
+    expect(readdirSync(s.installDir)).toEqual([]);
   });
 
   it("aborts on a wrong checksum and installs nothing", () => {
@@ -325,7 +433,10 @@ describe("install.sh against a stub release", () => {
   // A listed archive whose bytes do not match SHA256SUMS is corruption or tampering, not a
   // reason to try the plain binary: nothing is installed.
   it("aborts on a wrong archive checksum and installs nothing", () => {
-    const s = setup({ archive: "valid", archiveChecksum: "f".repeat(64) });
+    const s = setup({
+      archive: regularArchive(fakeBinary(VERSION)),
+      archiveChecksum: "f".repeat(64),
+    });
     const result = install(s, { SEVDESK_MCP_VERSION: VERSION });
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(`checksum mismatch for ${s.archive}`);
@@ -333,30 +444,39 @@ describe("install.sh against a stub release", () => {
     expect(readdirSync(s.installDir)).toEqual([]);
   });
 
-  it("aborts when the archive is not a readable tar", () => {
-    const s = setup({ archive: Buffer.from("this is not a tar archive") });
-    const result = install(s, { SEVDESK_MCP_VERSION: VERSION });
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain("Nothing was installed.");
-    expect(readdirSync(s.installDir)).toEqual([]);
-  });
-
-  const crafted: [string, TarMember[]][] = [
-    ["a symlink", [{ name: "sevdesk-mcp", type: "symlink", linkname: "/etc/passwd", mode: "755" }]],
+  // Readable archives with the wrong content are a hard stop too - and each names its
+  // reason: -tv reports the member type ("l"/"h"/"d"), so links never pass as files.
+  const crafted: [string, TarMember[], string][] = [
+    [
+      "a symlink",
+      [{ name: "sevdesk-mcp", type: "symlink", linkname: "/etc/passwd", mode: "755" }],
+      "does not hold a regular file named sevdesk-mcp",
+    ],
+    [
+      "a hardlink",
+      [{ name: "sevdesk-mcp", type: "hardlink", linkname: "base", mode: "755" }],
+      "does not hold a regular file named sevdesk-mcp",
+    ],
     [
       "an extra file",
       [
         { name: "sevdesk-mcp", data: "x", mode: "755" },
         { name: "evil.txt", data: "x" },
       ],
+      "does not hold exactly one file named sevdesk-mcp",
     ],
-    ["a ../ path", [{ name: "../evil", data: "x" }]],
+    [
+      "a ../ path",
+      [{ name: "../evil", data: "x" }],
+      "does not hold exactly one file named sevdesk-mcp",
+    ],
   ];
-  for (const [what, members] of crafted) {
+  for (const [what, members, why] of crafted) {
     it(`aborts when the archive holds ${what} and installs nothing`, () => {
       const s = setup({ archive: ustar(members) });
       const result = install(s, { SEVDESK_MCP_VERSION: VERSION });
       expect(result.status).toBe(1);
+      expect(result.stderr).toContain(why);
       expect(result.stderr).toContain("Nothing was installed.");
       expect(readdirSync(s.installDir)).toEqual([]);
       expect(existsSync(join(s.dir, "evil"))).toBe(false);
