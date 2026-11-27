@@ -40,6 +40,8 @@ const merger = spawnSync("sh", ["-c", "command -v jq || command -v python3"], {
   encoding: "utf8",
 }).stdout.trim();
 
+const python3 = spawnSync("sh", ["-c", "command -v python3"], { encoding: "utf8" }).stdout.trim();
+
 interface Env {
   dir: string;
   home: string;
@@ -58,6 +60,14 @@ interface Options {
   /** HTTP status the stub curl reports for the token check; "fail" = no connection. */
   http?: string;
   secretTool?: boolean;
+  /** The stub `claude mcp add` fails. */
+  claudeAddFails?: boolean;
+  /** The stub `stty -echo` fails. */
+  sttyFails?: boolean;
+  /** Extra options for sh, e.g. -x. */
+  shell?: string[];
+  /** jq fails, so python3 does the JSON work. */
+  noJq?: boolean;
 }
 
 /** Each stub appends "<name> <args>" to the call log. */
@@ -106,9 +116,25 @@ esac`,
     "curl",
     `${saveStdin("curl")}\n${http === "fail" ? "printf 000; exit 7" : `printf '%s' '${http}'`}`,
   );
-  stub(env, "stty", `case "$1" in -g) printf 'saved-state\\n' ;; esac`);
-  for (const cli of options.clis ?? []) stub(env, cli);
-  if (merger) symlinkSync(merger, join(env.stubs, merger.split("/").at(-1) ?? "jq"));
+  stub(
+    env,
+    "stty",
+    `case "$1" in -g) printf 'saved-state\\n' ;; -echo) exit ${options.sttyFails ? 1 : 0} ;; esac`,
+  );
+  for (const cli of options.clis ?? [])
+    stub(
+      env,
+      cli,
+      cli === "claude" && options.claudeAddFails
+        ? `case "$2" in add) exit 1 ;; get) exit 1 ;; esac`
+        : `case "$2" in get) exit 1 ;; esac`,
+    );
+  if (options.noJq) {
+    writeExecutable(join(env.stubs, "jq"), "#!/bin/sh\nexit 1\n");
+    if (python3) symlinkSync(python3, join(env.stubs, "python3"));
+  } else if (merger) {
+    symlinkSync(merger, join(env.stubs, merger.split("/").at(-1) ?? "jq"));
+  }
   return env;
 }
 
@@ -125,10 +151,10 @@ MAC_APPS='${join(env.dir, "Applications")}'
 BIN_PATH="$HOME/.local/bin/sevdesk-mcp"
 MODE=\${MODE:-read}
 REPLACE_TOKEN=\${REPLACE_TOKEN:-0}
+REPLACE_ENTRIES=\${REPLACE_ENTRIES:-0}
 VERIFY_TOKEN=\${VERIFY_TOKEN:-1}
 tmp=$(mktemp -d)
-trap cleanup EXIT
-trap 'exit 130' INT
+set_traps
 ${extra}
 `,
   );
@@ -153,7 +179,7 @@ function runSetup(
   vars: Record<string, string> = {},
 ) {
   writeFileSync(env.ttyIn, input.map((line) => `${line}\n`).join(""));
-  const result = spawnSync("sh", [harness(env, options, "setup")], {
+  const result = spawnSync("sh", [...(options.shell ?? []), harness(env, options, "setup")], {
     encoding: "utf8",
     env: harnessEnv(env, vars),
     timeout: 20_000,
@@ -199,7 +225,8 @@ describe.skipIf(realClient)("install.sh setup", () => {
       },
     });
     const bin = join(env.home, ".local/bin/sevdesk-mcp");
-    expect(result.calls).toContain("claude mcp remove --scope user sevdesk\n");
+    // Nothing to replace: no remove before the add.
+    expect(result.calls).not.toContain("claude mcp remove");
     expect(result.calls).toContain(
       `claude mcp add --scope user sevdesk --env SEVDESK_MODE=read -- ${bin}\n`,
     );
@@ -352,33 +379,199 @@ describe.skipIf(realClient)("install.sh setup", () => {
     },
   );
 
-  it("restores the terminal when interrupted during the hidden token prompt", async () => {
-    const env = prepare();
-    const fifo = join(env.dir, "tty.fifo");
-    expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
-    const path = harness(
+  const SECRET_VALUE = "fedcba9876543210fedcba9876543210";
+  const claudeJson = (env: Env, entry: unknown) =>
+    writeFileSync(
+      join(env.home, ".claude.json"),
+      JSON.stringify({ numStartups: 3, mcpServers: { sevdesk: entry } }),
+    );
+
+  it("keeps a Claude Code entry with its own env and never shows its values", () => {
+    const env = prepare({ clis: ["claude"] });
+    claudeJson(env, {
+      type: "stdio",
+      command: "npx",
+      args: ["-y", "@altipard/sevdesk-mcp"],
+      env: { SEVDESK_API_TOKEN: SECRET_VALUE, SEVDESK_ENABLE_TOOLS: "send_invoice" },
+    });
+    const result = runSetup(env, ["", ""], { clis: ["claude"] });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("has its own command or env");
+    expect(result.stdout).toContain("--replace-entries");
+    expect(result.stdout).toContain('Claude Code: kept the existing "sevdesk" entry');
+    expect(result.calls).not.toMatch(/^claude mcp (remove|add)/m);
+    expect(result.stdout + result.stderr + result.tty).not.toContain(SECRET_VALUE);
+  });
+
+  it("replaces a custom Claude Code entry with --replace-entries and names a restore command without secrets", () => {
+    const env = prepare({ clis: ["claude"], claudeAddFails: true });
+    claudeJson(env, {
+      command: "npx",
+      args: ["-y", "@altipard/sevdesk-mcp"],
+      env: { SEVDESK_MODE: "full", SEVDESK_API_TOKEN: SECRET_VALUE },
+    });
+    const result = runSetup(
       env,
-      {},
-      `TTY_IN='${fifo}'
+      ["", ""],
+      { clis: ["claude"], claudeAddFails: true },
+      { REPLACE_ENTRIES: "1" },
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("is replaced, its env is not kept");
+    expect(result.calls).toContain("claude mcp remove --scope user sevdesk\n");
+    expect(result.stdout).toContain("Registering with Claude Code failed");
+    expect(result.stdout).toContain(
+      "claude mcp add --scope user sevdesk --env SEVDESK_MODE=full --env SEVDESK_API_TOKEN=<value> -- npx -y @altipard/sevdesk-mcp",
+    );
+    expect(result.stdout + result.stderr + result.tty).not.toContain(SECRET_VALUE);
+  });
+
+  it("replaces its own Claude Code entry without asking", () => {
+    const env = prepare({ clis: ["claude"] });
+    const bin = join(env.home, ".local/bin/sevdesk-mcp");
+    claudeJson(env, { type: "stdio", command: bin, args: [], env: { SEVDESK_MODE: "read" } });
+    const result = runSetup(env, ["", ""], { clis: ["claude"] }, { MODE: "write" });
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain("stays unchanged");
+    expect(result.calls).toContain(
+      `claude mcp remove --scope user sevdesk\nclaude mcp add --scope user sevdesk --env SEVDESK_MODE=write -- ${bin}\n`,
+    );
+  });
+
+  it("keeps the other env variables of an existing JSON entry", () => {
+    const env = prepare();
+    mkdirSync(join(env.home, ".cursor"));
+    writeFileSync(
+      join(env.home, ".cursor/mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          sevdesk: {
+            command: "npx",
+            args: ["-y", "@altipard/sevdesk-mcp"],
+            env: {
+              SEVDESK_MODE: "full",
+              SEVDESK_API_TOKEN: "${env:SEVDESK_API_TOKEN}",
+              SEVDESK_ENABLE_TOOLS: "send_invoice",
+            },
+          },
+        },
+      }),
+    );
+    const result = runSetup(env, ["", ""]);
+    expect(result.status).toBe(0);
+    expect(JSON.parse(readFileSync(join(env.home, ".cursor/mcp.json"), "utf8"))).toEqual({
+      mcpServers: {
+        sevdesk: {
+          command: join(env.home, ".local/bin/sevdesk-mcp"),
+          env: {
+            SEVDESK_MODE: "read",
+            SEVDESK_API_TOKEN: "${env:SEVDESK_API_TOKEN}",
+            SEVDESK_ENABLE_TOOLS: "send_invoice",
+          },
+        },
+      },
+    });
+  });
+
+  it.skipIf(!python3)("does the same JSON work with python3 when jq is missing", () => {
+    const env = prepare({ clis: ["claude"], noJq: true });
+    mkdirSync(join(env.home, ".cursor"));
+    writeFileSync(
+      join(env.home, ".cursor/mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          sevdesk: { command: "npx", args: ["-y"], env: { SEVDESK_ENABLE_TOOLS: "x" } },
+        },
+      }),
+    );
+    claudeJson(env, {
+      command: "npx",
+      env: { SEVDESK_MODE: "read", SEVDESK_API_TOKEN: SECRET_VALUE },
+    });
+    const result = runSetup(env, ["", ""], { clis: ["claude"], noJq: true });
+    expect(result.status).toBe(0);
+    expect(
+      JSON.parse(readFileSync(join(env.home, ".cursor/mcp.json"), "utf8")).mcpServers.sevdesk,
+    ).toEqual({
+      command: join(env.home, ".local/bin/sevdesk-mcp"),
+      env: { SEVDESK_ENABLE_TOOLS: "x", SEVDESK_MODE: "read" },
+    });
+    expect(result.stdout).toContain("has its own command or env");
+    expect(result.calls).not.toMatch(/^claude mcp (remove|add)/m);
+    expect(result.stdout + result.stderr).not.toContain(SECRET_VALUE);
+  });
+
+  it("keeps the token out of an `sh -x` trace", () => {
+    const env = prepare();
+    const result = runSetup(env, ["", TOKEN], { shell: ["-x"] });
+    expect(result.status).toBe(0);
+    expect(result.securityStdin).toContain(`-w ${TOKEN}\n`);
+    // Tracing is on before and after the token step.
+    expect(result.stderr).toContain("+ store_token");
+    expect(result.stderr).toMatch(/\+ (for key|blank)/);
+    expect(result.stderr + result.stdout).not.toContain(TOKEN);
+  });
+
+  it("does not read the token when echo cannot be switched off", () => {
+    const env = prepare({ sttyFails: true });
+    const result = runSetup(env, ["", TOKEN], { sttyFails: true });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Cannot hide the input on this terminal");
+    expect(result.stdout).toContain("security add-generic-password -U -s sevdesk-mcp");
+    expect(result.tty).not.toContain("Paste your sevdesk API token");
+    expect(result.securityStdin).toBe("");
+  });
+
+  it("still counts an older token when replacing it is skipped", () => {
+    const env = prepare({ stored: true });
+    const result = runSetup(env, ["", ""], { stored: true }, { REPLACE_TOKEN: "1" });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("No token entered; the keychain was not changed.");
+    expect(result.stdout).toContain("The server reads the token from the keychain");
+  });
+
+  it.skipIf(existsSync("/usr/bin/secret-tool") || existsSync("/bin/secret-tool"))(
+    "points to secret-tool, not to a rerun, when Linux has no keychain tool",
+    () => {
+      const env = prepare({ os: "linux", secretTool: false });
+      const result = runSetup(env, [""], { os: "linux", secretTool: false });
+      expect(result.stdout).toContain("No token in the keychain: install secret-tool");
+    },
+  );
+
+  it.each([
+    ["SIGINT", 130],
+    ["SIGQUIT", 131],
+  ] as const)(
+    "restores the terminal on %s during the hidden token prompt",
+    async (signal, status) => {
+      const env = prepare();
+      const fifo = join(env.dir, "tty.fifo");
+      expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+      const path = harness(
+        env,
+        {},
+        `TTY_IN='${fifo}'
 open_tty
 read_secret "token:"
 echo "read returned" >&2`,
-    );
-    const child = spawn("sh", [path], { env: harnessEnv(env, {}), stdio: "ignore" });
-    const exited = new Promise<number | null>((resolve) => child.on("exit", resolve));
-    // Opening a FIFO for reading blocks until a writer exists; keep one open and write nothing.
-    const writer = openSync(fifo, "w");
-    try {
-      const deadline = Date.now() + 10_000;
-      while (!readFileSync(env.log, "utf8").includes("stty -echo")) {
-        if (Date.now() > deadline) throw new Error("stty -echo never ran");
-        await new Promise((resolve) => setTimeout(resolve, 20));
+      );
+      const child = spawn("sh", [path], { env: harnessEnv(env, {}), stdio: "ignore" });
+      const exited = new Promise<number | null>((resolve) => child.on("exit", resolve));
+      // Opening a FIFO for reading blocks until a writer exists; keep one open and write nothing.
+      const writer = openSync(fifo, "w");
+      try {
+        const deadline = Date.now() + 10_000;
+        while (!readFileSync(env.log, "utf8").includes("stty -echo")) {
+          if (Date.now() > deadline) throw new Error("stty -echo never ran");
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        child.kill(signal);
+        expect(await exited).toBe(status);
+      } finally {
+        closeSync(writer);
       }
-      child.kill("SIGINT");
-      expect(await exited).toBe(130);
-    } finally {
-      closeSync(writer);
-    }
-    expect(readFileSync(env.log, "utf8")).toBe("stty -g\nstty -echo\nstty saved-state\n");
-  });
+      expect(readFileSync(env.log, "utf8")).toBe("stty -g\nstty -echo\nstty saved-state\n");
+    },
+  );
 });
