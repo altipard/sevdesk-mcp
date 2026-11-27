@@ -11,8 +11,8 @@
 | Bank transaction | 100 created, 200 linked, 300 private, 350 auto booked, 400 booked |
 | Contact | 100 lead, 500 pending, 1000 active |
 
-Invoice types: RE invoice, SR cancellation, MA reminder, TR partial, AR advance, WKR
-recurring template. Order types: AN estimate, AB order confirmation, LI delivery note.
+Invoice types: RE invoice, SR cancellation, MA reminder, TR partial, AR advance, ER final
+invoice (Schlussrechnung), WKR recurring template. Order types: AN estimate, AB order confirmation, LI delivery note.
 
 Status changes the tools can make:
 
@@ -87,8 +87,10 @@ the amount; show that warning and let the user choose.
   depreciation; sevdesk refuses it when a linked transaction is enshrined.
 - `cancel_invoice` warns that sevdesk does not cancel drafts or existing cancellation
   invoices.
-- `send_invoice_email` and `cancel_invoice` run at most once per invoice within 24 hours;
-  `enshrine_document` once per document. A refused repeat is intentional.
+- `send_invoice_email` and `cancel_invoice` run at most once per invoice within 24 hours,
+  `enshrine_document` once per document, and a refused repeat is intentional. With the
+  plugin (stdio) this record is kept in memory only: a server restart clears it, so check
+  sevdesk before any repeat. An unknown outcome still means: check in sevdesk, do not retry.
 - Fetching a PDF never marks a document as sent.
 - `list_open_receivables` counts neither reminders nor cancellations, so totals are not
   doubled; recurring templates appear through their generated invoices.

@@ -25,7 +25,10 @@ arguments change, show the new state and ask again.
      Show recipient, cc/bcc, subject, text, invoice number and amount; warn if the address
      is not one of the contact's. Irreversible: get an explicit yes for exactly this e-mail.
 
-From an estimate: `search_orders` for the order, `create_invoice_from_order`, then from
+From an estimate: find the order with `search_orders`. Show the plan first: order number,
+customer, the positions and totals the invoice will take over, and for partial (TR) or
+advance (AR) invoices the amountType and amount. Wait for a yes, then call
+`create_invoice_from_order` once (every call creates another invoice) and continue with
 step 5. A new estimate is `create_order_draft` with the same steps 1 to 5.
 
 ## Record a voucher with its file and book the payment

@@ -27,6 +27,13 @@ are German (Rechnung, Beleg, Angebot, Skonto).
    object. If a call fails or times out, check in sevdesk (search tools) before retrying.
 5. **Read before you write.** Look up IDs with the search tools; never guess a contact,
    invoice, voucher or account ID.
+6. **Configuration belongs to the user.** Never change or raise the mode (plugin settings,
+   pluginConfigs in settings.json), SEVDESK_ENABLE_TOOLS, released operations or any other
+   server or client configuration yourself, not even when a tool is missing. Tell the user
+   what would be needed and let them decide.
+7. **The server's tool list is authoritative.** If a tool named here is missing, or the
+   server offers one this skill does not describe, the server is older or newer than this
+   skill. Do not guess parameters or substitute another tool; tell the user.
 
 ## Modes: what the server allows
 
@@ -82,8 +89,10 @@ Details per tool, inputs and limits: [references/tools.md](references/tools.md).
    changed argument invalidates it; a token works once. If it expired or was refused,
    start again at step 1 and show the new preview.
 4. Irreversible tools (X) also make the client ask the user directly where it supports
-   that; on other clients the yes in the conversation is the only gate, so be strict. They
-   run at most once per document within 24 hours and are never retried automatically.
+   that; on other clients the yes in the conversation is the only gate, so be strict. The
+   server runs each of them at most once per document within 24 hours and never retries
+   automatically. With the plugin (stdio) that record lives only as long as the server
+   process: a restart clears it, so it is no protection against repeating an action.
    "Outcome unknown" means: check the document in sevdesk, do not call again.
 
 Each confirmed booking with `book_invoice_payment` or `book_voucher_payment` books again:
@@ -115,14 +124,19 @@ Status codes, tax rules, payment types and documented pitfalls:
 - Small businesses (Kleinunternehmer, §19 UStG) use tax rule 11 with 0 % on every position;
   the server checks rule and rates against the account's tax guidance before sending.
 - Enshrined (festgeschrieben) documents can never be changed again (GoBD).
-- Amounts have at most two decimals; payment and document dates are German calendar dates
-  (YYYY-MM-DD).
+- Payment amounts and voucher position amounts have at most two decimals; the net unit
+  price of invoice and order positions (priceNet) is not limited to cents. Dates are German
+  calendar dates (YYYY-MM-DD).
 
 ## When something fails
 
-- Tools missing or "needs write rights": the mode is too low. The user changes it in the
-  plugin settings (`/plugin`, configure sevdesk) and reloads plugins.
-- 401 from sevdesk: the API token is wrong or missing. It lives in the system keychain
-  (service sevdesk-mcp, account api-token) or in SEVDESK_API_TOKEN, never in the chat; ask
-  the user to fix it there and never ask them to paste the token.
-- Server does not start: Node.js 24 or later must be on the PATH for npx.
+- No sevdesk tools at all, or the server shows as failed in `/mcp`: the server could not
+  start and exited. Usual causes: no API token (the keychain entry with service sevdesk-mcp
+  and account api-token is missing or empty, and SEVDESK_API_TOKEN is unset), or Node.js
+  older than 24 on the PATH for npx. There is no 401 in this case. The user fixes it
+  outside the chat and reloads plugins.
+- 401 from sevdesk: the server runs, but the token is wrong or revoked. The user replaces it
+  in the keychain or in SEVDESK_API_TOKEN. Never ask them to paste the token into the chat.
+- Some tools missing or "needs write rights": the mode is too low or the operator switched
+  tools off. Only the user changes that, in the plugin settings (`/plugin`, configure
+  sevdesk), then reloads plugins.
