@@ -67,4 +67,15 @@ describe("install.sh", () => {
     expect(version.status).toBe(1);
     expect(version.stderr).toContain("invalid release version");
   });
+
+  it("accepts read, write and full as mode and refuses anything else", () => {
+    expect(run(["--dry-run", "--mode=write"]).status).toBe(0);
+    expect(run(["--dry-run"], { SEVDESK_MODE: "full" }).status).toBe(0);
+    const flag = run(["--dry-run", "--mode=admin"]);
+    expect(flag.status).toBe(1);
+    expect(flag.stderr).toContain("unknown mode 'admin'");
+    expect(run(["--dry-run"], { SEVDESK_MODE: "Write" }).status).toBe(1);
+    // The option wins over the environment.
+    expect(run(["--dry-run", "--mode=read"], { SEVDESK_MODE: "bogus" }).status).toBe(0);
+  });
 });
