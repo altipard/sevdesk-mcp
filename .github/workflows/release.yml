@@ -15,10 +15,12 @@
 #
 # Order and reruns: everything is built and attested before anything is published; then npm,
 # then the GitHub release, which also creates the tag, and next to it the MCP registry entry.
-# Release assets: the four binaries, the Claude Desktop extension sevdesk-mcp.mcpb and
-# SHA256SUMS over all of them. Every publish step checks what already exists and never
-# replaces it, so "Re-run all jobs" after a partial failure completes the release: a commit
-# that already carries its release tag is resumed instead of bumped again.
+# Release assets: the four binaries, each one additionally as a
+# sevdesk-mcp-<os>-<arch>.tar.xz archive (the embedded Bun runtime is most of a binary; xz
+# brings the download down to about a quarter of the bytes), the Claude Desktop extension
+# sevdesk-mcp.mcpb and SHA256SUMS over all of them. Every publish step checks what already
+# exists and never replaces it, so "Re-run all jobs" after a partial failure completes the
+# release: a commit that already carries its release tag is resumed instead of bumped again.
 name: release
 
 on:
@@ -162,6 +164,57 @@ jobs:
           path: out/bin/sevdesk-mcp-${{ matrix.target }}
           if-no-files-found: error
 
+  # xz archives of the binaries; install.sh downloads one when tar can unpack xz here. Packed
+  # on Linux with GNU tar: macOS bsdtar would add xattrs and ._ entries. Fixed metadata
+  # (single member, mode 0755, owner/group 0, mtime at the epoch) makes the archive a
+  # reproducible build of its binary.
+  archives:
+    needs: [version, binaries]
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        target: [darwin-arm64, darwin-x64, linux-x64, linux-arm64]
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sevdesk-mcp-${{ matrix.target }}
+          path: in
+
+      - name: pack and verify
+        run: |
+          # download-artifact drops the executable bit; the member must be 0755 in the archive.
+          chmod 755 "in/sevdesk-mcp-$TARGET"
+          stage=$(mktemp -d)
+          cp "in/sevdesk-mcp-$TARGET" "$stage/sevdesk-mcp"
+          mkdir -p out
+          tar -C "$stage" --format=gnu --owner=0 --group=0 --numeric-owner \
+              --mtime='@0' --mode=0755 -cJf "out/sevdesk-mcp-$TARGET.tar.xz" sevdesk-mcp
+          # Complete archive: exactly one member named sevdesk-mcp, and unpacking it returns
+          # the binary byte for byte.
+          if [ "$(tar -tJf "out/sevdesk-mcp-$TARGET.tar.xz")" != "sevdesk-mcp" ]; then
+            echo "::error::archive does not hold exactly one member named sevdesk-mcp"
+            exit 1
+          fi
+          verify=$(mktemp -d)
+          tar -xJf "out/sevdesk-mcp-$TARGET.tar.xz" -C "$verify"
+          cmp "$verify/sevdesk-mcp" "in/sevdesk-mcp-$TARGET"
+          mode=$(stat -c '%a' "$verify/sevdesk-mcp")
+          mtime=$(stat -c '%Y' "$verify/sevdesk-mcp")
+          if [ "$mode" != 755 ] || [ "$mtime" != 0 ]; then
+            echo "::error::extracted member has mode $mode and mtime $mtime, expected 755 and 0"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sevdesk-mcp-${{ matrix.target }}.tar.xz
+          path: out/sevdesk-mcp-${{ matrix.target }}.tar.xz
+          if-no-files-found: error
+
   # Claude Desktop extension: dist/ plus production dependencies, run by the client's built-in
   # Node.js. Dependency install scripts are skipped; the smoke test starts the server from the
   # unpacked bundle with the manifest's command and environment.
@@ -197,10 +250,11 @@ jobs:
           path: out/mcpb/sevdesk-mcp.mcpb
           if-no-files-found: error
 
-  # Signed build provenance for the binaries and the extension; verify a download with
+  # Signed build provenance for the binaries, their archives and the extension; verify a
+  # download with
   #   gh attestation verify <file> --repo altipard/sevdesk-mcp
   attest:
-    needs: [version, binaries, mcpb]
+    needs: [version, binaries, archives, mcpb]
     if: needs.version.outputs.version != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -437,7 +491,7 @@ jobs:
       # A published asset is never replaced: a rerun only adds what a partial run left out.
       - name: tag and release
         run: |
-          files=(sevdesk-mcp-darwin-arm64 sevdesk-mcp-darwin-x64 sevdesk-mcp-linux-x64 sevdesk-mcp-linux-arm64 sevdesk-mcp.mcpb)
+          files=(sevdesk-mcp-darwin-arm64 sevdesk-mcp-darwin-x64 sevdesk-mcp-linux-x64 sevdesk-mcp-linux-arm64 sevdesk-mcp-darwin-arm64.tar.xz sevdesk-mcp-darwin-x64.tar.xz sevdesk-mcp-linux-x64.tar.xz sevdesk-mcp-linux-arm64.tar.xz sevdesk-mcp.mcpb)
           if ! existing=$(gh release view "$VERSION" --json assets --jq '.assets[].name' 2>/dev/null); then
             (cd assets && sha256sum "${files[@]}" > SHA256SUMS && cat SHA256SUMS)
             gh release create "$VERSION" assets/* \
