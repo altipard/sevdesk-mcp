@@ -4,6 +4,7 @@ import {
   confirmSecretFor,
   DEFAULT_BASE_URL,
   DEFAULT_CONFIRM_TTL_SECONDS,
+  DEFAULT_RATE_LIMIT,
   loadConfig,
 } from "../../src/config.js";
 import { errorRepresentations, TEST_TOKEN } from "../helpers.js";
@@ -28,6 +29,7 @@ describe("loadConfig", () => {
       deniedTools: [],
       enableTools: [],
       confirmTtlSeconds: DEFAULT_CONFIRM_TTL_SECONDS,
+      rateLimit: DEFAULT_RATE_LIMIT,
     });
   });
 
@@ -47,6 +49,7 @@ describe("loadConfig", () => {
       deniedTools: [],
       enableTools: [],
       confirmTtlSeconds: DEFAULT_CONFIRM_TTL_SECONDS,
+      rateLimit: DEFAULT_RATE_LIMIT,
     });
   });
 
@@ -229,6 +232,46 @@ describe("confirmation settings", () => {
       SEVDESK_CONFIRM_TTL_SECONDS: value,
     });
     expect(error.issues[0]).toMatch(/^SEVDESK_CONFIRM_TTL_SECONDS: must be/);
+  });
+
+  it("defaults SEVDESK_RATE_LIMIT to 4 requests per second", () => {
+    expect(DEFAULT_RATE_LIMIT).toBe(4);
+    expect(loadConfig({ SEVDESK_API_TOKEN: TEST_TOKEN, SEVDESK_RATE_LIMIT: " " }).rateLimit).toBe(
+      4,
+    );
+  });
+
+  it.each([
+    ["0", 0],
+    ["1", 1],
+    ["0.5", 0.5],
+    ["0.05", 0.05],
+    [" 10 ", 10],
+    ["100", 100],
+  ])("accepts SEVDESK_RATE_LIMIT=%j", (value, expected) => {
+    const config = loadConfig({ SEVDESK_API_TOKEN: TEST_TOKEN, SEVDESK_RATE_LIMIT: value });
+    expect(config.rateLimit).toBe(expected);
+  });
+
+  it.each([
+    "-1",
+    "abc",
+    "0x10",
+    "1e3",
+    "Infinity",
+    "NaN",
+    "4 rps",
+    ".5",
+    "100.5",
+    "1000",
+    "0.04",
+    "0.0001",
+  ])("rejects SEVDESK_RATE_LIMIT=%j at startup", (value) => {
+    const error = configError({ SEVDESK_API_TOKEN: TEST_TOKEN, SEVDESK_RATE_LIMIT: value });
+    expect(error.issues).toHaveLength(1);
+    expect(error.issues[0]).toMatch(
+      /^SEVDESK_RATE_LIMIT: must be (a number of requests per second, e\.g\. 4 or 0\.5|0 \(off\) or between 0\.05 and 100)$/,
+    );
   });
 
   it("uses the configured secret on both transports", () => {

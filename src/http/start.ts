@@ -233,7 +233,12 @@ export async function startHttpServer(options: StartHttpOptions = {}): Promise<R
     });
     const sevdesk =
       options.sevdesk ??
-      createSevdeskClient({ baseUrl: config.baseUrl, token: config.sevdeskApiToken, logger });
+      createSevdeskClient({
+        baseUrl: config.baseUrl,
+        token: config.sevdeskApiToken,
+        rateLimit: config.rateLimit,
+        logger,
+      });
     const jwt = createJwtVerifier({
       issuer: http.issuer,
       resource: http.resourceUrl,

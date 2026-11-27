@@ -350,7 +350,7 @@ describe("retries", () => {
     expect(error.retryAfterSeconds).toBe(120);
   });
 
-  it.each([500, 503, 429])("sends a POST answered with %i exactly once", async (status) => {
+  it.each([500, 503])("sends a POST answered with %i exactly once", async (status) => {
     let calls = 0;
     server.use(
       http.post(url("/Contact"), () => {

@@ -5,10 +5,19 @@ import { enforceRequestPins, PinViolation } from "../policy/pins.js";
 import { createRedactor, type Redactor } from "../redact.js";
 import { USER_AGENT } from "../version.js";
 import { mapHttpError, OUTCOME_UNKNOWN, parseRetryAfter, SevdeskError } from "./errors.js";
+import { type RateLimiter, type RateLimiterRegistry, sharedRateLimiters } from "./rate-limit.js";
 
 export interface RetryOptions {
-  /** Additional attempts after the first one. Only GET requests are retried. */
+  /**
+   * Additional attempts after the first one for 5xx (502, 503, 504),
+   * timeouts and network errors. Only GET requests are retried this way.
+   */
   maxRetries: number;
+  /**
+   * Additional attempts after a 429, for every method and also through the
+   * single-attempt client: sevdesk did not run a throttled request.
+   */
+  maxRateLimitRetries: number;
   baseDelayMs: number;
   /** Upper bound per wait. A longer Retry-After ends retrying instead. */
   maxDelayMs: number;
@@ -25,6 +34,13 @@ export interface SevdeskClientOptions {
   /** Upper bound for one response body; larger answers are dropped while streaming. */
   maxResponseBytes?: number;
   retry?: Partial<RetryOptions>;
+  /**
+   * Client-side pacing in requests per second (SEVDESK_RATE_LIMIT). Shared
+   * by every client of the process with the same token. Unset or 0: off.
+   */
+  rateLimit?: number | undefined;
+  /** Where the buckets live; injected in tests. Default: one per process. */
+  rateLimiters?: RateLimiterRegistry;
   logger?: Logger;
   /**
    * Injected in tests so retries do not wait in real time. The signal
@@ -41,9 +57,10 @@ export interface SevdeskClient {
   /** Typed openapi-fetch client. Pass its promise to `call` to get data or a SevdeskError. */
   readonly api: SevdeskApi;
   /**
-   * Same client without retries, also for GET. For operations with side
-   * effects behind a GET (export jobs, sendByWithRender): repeating them
-   * after a timeout could run them twice.
+   * Same client without retries on 5xx, timeouts or network errors, also
+   * for GET. For operations with side effects behind a GET (export jobs,
+   * sendByWithRender): repeating them after a timeout could run them twice.
+   * A 429 is still retried: sevdesk did not run the throttled request.
    */
   readonly apiSingleAttempt: SevdeskApi;
   call<T>(request: Promise<ApiResult<T>>): Promise<T>;
@@ -56,7 +73,12 @@ type ApiResult<T> =
 export const DEFAULT_TIMEOUT_MS = 30_000;
 export const DEFAULT_DEADLINE_MS = 60_000;
 export const DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
-export const DEFAULT_RETRY: RetryOptions = { maxRetries: 3, baseDelayMs: 500, maxDelayMs: 10_000 };
+export const DEFAULT_RETRY: RetryOptions = {
+  maxRetries: 3,
+  maxRateLimitRetries: 3,
+  baseDelayMs: 500,
+  maxDelayMs: 10_000,
+};
 
 /** Waits `ms`; an abort clears the timer, so it does not outlive the call. */
 const realSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
@@ -200,6 +222,8 @@ interface FetchPolicy {
   timeoutMs: number;
   deadlineMs: number;
   retry: RetryOptions;
+  /** Paces every attempt, retries included. */
+  limiter: RateLimiter;
   logger: Logger;
   sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   now: () => number;
@@ -280,9 +304,10 @@ async function waitUnlessAborted(
 }
 
 /**
- * fetch with a per-attempt timeout, an overall deadline and retries.
- * Retries happen only for GET: repeating a write could create or send
- * something twice.
+ * fetch with client-side pacing, a per-attempt timeout, an overall deadline
+ * and retries. 5xx, timeouts and network errors are retried only for GET:
+ * repeating a write could create or send something twice. A 429 is retried
+ * for every method, since sevdesk refused it before running it.
  */
 function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<Response> {
   return async (original) => {
@@ -308,7 +333,11 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
     request = new Request(request, { headers });
     const method = request.method.toUpperCase();
     const mayHaveSideEffect = method !== "GET" || policy.sideEffects;
-    const maxAttempts = method === "GET" ? policy.retry.maxRetries + 1 : 1;
+    // Two budgets, so a 429 after a 503 still gets its own retries. Both
+    // are finite, so the attempts are bounded by their sum plus one.
+    const maxOtherRetries = method === "GET" ? policy.retry.maxRetries : 0;
+    let otherRetries = 0;
+    let rateLimitRetries = 0;
     const path = new URL(request.url).pathname;
     const deadline = policy.now() + policy.deadlineMs;
     // A retry only starts if, after the wait, a meaningful attempt still
@@ -317,18 +346,38 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
     const minAttemptMs = Math.min(policy.timeoutMs, 1000);
     const fitsDeadline = (delayMs: number) => policy.now() + delayMs + minAttemptMs <= deadline;
 
+    // The last answer that was retried, passed on if pacing leaves no room
+    // for another attempt.
+    let retriedResponse: Response | undefined;
+
     for (let attempt = 1; ; attempt++) {
+      // Pacing counts against the deadline like a retry wait; a caller's
+      // abort during it is passed through unchanged.
+      const paced = await policy.limiter.acquire(
+        request.signal,
+        Math.max(0, deadline - policy.now() - minAttemptMs),
+      );
+      if (!paced) {
+        if (retriedResponse !== undefined) return retriedResponse;
+        const nothingSent = attempt === 1 ? " Nothing was sent." : "";
+        throw new SevdeskError(
+          "timeout",
+          `The client-side rate limit (SEVDESK_RATE_LIMIT) would hold this request past the ${policy.deadlineMs} ms deadline.${nothingSent}`,
+        );
+      }
       const attemptTimeoutMs = Math.max(1, Math.min(policy.timeoutMs, deadline - policy.now()));
       const timeout = AbortSignal.timeout(attemptTimeoutMs);
       const signal = AbortSignal.any([request.signal, timeout]);
       const started = performance.now();
-      const canRetry = attempt < maxAttempts;
+      const canRetry = otherRetries < maxOtherRetries;
       let response: Response;
 
       try {
         // A redirect could lead to a path or host the scope never checked.
+        // A clone per attempt: a retried write must send its body again,
+        // and the first attempt would otherwise have consumed it.
         const raw = await untilAborted(
-          fetch(new Request(request, { signal, redirect: "error" })),
+          fetch(new Request(request.clone(), { signal, redirect: "error" })),
           signal,
         );
         response = await readFully(raw, signal, policy.maxResponseBytes);
@@ -361,7 +410,7 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
           );
         }
         const kind = timeout.aborted ? "timeout" : "network";
-        const delay = backoffDelay(attempt, policy.retry);
+        const delay = backoffDelay(otherRetries + 1, policy.retry);
         const deadlineHit = canRetry && !fitsDeadline(delay);
         if (canRetry && !deadlineHit) {
           policy.logger.warn("sevdesk request failed, retrying", {
@@ -371,6 +420,8 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
             kind,
             delayMs: delay,
           });
+          retriedResponse = undefined;
+          otherRetries++;
           await waitUnlessAborted(policy, delay, request.signal);
           continue;
         }
@@ -411,13 +462,26 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
         });
       }
 
-      if (!canRetry || !isRetryableStatus(response.status)) return response;
-
+      const rateLimited = response.status === 429;
       const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
+      // sevdesk throttles the token, not this call: hold back the other
+      // calls of the token as well, whether or not this one is retried.
+      // Capped like our own wait, so a huge header cannot lock the token.
+      if (rateLimited && retryAfter !== undefined) {
+        policy.limiter.pause(Math.min(retryAfter, policy.retry.maxDelayMs));
+      }
+
+      // Retries of other answers are bounded by maxRetries and GET only;
+      // a 429 by its own budget, for every method.
+      const retryStatus = rateLimited
+        ? rateLimitRetries < policy.retry.maxRateLimitRetries
+        : canRetry && isRetryableStatus(response.status);
+      if (!retryStatus) return response;
+
       // Retry-After 0 (or a date in the past) still gets a minimal pause.
       const delay =
         retryAfter === undefined
-          ? backoffDelay(attempt, policy.retry)
+          ? backoffDelay((rateLimited ? rateLimitRetries : otherRetries) + 1, policy.retry)
           : Math.max(policy.retry.baseDelayMs, retryAfter);
       // A server asking for a longer pause than we are willing to wait, or
       // one past the deadline, gets its error passed through as is.
@@ -430,6 +494,9 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
         status: response.status,
         delayMs: delay,
       });
+      retriedResponse = response;
+      if (rateLimited) rateLimitRetries++;
+      else otherRetries++;
       await waitUnlessAborted(policy, delay, request.signal);
     }
   };
@@ -531,6 +598,10 @@ export function createSevdeskClient(options: SevdeskClientOptions): SevdeskClien
     timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     deadlineMs: options.deadlineMs ?? DEFAULT_DEADLINE_MS,
     retry: { ...DEFAULT_RETRY, ...options.retry },
+    limiter: (options.rateLimiters ?? sharedRateLimiters).limiterFor(
+      options.token,
+      options.rateLimit ?? 0,
+    ),
     logger: options.logger ?? silentLogger,
     sleep: options.sleep ?? realSleep,
     now: options.now ?? Date.now,

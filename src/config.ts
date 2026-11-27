@@ -13,6 +13,17 @@ export type Mode = (typeof MODES)[number];
 export const DEFAULT_BASE_URL = "https://my.sevdesk.de/api/v1";
 export const DEFAULT_CONFIRM_TTL_SECONDS = 300;
 export const MIN_CONFIRM_SECRET_LENGTH = 32;
+/**
+ * Requests per second per API token. sevdesk documents no figure for its
+ * throttle, so this is a conservative guess; 429 answers are retried anyway.
+ */
+export const DEFAULT_RATE_LIMIT = 4;
+export const MAX_RATE_LIMIT = 100;
+/**
+ * Below this, one slot takes longer than a call may wait (60 s deadline),
+ * so every call after the first would time out.
+ */
+export const MIN_RATE_LIMIT = 0.05;
 
 export interface Config {
   sevdeskApiToken: string;
@@ -35,6 +46,12 @@ export interface Config {
   /** SEVDESK_CONFIRM_SECRET, HMAC key for confirmation tokens. */
   confirmSecret?: string;
   confirmTtlSeconds: number;
+  /**
+   * SEVDESK_RATE_LIMIT. Requests per second per API token; 0 switches
+   * pacing off. loadConfig always sets it; unset (hand-built configs in
+   * tests) also means off.
+   */
+  rateLimit?: number;
 }
 
 export class ConfigError extends Error {
@@ -174,6 +191,19 @@ const envSchema = z.object({
       .max(3600, { error: "must be between 30 and 3600" })
       .default(DEFAULT_CONFIRM_TTL_SECONDS),
   ),
+  // Plain decimal only: Number() would also take "0x10", "1e3" or "Infinity".
+  SEVDESK_RATE_LIMIT: z.preprocess(
+    blankToUndefined,
+    z
+      .string({ error: "must be a number of requests per second" })
+      .trim()
+      .regex(/^\d+(\.\d+)?$/, { error: "must be a number of requests per second, e.g. 4 or 0.5" })
+      .transform(Number)
+      .refine((value) => value === 0 || (value >= MIN_RATE_LIMIT && value <= MAX_RATE_LIMIT), {
+        error: `must be 0 (off) or between ${MIN_RATE_LIMIT} and ${MAX_RATE_LIMIT}`,
+      })
+      .default(DEFAULT_RATE_LIMIT),
+  ),
 });
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
@@ -195,6 +225,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     ...(data.SEVDESK_API_ALLOW && { apiAllow: data.SEVDESK_API_ALLOW }),
     ...(data.SEVDESK_CONFIRM_SECRET && { confirmSecret: data.SEVDESK_CONFIRM_SECRET }),
     confirmTtlSeconds: data.SEVDESK_CONFIRM_TTL_SECONDS,
+    rateLimit: data.SEVDESK_RATE_LIMIT,
   };
 }
 

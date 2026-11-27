@@ -46,7 +46,12 @@ export function createServer(config: Config, deps: ServerDeps): McpServer {
     deps.logger ?? createLogger({ level: config.logLevel, redact: [config.sevdeskApiToken] });
   const sevdesk =
     deps.sevdesk ??
-    createSevdeskClient({ baseUrl: config.baseUrl, token: config.sevdeskApiToken, logger });
+    createSevdeskClient({
+      baseUrl: config.baseUrl,
+      token: config.sevdeskApiToken,
+      rateLimit: config.rateLimit,
+      logger,
+    });
   // Everything past this point, tools included, sees the configuration
   // without the API token and the confirmation secret.
   const visible = configForTools(config);
