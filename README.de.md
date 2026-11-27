@@ -30,7 +30,8 @@ der Assistent sucht die Antwort in sevdesk. Zum Beispiel:
   Schreibmodus)
 
 > [!IMPORTANT]
-> **Inoffiziell.** Kein Angebot der sevdesk GmbH, nicht von ihr unterstützt oder geprüft.
+> **Inoffiziell.** Steht in keiner Verbindung zur sevdesk GmbH und wird von ihr weder
+> empfohlen noch unterstützt.
 > „sevdesk“ ist eine Marke der sevdesk GmbH.
 
 Technisch ist sevdesk-mcp ein [Model Context Protocol](https://modelcontextprotocol.io)
@@ -71,7 +72,7 @@ du dort zusätzlich die Erweiterung oder das Plugin installierst, hast du zwei S
 
 **Windows** (nicht getestet): Nimm die Erweiterung für Claude Desktop. Manuelle
 Einrichtung, Prüfsummen und alle anderen Wege: [docs/install.md](docs/install.md) (auf
-Englisch, wie alle Seiten unter `docs/`).
+Englisch, wie alle Seiten unter docs/).
 
 ## Dein API-Token
 
@@ -157,7 +158,8 @@ auch den Modus. Mehr Hilfe: [docs/install.md](docs/install.md#troubleshooting), 
   betreiben
 - [Konfiguration](docs/configuration.md): alle Umgebungsvariablen
 - [Entwicklung](docs/development.md): Build, Tests, Releases
-- [Datenschutz](PRIVACY.md): welche Daten wohin gehen, und was die Einrichtung schreibt
+- [Datenschutz](PRIVACY.md) (auf Englisch): welche Daten wohin gehen, und was die
+  Einrichtung schreibt
 
 ## Lizenz
 
