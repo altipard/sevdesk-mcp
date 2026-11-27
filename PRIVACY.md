@@ -26,8 +26,9 @@ server or the setup starts, and log output replaces it with a placeholder.
 
 ## Network connections
 
-The local server connects to the sevdesk API base URL and nowhere else. There is no
-telemetry, no analytics, no crash reporting and no update check.
+The server process connects to the sevdesk API base URL and nowhere else. There is no
+telemetry, no analytics, no crash reporting and no update check in it. How it is started
+can add connections of its own: see npx below.
 
 `sevdesk-mcp setup` additionally sends one read-only request to
 `https://my.sevdesk.de/api/v1/Tools/bookkeepingSystemVersion` to check that sevdesk accepts
@@ -76,7 +77,8 @@ writes, after you confirm:
   asks GitHub which release is the latest unless you set `SEVDESK_MCP_VERSION`.
 - **`npx -y @altipard/sevdesk-mcp`** downloads the package and its dependencies from your
   npm registry, by default `https://registry.npmjs.org`. Client entries that start the
-  server through npx do this whenever the package is not in the npx cache.
+  server through npx, including the Claude Code plugin, ask that registry for the current
+  version on every start, even when the package is already cached.
 - **The Claude Desktop extension** (`sevdesk-mcp.mcpb`) is downloaded by you from the
   GitHub releases and contains everything it needs.
 
