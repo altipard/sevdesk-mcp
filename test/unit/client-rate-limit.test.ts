@@ -337,12 +337,15 @@ describe("429 budget and the shared bucket", () => {
     expect(limiterWaits).toEqual([10_000]);
   });
 
-  it("does not hold the token after a 429 without Retry-After", async () => {
-    const client = setup({ rateLimit: 4, retry: { maxRateLimitRetries: 0 } });
+  it("holds back the token for the backoff after a 429 without Retry-After", async () => {
+    const client = setup({ rateLimit: 4, retry: { maxRateLimitRetries: 0, baseDelayMs: 400 } });
     answers = [json(429)];
     await captureError(client.call(client.api.GET("/Part")));
     await client.call(client.api.GET("/Part"));
-    expect(limiterWaits).toEqual([]);
+    // Jittered first backoff: 50 % to 100 % of baseDelayMs.
+    expect(limiterWaits).toHaveLength(1);
+    expect(limiterWaits[0]).toBeGreaterThanOrEqual(200);
+    expect(limiterWaits[0]).toBeLessThanOrEqual(400);
   });
 });
 
