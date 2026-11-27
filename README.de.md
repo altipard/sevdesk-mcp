@@ -131,7 +131,7 @@ KI-Programm und von dort an dessen Anbieter.
 - **Auswertungen:** die Listen-Auswertungen von sevdesk als PDF, und welche Steuersätze
   und Buchungskonten zusammenpassen.
 - **Prüfungen:** Umsatzsteuer- und Reverse-Charge-Prüfung (§13b), doppelte Belege, fehlende
-  monatliche Abos, Umsätze ohne Beleg, Summen pro Monat oder Kunde, wie lange offene Posten
+  monatliche Abos, Bankumsätze ohne Beleg, Summen pro Monat oder Kunde, wie lange offene Posten
   überfällig sind. Das sind Hinweise zum Nachprüfen, keine Steuerberatung.
 
 Alle Werkzeuge im Überblick: [docs/tools.md](docs/tools.md).
