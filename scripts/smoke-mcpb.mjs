@@ -2,8 +2,9 @@
 // client would: command, arguments and environment resolved from manifest.json
 // by getMcpConfigForManifest, the function of the mcpb package that clients use
 // (user_config defaults included). Checks initialize and tools/list for the
-// default and a cleared mode (read-only), for mode "full" (write tools, no
-// irreversible ones) and once with the irreversible tools enabled on top.
+// default and a cleared mode (read-only), for mode "write" (write tools, no
+// irreversible ones) and once for the manual full setup with the irreversible
+// tools enabled.
 // No network: the token is a dummy and the base URL points at a closed local
 // port.
 //
@@ -57,7 +58,7 @@ if (!existsSync(join(dir, manifest.server.entry_point))) {
   fail(`entry point ${manifest.server.entry_point} is not in the bundle`);
 }
 
-async function run(label, userConfig, extraEnv, expectedTools, { forbidden = [] } = {}) {
+async function run(label, userConfig, extraEnv, expectedTools, { forbidden = [], exact } = {}) {
   const config = await getMcpConfigForManifest({
     manifest,
     extensionPath: dir,
@@ -90,6 +91,9 @@ async function run(label, userConfig, extraEnv, expectedTools, { forbidden = [] 
   });
   const unexpected = names.filter((name) => forbidden.includes(name));
   if (unexpected.length > 0) fail(`${label}: lists ${unexpected.join(", ")}`);
+  if (exact && [...names].sort().join() !== [...exact].sort().join()) {
+    fail(`${label}: lists ${names.join(", ")}; expected ${exact.join(", ")}`);
+  }
   return names;
 }
 
@@ -104,19 +108,28 @@ const defaults = await run(
 );
 // A mode field the user cleared reaches the server as "", which means read.
 await run("mcpb cleared mode", { api_token: DUMMY_TOKEN, mode: "" }, {}, EXPECTED_TOOLS, READ_ONLY);
-// What the client starts in full mode: the irreversible tools stay off without
-// SEVDESK_ENABLE_TOOLS, which the manifest does not pass.
+// The extension offers read and write; the irreversible tools are never part of it.
 const reversible = WRITE_TOOLS.filter((name) => !X_TOOLS.includes(name));
-const full = await run(
-  "mcpb full",
-  { api_token: DUMMY_TOKEN, mode: "full" },
+const write = await run(
+  "mcpb write",
+  { api_token: DUMMY_TOKEN, mode: "write" },
   {},
   [...EXPECTED_TOOLS, ...reversible],
   { forbidden: X_TOOLS },
 );
-// Not a client setup: checks that the irreversible tools are in the bundle at all.
+// A user who types "full" anyway gets what write gives: without SEVDESK_ENABLE_TOOLS,
+// which the extension never passes, the irreversible tools stay off.
+await run(
+  "mcpb full typed into the mode field",
+  { api_token: DUMMY_TOKEN, mode: "full" },
+  {},
+  [...EXPECTED_TOOLS, ...reversible],
+  { forbidden: X_TOOLS, exact: write },
+);
+// The manual configuration the manifest points to, not something the extension sets:
+// checks that the irreversible tools are in the bundle at all.
 const all = await run(
-  "mcpb full with SEVDESK_ENABLE_TOOLS (not set by the client)",
+  "mcpb manual SEVDESK_MODE=full with SEVDESK_ENABLE_TOOLS",
   { api_token: DUMMY_TOKEN, mode: "full" },
   { SEVDESK_ENABLE_TOOLS: X_TOOLS.join(",") },
   [...EXPECTED_TOOLS, ...WRITE_TOOLS],
@@ -124,5 +137,5 @@ const all = await run(
 
 console.error(
   `smoke-mcpb: ${bundle} ${version} ok, ${defaults.length} tools by default, ` +
-    `${full.length} in full mode, ${all.length} with the irreversible tools enabled`,
+    `${write.length} in write mode, ${all.length} in a manual full setup`,
 );

@@ -45,7 +45,20 @@ describe("mcpb manifest", () => {
       required: true,
     });
     expect(manifest.user_config.mode).toMatchObject({ type: "string", default: "read" });
-    for (const mode of MODES) expect(manifest.user_config.mode.description).toContain(mode);
+  });
+
+  // Irreversible tools are unlocked deliberately in a manual configuration, not in the
+  // one-click extension: the mode field offers read and write only.
+  it("offers read and write as modes and points to the manual setup for the rest", () => {
+    const { description } = manifest.user_config.mode;
+    expect(description).toMatch(/^read \(default\) or write\./);
+    expect(MODES).toEqual(expect.arrayContaining(["read", "write"]));
+    for (const text of [description, manifest.long_description]) {
+      expect(text).toContain("SEVDESK_MODE=full");
+      expect(text).toContain("SEVDESK_ENABLE_TOOLS");
+      expect(text).not.toMatch(/\bread\b[^.]*\bwrite\b[^.]*\bor full\b/);
+    }
+    expect(manifest.server.mcp_config.env).not.toHaveProperty("SEVDESK_ENABLE_TOOLS");
   });
 
   // The tool set depends on the mode, so a static list would describe only one of them.
