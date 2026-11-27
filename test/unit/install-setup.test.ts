@@ -6,7 +6,9 @@ import {
   mkdirSync,
   mkdtempSync,
   openSync,
+  readdirSync,
   readFileSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -403,13 +405,22 @@ describe.skipIf(realClient)("install.sh setup", () => {
     expect(result.stdout + result.stderr + result.tty).not.toContain(SECRET_VALUE);
   });
 
-  it("replaces a custom Claude Code entry with --replace-entries and names a restore command without secrets", () => {
+  /** Files under dir (recursively) whose content contains needle, except the given paths. */
+  const filesContaining = (dir: string, needle: string, except: string[]): string[] =>
+    readdirSync(dir, { recursive: true, encoding: "utf8" })
+      .map((name) => join(dir, name))
+      .filter((path) => statSync(path).isFile() && !except.includes(path))
+      .filter((path) => readFileSync(path, "utf8").includes(needle));
+
+  it("replaces a custom Claude Code entry with --replace-entries, keeping a private copy and no secret elsewhere", () => {
     const env = prepare({ clis: ["claude"], claudeAddFails: true });
+    const ARG_SECRET = "argsecret0123456789";
     claudeJson(env, {
       command: "npx",
-      args: ["-y", "@altipard/sevdesk-mcp"],
+      args: ["-y", "@altipard/sevdesk-mcp", `--api-key=${ARG_SECRET}`],
       env: { SEVDESK_MODE: "full", SEVDESK_API_TOKEN: SECRET_VALUE },
     });
+    const original = readFileSync(join(env.home, ".claude.json"), "utf8");
     const result = runSetup(
       env,
       ["", ""],
@@ -420,10 +431,72 @@ describe.skipIf(realClient)("install.sh setup", () => {
     expect(result.stdout).toContain("is replaced, its env is not kept");
     expect(result.calls).toContain("claude mcp remove --scope user sevdesk\n");
     expect(result.stdout).toContain("Registering with Claude Code failed");
-    expect(result.stdout).toContain(
-      "claude mcp add --scope user sevdesk --env SEVDESK_MODE=full --env SEVDESK_API_TOKEN=<value> -- npx -y @altipard/sevdesk-mcp",
-    );
-    expect(result.stdout + result.stderr + result.tty).not.toContain(SECRET_VALUE);
+    const backups = readdirSync(env.home).filter((name) => name.startsWith(".claude.json.backup-"));
+    expect(backups).toHaveLength(1);
+    const backup = join(env.home, backups[0] ?? "");
+    expect(readFileSync(backup, "utf8")).toBe(original);
+    expect(statSync(backup).mode & 0o777).toBe(0o600);
+    expect(result.stdout).toContain(`is in\n  ${backup} (mcpServers.sevdesk)`);
+    for (const secret of [SECRET_VALUE, ARG_SECRET]) {
+      expect(result.stdout + result.stderr + result.tty).not.toContain(secret);
+      expect(filesContaining(env.dir, secret, [join(env.home, ".claude.json"), backup])).toEqual(
+        [],
+      );
+    }
+  });
+
+  it("keeps a remote Claude Code entry and shows nothing of its URL or headers", () => {
+    const env = prepare({ clis: ["claude"] });
+    const URL_SECRET = "urlsecret0123456789";
+    claudeJson(env, {
+      type: "http",
+      url: `https://mcp.example.com/mcp?token=${URL_SECRET}`,
+      headers: { Authorization: `Bearer ${SECRET_VALUE}` },
+    });
+    const result = runSetup(env, ["", ""], { clis: ["claude"] });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("has its own command or env");
+    expect(result.calls).not.toMatch(/^claude mcp (remove|add)/m);
+    for (const secret of [SECRET_VALUE, URL_SECRET]) {
+      expect(result.stdout + result.stderr + result.tty).not.toContain(secret);
+      expect(filesContaining(env.dir, secret, [join(env.home, ".claude.json")])).toEqual([]);
+    }
+  });
+
+  it("leaves a remote JSON entry unchanged", () => {
+    const env = prepare();
+    mkdirSync(join(env.home, ".cursor"));
+    const file = join(env.home, ".cursor/mcp.json");
+    const original = `${JSON.stringify({
+      mcpServers: {
+        sevdesk: {
+          type: "http",
+          url: "https://mcp.example.com/mcp",
+          headers: { Authorization: `Bearer ${SECRET_VALUE}` },
+        },
+      },
+    })}\n`;
+    writeFileSync(file, original);
+    const result = runSetup(env, ["", ""]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('Cursor: the remote (URL) "sevdesk" entry stays unchanged');
+    expect(result.stdout).toContain("is a remote (URL) entry; not changing it.");
+    expect(readFileSync(file, "utf8")).toBe(original);
+    expect(readdirSync(join(env.home, ".cursor"))).toEqual(["mcp.json"]);
+    expect(result.stdout + result.stderr).not.toContain(SECRET_VALUE);
+  });
+
+  it.skipIf(!python3)("treats env: null like no env with python3", () => {
+    const env = prepare({ noJq: true });
+    mkdirSync(join(env.home, ".cursor"));
+    const file = join(env.home, ".cursor/mcp.json");
+    writeFileSync(file, JSON.stringify({ mcpServers: { sevdesk: { command: "npx", env: null } } }));
+    const result = runSetup(env, ["", ""], { noJq: true });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(readFileSync(file, "utf8")).mcpServers.sevdesk).toEqual({
+      command: join(env.home, ".local/bin/sevdesk-mcp"),
+      env: { SEVDESK_MODE: "read" },
+    });
   });
 
   it("replaces its own Claude Code entry without asking", () => {

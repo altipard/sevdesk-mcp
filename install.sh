@@ -606,6 +606,50 @@ find_merger() {
     merger=python3
 }
 
+# entry_kind FILE KEY prints what FILE has under KEY.sevdesk: none, ours (this binary, env at
+# most SEVDESK_MODE), stdio (another local command, args or env), remote (url or a type other
+# than stdio) or other (not an object). Only this word leaves the merger, never a value from the
+# file. Fails without a merger or on invalid JSON.
+entry_kind() {
+    find_merger || return 1
+    case "$merger" in
+        jq)
+            jq -r --arg key "$2" --arg name "$SERVER_NAME" --arg cmd "$BIN_PATH" '
+                (.[$key] // {})[$name] as $e
+                | if $e == null then "none"
+                  elif ($e | type) != "object" then "other"
+                  elif ($e.url != null) or (($e.type // "stdio") != "stdio") then "remote"
+                  elif ($e.command == $cmd) and (($e.args // []) == [])
+                      and ((($e.env // {}) | if type == "object" then keys else ["?"] end)
+                          - ["SEVDESK_MODE"] == [])
+                  then "ours"
+                  else "stdio" end
+            ' "$1" 2>/dev/null
+            ;;
+        python3)
+            python3 -I -c '
+import json, sys
+path, key, name, cmd = sys.argv[1:]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+e = (data.get(key) or {}).get(name)
+env = (e.get("env") or {}) if isinstance(e, dict) else {}
+if e is None:
+    print("none")
+elif not isinstance(e, dict):
+    print("other")
+elif e.get("url") is not None or e.get("type", "stdio") != "stdio":
+    print("remote")
+elif (e.get("command") == cmd and not e.get("args") and isinstance(env, dict)
+        and set(env) <= {"SEVDESK_MODE"}):
+    print("ours")
+else:
+    print("stdio")
+' "$1" "$2" "$SERVER_NAME" "$BIN_PATH" 2>/dev/null
+            ;;
+    esac
+}
+
 # merge_json FILE KEY: points KEY.sevdesk at the binary and sets SEVDESK_MODE in its env; other
 # env variables (a token reference, SEVDESK_ENABLE_TOOLS, ...) and everything else stay. Needs
 # jq or python3; the original is backed up first and only replaced by a complete, valid result.
@@ -614,6 +658,12 @@ merge_json() {
     key=$2
     if ! find_merger; then
         say "Neither jq nor a working python3 found, so $file is not changed automatically."
+        print_snippet "$file" "$key" ''
+        return 0
+    fi
+    # A remote entry (url, type other than stdio) would turn into a broken hybrid.
+    if [ -s "$file" ] && [ "$(entry_kind "$file" "$key")" = remote ]; then
+        say "The \"$SERVER_NAME\" entry in $file is a remote (URL) entry; not changing it."
         print_snippet "$file" "$key" ''
         return 0
     fi
@@ -642,7 +692,7 @@ merge_json() {
                 | .[$key] = ((.[$key] // {}) | if type == "object" then . else error("not an object") end)
                 | .[$key][$name] = ((.[$key][$name] // {})
                     | if type == "object" then . else error("not an object") end
-                    | del(.args, .url)
+                    | del(.args)
                     | .command = $cmd
                     | .env = ((.env // {}) | if type == "object" then . else error("not an object") end)
                     | .env.SEVDESK_MODE = $mode)
@@ -663,11 +713,11 @@ entry = servers.get(name, {})
 if not isinstance(entry, dict):
     sys.exit(1)
 entry.pop("args", None)
-entry.pop("url", None)
 entry["command"] = cmd
-env = entry.setdefault("env", {})
+env = entry.get("env") or {}
 if not isinstance(env, dict):
     sys.exit(1)
+entry["env"] = env
 env["SEVDESK_MODE"] = mode
 servers[name] = entry
 with open(out, "w", encoding="utf-8") as f:
@@ -755,88 +805,19 @@ client_names() {
 #   none     no such entry
 #   ours     the command is this binary and the env holds at most SEVDESK_MODE
 #   custom   anything else (another command, args, a URL, more env); kept unless --replace-entries
-#   unknown  the file cannot be read (no jq/python3, invalid JSON); treated like custom
-# and CC_RESTORE, a command that recreates the entry with env values replaced by placeholders
-# (SEVDESK_MODE excepted): they may hold a token and are never printed.
+#   unknown  the file cannot be inspected (no jq/python3, invalid JSON); treated like custom
 inspect_claude_code() {
     CC_ENTRY=none
-    CC_RESTORE=''
     cc_file="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
     [ -f "$cc_file" ] || return 0
-    if ! find_merger; then
-        cc_unreadable
-        return 0
-    fi
-    cc_out="$tmp/claude-code-entry"
-    status=0
-    case "$merger" in
-        jq)
-            jq -r --arg name "$SERVER_NAME" --arg cmd "$BIN_PATH" '
-                (.mcpServers // {})[$name] as $e
-                | if $e == null then "none"
-                  elif ($e | type) != "object" then "custom"
-                  else
-                    (($e.env // {}) | if type == "object" then . else {} end) as $env
-                    | (if ($e.command == $cmd) and (($e.args // []) == []) and ($e.url == null)
-                          and ((($e.type // "stdio") == "stdio"))
-                          and (($env | keys) - ["SEVDESK_MODE"] == [])
-                        then "ours" else "custom" end),
-                      ([ "claude mcp add --scope user", $name ]
-                        + ($env | to_entries | map("--env " + .key + "="
-                            + (if .key == "SEVDESK_MODE" then (.value | tostring) else "<value>" end)))
-                        + (if $e.url != null then ["--transport", ($e.type // "http"), ($e.url | tostring)]
-                           else ["--", ($e.command // "" | tostring)] + (($e.args // []) | map(tostring)) end)
-                      | join(" "))
-                  end
-            ' "$cc_file" >"$cc_out" 2>/dev/null || status=$?
-            ;;
-        python3)
-            python3 -I -c '
-import json, sys
-path, name, cmd = sys.argv[1:]
-with open(path, encoding="utf-8") as f:
-    data = json.load(f)
-entry = (data.get("mcpServers") or {}).get(name)
-if entry is None:
-    print("none")
-    sys.exit(0)
-if not isinstance(entry, dict):
-    print("custom")
-    sys.exit(0)
-env = entry.get("env") or {}
-if not isinstance(env, dict):
-    env = {}
-ours = (entry.get("command") == cmd and not entry.get("args") and entry.get("url") is None
-        and entry.get("type", "stdio") == "stdio" and set(env) <= {"SEVDESK_MODE"})
-print("ours" if ours else "custom")
-parts = ["claude mcp add --scope user", name]
-parts += ["--env %s=%s" % (k, v if k == "SEVDESK_MODE" else "<value>") for k, v in env.items()]
-if entry.get("url") is not None:
-    parts += ["--transport", str(entry.get("type", "http")), str(entry["url"])]
-else:
-    parts += ["--", str(entry.get("command", ""))] + [str(a) for a in entry.get("args") or []]
-print(" ".join(parts))
-' "$cc_file" "$SERVER_NAME" "$BIN_PATH" >"$cc_out" 2>/dev/null || status=$?
-            ;;
-    esac
-    if [ "$status" -ne 0 ]; then
-        cc_unreadable
-        return 0
-    fi
-    { IFS= read -r CC_ENTRY && IFS= read -r CC_RESTORE; } <"$cc_out" || true
-    case "$CC_ENTRY" in
-        none | ours | custom) ;;
-        *) CC_ENTRY=unknown ;;
-    esac
-}
-
-# The file cannot be inspected: ask Claude Code whether the name exists at all. Its output is
-# discarded, as it may show env values.
-cc_unreadable() {
-    if claude mcp get "$SERVER_NAME" >/dev/null 2>&1; then
+    if kind=$(entry_kind "$cc_file" mcpServers); then
+        case "$kind" in
+            none | ours) CC_ENTRY=$kind ;;
+            *) CC_ENTRY=custom ;;
+        esac
+    elif grep -q "\"$SERVER_NAME\"" "$cc_file" 2>/dev/null; then
+        # The name appears somewhere: there may be an entry, so leave it alone.
         CC_ENTRY=unknown
-    else
-        CC_ENTRY=none
     fi
 }
 
@@ -849,19 +830,27 @@ register_claude_code() {
             fi
             ;;
     esac
-    # `claude mcp add` refuses an existing name: replace the user-scope entry.
+    # `claude mcp add` refuses an existing name: replace the user-scope entry, after a private
+    # copy of the file that holds it (it may contain tokens, hence mode 600).
+    cc_backup=''
     if [ "$CC_ENTRY" != none ]; then
+        cc_backup="$cc_file.backup-$(date +%Y%m%d%H%M%S)"
+        if ! (umask 077 && cp "$cc_file" "$cc_backup"); then
+            say "Cannot back up $cc_file, so the existing Claude Code entry is kept."
+            return 0
+        fi
         claude mcp remove --scope user "$SERVER_NAME" >/dev/null 2>&1 || true
     fi
     if claude mcp add --scope user "$SERVER_NAME" --env "SEVDESK_MODE=$MODE" -- "$BIN_PATH" >/dev/null 2>&1; then
         say "Registered with Claude Code (user scope)."
+        if [ -n "$cc_backup" ]; then say "${DIM}previous entry: $cc_backup${RST}"; fi
         return 0
     fi
     say "Registering with Claude Code failed. Run it yourself:"
     say "  claude mcp add --scope user $SERVER_NAME --env SEVDESK_MODE=$MODE -- \"$BIN_PATH\""
-    if [ "$CC_ENTRY" != none ] && [ -n "$CC_RESTORE" ]; then
-        say "The previous entry was removed. To restore it, fill in the <value> placeholders:"
-        say "  $CC_RESTORE"
+    if [ -n "$cc_backup" ]; then
+        say "The previous \"$SERVER_NAME\" entry was removed; $cc_file as it was before is in"
+        say "$cc_backup (mcpServers.$SERVER_NAME)."
     fi
 }
 
@@ -912,8 +901,18 @@ print_plan() {
     fi
     if [ -n "$CLIENTS" ]; then
         say "  clients: $(client_names "$CLIENTS")"
-        say "           ${DIM}an existing \"$SERVER_NAME\" entry is updated (command, SEVDESK_MODE; other${RST}"
-        say "           ${DIM}env kept); JSON files are backed up first${RST}"
+        say "           ${DIM}an existing \"$SERVER_NAME\" entry is updated (command and SEVDESK_MODE set,${RST}"
+        say "           ${DIM}args removed, other env kept); files are backed up first${RST}"
+        for key in $CLIENTS; do
+            case "$key" in
+                desktop) jfile=$(desktop_config) ;;
+                cursor) jfile="$HOME/.cursor/mcp.json" ;;
+                *) continue ;;
+            esac
+            if [ -s "$jfile" ] && [ "$(entry_kind "$jfile" mcpServers)" = remote ]; then
+                say "           $(client_label "$key"): the remote (URL) \"$SERVER_NAME\" entry stays unchanged"
+            fi
+        done
         case " $CLIENTS " in
             *" code "*)
                 case "$CC_ENTRY:$REPLACE_ENTRIES" in
@@ -921,10 +920,11 @@ print_plan() {
                         say "           Claude Code: the existing \"$SERVER_NAME\" entry has its own command or env"
                         say "           and stays unchanged (--replace-entries replaces it)" ;;
                     unknown:0)
-                        say "           Claude Code: an existing \"$SERVER_NAME\" entry could not be inspected"
-                        say "           and stays unchanged (--replace-entries replaces it)" ;;
+                        say "           Claude Code: a possible \"$SERVER_NAME\" entry could not be read (invalid"
+                        say "           JSON, or neither jq nor python3) and stays unchanged (--replace-entries replaces it)" ;;
                     custom:1 | unknown:1)
-                        say "           Claude Code: the existing \"$SERVER_NAME\" entry is replaced, its env is not kept" ;;
+                        say "           Claude Code: the existing \"$SERVER_NAME\" entry is replaced, its env is not kept;"
+                        say "           ~/.claude.json is copied first" ;;
                 esac
                 ;;
         esac
