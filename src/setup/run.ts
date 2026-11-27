@@ -466,6 +466,9 @@ async function planToken(
     };
   }
   if (current.status === "found" && !args.replaceToken) return { action: "keep" };
+  // With --replace-token, a token already stored stays whenever no new one is given.
+  const fallback = (reason: string): TokenPlan =>
+    current.status === "found" ? { action: "keep" } : { action: "none", reason };
 
   const verify = async (token: string): Promise<"accepted" | "rejected" | string> => {
     if (!args.verify) return "not checked (--no-verify)";
@@ -503,12 +506,10 @@ async function planToken(
     };
   }
   if (!ui) {
-    return current.status === "found"
-      ? { action: "none", reason: "--replace-token needs --token-stdin without prompts" }
-      : {
-          action: "none",
-          reason: "no token given; pass --token-stdin or run the setup in a terminal",
-        };
+    if (current.status === "found") {
+      say.warn("--replace-token needs --token-stdin without prompts; the stored token stays.");
+    }
+    return fallback("no token given; pass --token-stdin or run the setup in a terminal");
   }
   for (let attempt = 1; attempt <= 3; attempt++) {
     const input = answer(
@@ -518,7 +519,7 @@ async function planToken(
       }),
     );
     const token = normalizeToken(input);
-    if (token === "") return { action: "none", reason: "no token entered" };
+    if (token === "") return fallback("no token entered");
     const checked = await verify(token);
     if (checked === "rejected") {
       say.warn("sevdesk rejected this token (HTTP 401). Copy it again from sevdesk.");
@@ -531,5 +532,5 @@ async function planToken(
       checked: checked === "accepted" ? "accepted by sevdesk" : checked,
     };
   }
-  return { action: "none", reason: "sevdesk rejected three tokens" };
+  return fallback("sevdesk rejected three tokens");
 }

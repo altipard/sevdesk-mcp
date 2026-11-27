@@ -1,5 +1,12 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -179,5 +186,36 @@ describe("install.sh print_next_steps", () => {
       "security add-generic-password -U -s sevdesk-mcp -a api-token -w",
     );
     expect(result.stdout).toContain(`point your MCP client at ${env.bin}`);
+  });
+});
+
+describe("install.sh terminal_device", () => {
+  /** Runs terminal_device with TTY_IN=/dev/tty and a stub ps that prints `tty`. */
+  function device(tty: string) {
+    const env = prepare();
+    const stubs = join(env.dir, "stubs");
+    mkdirSync(stubs);
+    writeFileSync(join(stubs, "ps"), `#!/bin/sh\nprintf '%s\\n' '${tty}'\n`);
+    chmodSync(join(stubs, "ps"), 0o755);
+    return run(env, 'TTY_IN=/dev/tty; terminal_device; echo "dev=$TTY_DEV"', {
+      PATH: `${stubs}:/usr/bin:/bin`,
+    }).stdout;
+  }
+
+  it("keeps a test terminal file as it is", () => {
+    const env = prepare();
+    expect(run(env, 'terminal_device; echo "dev=$TTY_DEV"').stdout).toContain(`dev=${env.ttyIn}`);
+  });
+
+  it.each(["??", "?", "", "ttys0;rm", "../etc/passwd", "no-such-tty-device"])(
+    "falls back to /dev/tty for %j",
+    (tty) => {
+      expect(device(tty)).toContain("dev=/dev/tty\n");
+    },
+  );
+
+  it("takes the device behind the terminal when it exists", () => {
+    // /dev/null is a character device anyone may read and write.
+    expect(device("null")).toContain("dev=/dev/null\n");
   });
 });

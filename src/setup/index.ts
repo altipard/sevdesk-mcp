@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { readKeychainToken, storeKeychainToken } from "../keychain.js";
 import { VERSION } from "../version.js";
 import { detectAgents, detectLaunch, loadAddMcp } from "./agents.js";
+import { HELP } from "./args.js";
 import { clackPrompter } from "./prompter.js";
 import { runSetup, type SetupDeps } from "./run.js";
 
@@ -53,6 +54,12 @@ async function holdInterrupts<T>(
 
 /** `sevdesk-mcp setup [options]`; resolves with the exit code. */
 export async function main(argv: readonly string[], moduleUrl: string): Promise<number> {
+  // The help needs nothing else; install.sh probes for the setup command with it in an empty
+  // environment.
+  if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) {
+    process.stdout.write(`${HELP}`);
+    return 0;
+  }
   const addMcp = await loadAddMcp();
   const home = homedir();
   const deps: SetupDeps = {

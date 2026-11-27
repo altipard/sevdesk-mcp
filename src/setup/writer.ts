@@ -211,6 +211,9 @@ function ownSettings(
   }) as Record<string, unknown>;
   for (const [key, value] of Object.entries(entry)) {
     if (CORE_KEYS.has(key)) continue;
+    // `claude mcp add` and `code --add-mcp` write type "stdio"; it only restates the default.
+    if ((key === "type" || key === "transport") && (value === "stdio" || value === "local"))
+      continue;
     if (!(key in emitted) || !isDeepStrictEqual(value, emitted[key])) own.push(key);
   }
   const rawEnv = entry.env ?? entry.envs ?? entry.environment;
@@ -252,6 +255,8 @@ export interface WriteOptions {
   now?: () => Date;
   /** Called after staging, before the final check; tests change the file here. */
   beforeCommit?: (path: string) => Promise<void> | void;
+  /** Replaced in tests to make the final rename fail. */
+  rename?: (from: string, to: string) => Promise<void>;
 }
 
 /**
@@ -353,11 +358,11 @@ async function writeOnce(
     if (current !== original) return "changed";
     const saved = original === null ? undefined : await backup(path, original, now());
     try {
-      await rename(stage, path);
+      await (options.rename ?? rename)(stage, path);
       staged = false;
     } catch {
       // The original is untouched; its copy is clutter.
-      if (saved) await rm(saved, { force: true });
+      if (saved) await rm(saved, { force: true }).catch(() => {});
       return fail("replacing the configuration failed; the original is unchanged");
     }
     return { status: "ok", path, action: plan.action, ...(saved ? { backup: saved } : {}) };
@@ -365,6 +370,7 @@ async function writeOnce(
     const code = (error as NodeJS.ErrnoException).code;
     return fail(`writing failed${code ? ` (${code})` : ""}; the original is unchanged`);
   } finally {
-    if (staged) await rm(stage, { force: true });
+    // Cleanup must not replace the outcome.
+    if (staged) await rm(stage, { force: true }).catch(() => {});
   }
 }

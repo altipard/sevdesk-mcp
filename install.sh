@@ -406,6 +406,19 @@ supports_setup() {
     grep -q '^Usage: sevdesk-mcp setup' "$out"
 }
 
+# Sets TTY_DEV to the terminal's own device (e.g. /dev/ttys003, /dev/pts/1), else TTY_IN. The
+# binary is compiled with bun, which cannot read /dev/tty itself on macOS (kqueue refuses that
+# device), so the setup gets the device behind it.
+terminal_device() {
+    TTY_DEV=$TTY_IN
+    [ "$TTY_IN" = /dev/tty ] || return 0
+    dev=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ') || dev=''
+    case "$dev" in
+        '' | *'?'* | *[!A-Za-z0-9/]* | */../* | ../*) return 0 ;;
+    esac
+    if [ -c "/dev/$dev" ] && [ -r "/dev/$dev" ] && [ -w "/dev/$dev" ]; then TTY_DEV="/dev/$dev"; fi
+}
+
 # Runs `sevdesk-mcp setup` on the terminal with the options given to the installer. The setup
 # asks for everything else (agents, scope, mode, token) and does the backups, the keychain and
 # the client configurations itself. Its exit status never fails the installation.
@@ -418,9 +431,12 @@ run_setup() {
     if [ "$VERIFY_TOKEN" = 0 ]; then set -- "$@" --no-verify; fi
     # Ctrl-C belongs to the setup now: it finishes or cancels cleanly, then the installer
     # continues here instead of exiting under it.
+    terminal_device
+    out_dev=$TTY_OUT
+    if [ "$TTY_DEV" != "$TTY_IN" ]; then out_dev=$TTY_DEV; fi
     trap ':' INT
     status=0
-    "$BIN_PATH" "$@" <"$TTY_IN" >"$TTY_OUT" || status=$?
+    "$BIN_PATH" "$@" <"$TTY_DEV" >"$out_dev" || status=$?
     trap 'exit 130' INT
     case "$status" in
         0) ;;

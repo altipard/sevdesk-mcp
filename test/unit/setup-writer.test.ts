@@ -16,6 +16,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   type AddMcp,
   agentTypes,
+  classifyEntry,
   configPath,
   type Launch,
   readServers,
@@ -57,6 +58,7 @@ const TOKEN = "0123456789abcdef0123456789abcdef";
 
 const cursorFile = join(home, ".cursor", "mcp.json");
 const desktopFile = () => configPath(addMcp, "claude-desktop", "global", project);
+const claudeFile = () => configPath(addMcp, "claude-code", "global", project);
 
 function request(overrides: Partial<EntryRequest> = {}): EntryRequest {
   return {
@@ -342,4 +344,67 @@ describe("writeEntry", () => {
     const read = await readServers(addMcp, "cursor", cursorFile, "global", project);
     expect(read.names).toEqual(["sevdesk"]);
   });
+
+  it("updates entries the shell installer wrote (type stdio) without asking", async () => {
+    write(claudeFile(), {
+      mcpServers: {
+        sevdesk: { type: "stdio", command: BIN, args: [], env: { SEVDESK_MODE: "read" } },
+      },
+    });
+    expect(await planEntry(addMcp, request({ agent: "claude-code" }))).toMatchObject({
+      action: "unchanged",
+    });
+    expect(
+      await writeEntry(addMcp, request({ agent: "claude-code", mode: "write" })),
+    ).toMatchObject({
+      status: "ok",
+      action: "update",
+    });
+    expect(json(claudeFile()).mcpServers.sevdesk.env).toEqual({ SEVDESK_MODE: "write" });
+    // VS Code, as `code --add-mcp` wrote it.
+    const vscodeFile = configPath(addMcp, "vscode", "global", project);
+    write(vscodeFile, {
+      servers: { sevdesk: { type: "stdio", command: BIN, env: { SEVDESK_MODE: "read" } } },
+    });
+    expect(await planEntry(addMcp, request({ agent: "vscode" }))).toMatchObject({
+      action: "unchanged",
+    });
+  });
+
+  it("leaves the original and no backup when the final rename fails", async () => {
+    const original = JSON.stringify({ mcpServers: { other: { command: "o" } } });
+    write(cursorFile, original);
+    const outcome = await writeEntry(addMcp, request(), {
+      rename: async () => {
+        throw Object.assign(new Error("rename failed"), { code: "EXDEV" });
+      },
+    });
+    expect(outcome).toMatchObject({
+      status: "error",
+      reason: "replacing the configuration failed; the original is unchanged",
+    });
+    expect(readFileSync(cursorFile, "utf8")).toBe(original);
+    expect(backups(cursorFile)).toEqual([]);
+    expect(leftovers(cursorFile)).toEqual([]);
+  });
+});
+
+describe("writeEntry for every agent", () => {
+  it.each(agentTypes(addMcp))(
+    "%s: adds, then finds it set up, then updates the mode keeping other env",
+    async (agent) => {
+      const first = await writeEntry(addMcp, request({ agent }));
+      expect(first).toMatchObject({ status: "ok", action: "add" });
+      expect(await planEntry(addMcp, request({ agent }))).toMatchObject({ action: "unchanged" });
+      const path = configPath(addMcp, agent, "global", project);
+      const update = await writeEntry(addMcp, request({ agent, mode: "write" }));
+      expect(update).toMatchObject({ status: "ok", action: "update", path });
+      const read = await readServers(addMcp, agent, path, "global", project);
+      expect(classifyEntry(read.entry, LAUNCH)).toEqual({
+        kind: "ours",
+        env: { SEVDESK_MODE: "write" },
+      });
+      expect(leftovers(path)).toEqual([]);
+    },
+  );
 });

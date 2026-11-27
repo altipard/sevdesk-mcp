@@ -428,6 +428,19 @@ describe("runSetup with prompts", () => {
       ],
     });
     expect(replaced.stored).toEqual([OTHER]);
+    // Enter instead of a new token keeps the stored one.
+    const skipped = await run(["--replace-token"], {
+      keychain: { status: "found", token: TOKEN },
+      steps: [
+        { multiselect: ["claude-desktop"] },
+        { select: "read" },
+        { password: "" },
+        { confirm: true },
+      ],
+    });
+    expect(skipped.stored).toEqual([]);
+    expect(skipped.output).toContain("token: keep the one in the keychain");
+    expect(skipped.output).not.toContain("No token stored");
   });
 
   it("names the missing keychain tool on Linux and asks for no token", async () => {
@@ -557,24 +570,28 @@ describe("runSetup with prompts", () => {
     expect(json(desktopFile()).mcpServers.sevdesk.command).toBe(BIN);
   });
 
-  it("reports a failed write, leaves that file as it was and exits 1", async () => {
-    mkdirSync(dirname(cursorFile), { recursive: true });
-    writeFileSync(cursorFile, '{"mcpServers":{}}');
-    // No new file can be created next to it, so the staged copy fails.
-    chmodSync(dirname(cursorFile), 0o500);
-    try {
-      const result = await run(["--yes"], { interactive: false });
-      expect(result.code).toBe(EXIT.failed);
-      expect(result.output).toMatch(
-        /error: Cursor: writing failed \(EACCES\); the original is unchanged/,
-      );
-      expect(result.output).toContain('"sevdesk"');
-      expect(readFileSync(cursorFile, "utf8")).toBe('{"mcpServers":{}}');
-      expect(json(desktopFile()).mcpServers.sevdesk.command).toBe(BIN);
-    } finally {
-      chmodSync(dirname(cursorFile), 0o700);
-    }
-  });
+  // Root may write into a read-only directory.
+  it.skipIf(process.getuid?.() === 0)(
+    "reports a failed write, leaves that file as it was and exits 1",
+    async () => {
+      mkdirSync(dirname(cursorFile), { recursive: true });
+      writeFileSync(cursorFile, '{"mcpServers":{}}');
+      // No new file can be created next to it, so the staged copy fails.
+      chmodSync(dirname(cursorFile), 0o500);
+      try {
+        const result = await run(["--yes"], { interactive: false });
+        expect(result.code).toBe(EXIT.failed);
+        expect(result.output).toMatch(
+          /error: Cursor: writing failed \(EACCES\); the original is unchanged/,
+        );
+        expect(result.output).toContain('"sevdesk"');
+        expect(readFileSync(cursorFile, "utf8")).toBe('{"mcpServers":{}}');
+        expect(json(desktopFile()).mcpServers.sevdesk.command).toBe(BIN);
+      } finally {
+        chmodSync(dirname(cursorFile), 0o700);
+      }
+    },
+  );
 
   it("cancels with nothing changed when Ctrl-C comes while the token is checked", async () => {
     const before = tree();
