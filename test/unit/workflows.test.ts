@@ -70,11 +70,46 @@ describe("release workflow", () => {
     expect(mcpb).toMatch(/name: sevdesk-mcp-mcpb\n\s+path: out\/mcpb\/sevdesk-mcp\.mcpb\n/);
   });
 
-  it("attests the extension with the binaries", () => {
+  it("attests the archives together with the binaries and the extension", () => {
     const attest = job("attest");
     expect(attest).toMatch(/needs: \[[^\]]*\bmcpb\b[^\]]*\]/);
+    expect(attest).toMatch(/needs: \[[^\]]*\barchives\b[^\]]*\]/);
+    // The subject-path glob also covers the sevdesk-mcp-*<os>-<arch>.tar.xz artifacts.
     expect(attest).toMatch(
       /subject-path: \|\n\s+assets\/sevdesk-mcp-\*\n\s+assets\/sevdesk-mcp\.mcpb\n/,
+    );
+  });
+
+  // The archives are what install.sh prefers: packed with GNU tar on Linux (macOS bsdtar
+  // would add xattrs and ._ entries), with fixed metadata for a reproducible build, and
+  // verified complete before they are uploaded.
+  it("packs every target into a reproducible tar.xz and verifies it", () => {
+    const archives = job("archives");
+    expect(archives).toContain("needs: [version, binaries]");
+    expect(archives).toMatch(/^ {4}if: needs\.version\.outputs\.version != ''$/m);
+    expect(archives).toContain("runs-on: ubuntu-24.04");
+    expect(archives).toMatch(/target: \[darwin-arm64, darwin-x64, linux-x64, linux-arm64\]/);
+    // download-artifact drops the executable bit; the member must be 0755.
+    expect(archives).toContain('chmod 755 "in/sevdesk-mcp-$TARGET"');
+    expect(archives).toContain("--format=gnu");
+    expect(archives).toContain("--owner=0");
+    expect(archives).toContain("--group=0");
+    expect(archives).toContain("--numeric-owner");
+    expect(archives).toContain("--mtime='@0'");
+    expect(archives).toContain("--mode=0755");
+    expect(archives).toMatch(/-cJf "out\/sevdesk-mcp-\$TARGET\.tar\.xz" sevdesk-mcp/);
+    // Complete before upload: one member, byte-identical to the binary, fixed mode and mtime.
+    const at = (text: string) => archives.indexOf(text);
+    const listing = at('tar -tJf "out/sevdesk-mcp-$TARGET.tar.xz"');
+    const extract = at('tar -xJf "out/sevdesk-mcp-$TARGET.tar.xz" -C "$verify"');
+    const compare = at('cmp "$verify/sevdesk-mcp" "in/sevdesk-mcp-$TARGET"');
+    expect(listing).toBeGreaterThan(-1);
+    expect(extract).toBeGreaterThan(listing);
+    expect(compare).toBeGreaterThan(extract);
+    expect(archives).toContain("expected 755 and 0");
+    // The artifact name matches the sevdesk-mcp-* pattern of attest and the release download.
+    expect(archives).toMatch(
+      /name: sevdesk-mcp-\$\{\{ matrix\.target \}\}\.tar\.xz\n\s+path: out\/sevdesk-mcp-\$\{\{ matrix\.target \}\}\.tar\.xz\n/,
     );
   });
 
@@ -87,6 +122,10 @@ describe("release workflow", () => {
       "sevdesk-mcp-darwin-x64",
       "sevdesk-mcp-linux-x64",
       "sevdesk-mcp-linux-arm64",
+      "sevdesk-mcp-darwin-arm64.tar.xz",
+      "sevdesk-mcp-darwin-x64.tar.xz",
+      "sevdesk-mcp-linux-x64.tar.xz",
+      "sevdesk-mcp-linux-arm64.tar.xz",
       "sevdesk-mcp.mcpb",
     ]);
     expect(step.match(/sha256sum "\$\{files\[@\]\}" > SHA256SUMS/g)).toHaveLength(2);

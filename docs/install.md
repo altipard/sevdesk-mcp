@@ -275,9 +275,12 @@ For macOS and Linux with glibc (x64 and arm64), no Node.js needed:
 curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.sh | sh
 ```
 
-It downloads the release binary for your platform, verifies it against the release's
-`SHA256SUMS` (nothing is installed on a mismatch) and installs it to `~/.local/bin`. With a
-terminal it then starts the [guided setup](#guided-setup) and passes `--mode`,
+It downloads the release for your platform, verifies it against the release's
+`SHA256SUMS` (nothing is installed on a mismatch, or if the archive holds anything but the
+binary) and installs it to `~/.local/bin`. It prefers the `sevdesk-mcp-<os>-<arch>.tar.xz`
+archive when the release lists one and the machine unpacks xz - a quarter of the bytes -
+and otherwise takes the single binary, so older releases work unchanged. With a terminal it
+then starts the [guided setup](#guided-setup) and passes `--mode`,
 `--replace-token`, `--replace-entries` and `--no-verify` on to it. If the setup fails or
 you cancel it, the binary stays installed; run `sevdesk-mcp setup` again later.
 
@@ -318,22 +321,34 @@ curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.s
   | INSTALL_DIR="$HOME/bin" SEVDESK_MCP_VERSION=0.2.0 sh -s -- --no-setup
 ```
 
-The installer needs `curl` and `sha256sum` or `shasum`. Release binaries exist for
+The installer needs `curl` and `sha256sum` or `shasum`; on Linux also `xz` to use the
+archive, otherwise it takes the plain binary. Release binaries exist for
 `darwin-arm64`, `darwin-x64`, `linux-x64` and `linux-arm64`; under Rosetta it picks the
 native arm64 binary. The Linux binaries are built against glibc, so on musl systems such as
 Alpine use npx instead.
 
 ### Manual download
 
-Every release carries `sevdesk-mcp-<os>-<arch>` plus `SHA256SUMS`:
+Every release carries `sevdesk-mcp-<os>-<arch>`, the same binary compressed as
+`sevdesk-mcp-<os>-<arch>.tar.xz` (about a quarter of the bytes; the archive holds exactly
+one file `sevdesk-mcp`, mode 0755), and `SHA256SUMS` over both:
 
 ```sh
 base=https://github.com/altipard/sevdesk-mcp/releases/latest/download
 asset=sevdesk-mcp-linux-x64
-curl -fsSLO "$base/$asset"
+curl -fsSLO "$base/$asset.tar.xz"
 curl -fsSLO "$base/SHA256SUMS"
-grep " $asset\$" SHA256SUMS | sha256sum -c -   # macOS: shasum -a 256 -c -
+grep " $asset.tar.xz\$" SHA256SUMS | sha256sum -c -   # macOS: shasum -a 256 -c -
+tar -xf "$asset.tar.xz"   # Linux needs xz installed; macOS unpacks xz itself
 mkdir -p ~/.local/bin
+install -m 755 sevdesk-mcp ~/.local/bin/sevdesk-mcp
+```
+
+Without xz, or for releases from before the archives, take the plain binary instead:
+
+```sh
+curl -fsSLO "$base/$asset"
+grep " $asset\$" SHA256SUMS | sha256sum -c -
 install -m 755 "$asset" ~/.local/bin/sevdesk-mcp
 ```
 

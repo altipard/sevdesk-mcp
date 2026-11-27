@@ -51,6 +51,10 @@ describe("install.sh", () => {
     expect(result.stdout).toMatch(
       /releases\/download\/0\.2\.0\/sevdesk-mcp-(darwin|linux)-(arm64|x64)\n/,
     );
+    // The dry run names both candidates and the rule that picks between them.
+    expect(result.stdout).toMatch(
+      /package: {3}sevdesk-mcp-(darwin|linux)-(arm64|x64)\.tar\.xz when it is listed/,
+    );
     expect(result.stdout).toContain("releases/download/0.2.0/SHA256SUMS");
     expect(result.stdout).toContain("target:    /opt/x/sevdesk-mcp");
     expect(run(["--dry-run"]).stdout).toContain("target:    /home/test/.local/bin/sevdesk-mcp");

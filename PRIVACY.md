@@ -77,9 +77,11 @@ writes, after you confirm:
 ## What the installers download
 
 - **`install.sh`** downloads the release binary for your system and its `SHA256SUMS` from
-  the GitHub releases of `altipard/sevdesk-mcp` (`https://github.com/altipard/sevdesk-mcp/releases`),
-  checks the checksum and installs the binary into `~/.local/bin` (or `INSTALL_DIR`). It
-  asks GitHub which release is the latest unless you set `SEVDESK_MCP_VERSION`.
+  the GitHub releases of `altipard/sevdesk-mcp` (`https://github.com/altipard/sevdesk-mcp/releases`):
+  the binary as an xz archive when the release carries one and the system unpacks xz,
+  otherwise on its own. It checks the checksum and installs the binary into `~/.local/bin`
+  (or `INSTALL_DIR`). It asks GitHub which release is the latest unless you set
+  `SEVDESK_MCP_VERSION`.
 - **`npx -y @altipard/sevdesk-mcp`** downloads the package and its dependencies from your
   npm registry, by default `https://registry.npmjs.org`. Client entries that start the
   server through npx, including the Claude Code plugin, ask that registry for the current
