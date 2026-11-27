@@ -83,12 +83,14 @@ release nothing). The version lives only in the tag, without a `v` prefix (for e
 `0.2.0`), and is stamped into the build.
 
 A release publishes on GitHub the four binaries (`darwin-arm64`, `darwin-x64`,
-`linux-x64`, `linux-arm64`), the Claude Desktop extension `sevdesk-mcp.mcpb` and
-`SHA256SUMS` over all of them, plus the npm package with provenance and, after it, the
-entry in the official MCP registry (`server.json`, version stamped from the tag). The
-binaries and the extension carry a build provenance attestation (`gh attestation verify
-<file> --repo altipard/sevdesk-mcp`). Everything is built and attested before anything is
-published.
+`linux-x64`, `linux-arm64`) and each one additionally as a reproducible
+`sevdesk-mcp-<os>-<arch>.tar.xz` archive (the embedded Bun runtime is most of a binary;
+xz brings the download to about a quarter of the bytes), the Claude Desktop extension
+`sevdesk-mcp.mcpb` and `SHA256SUMS` over all of them, plus the npm package with provenance
+and, after it, the entry in the official MCP registry (`server.json`, version stamped from
+the tag). The binaries, their archives and the extension carry a build provenance
+attestation (`gh attestation verify <file> --repo altipard/sevdesk-mcp`). Everything is
+built and attested before anything is published.
 A published asset is never replaced, so re-running a partly failed release completes it
 instead of bumping the version again.
 
