@@ -144,6 +144,7 @@ More help: [docs/install.md](docs/install.md#troubleshooting), or
 - [Remote (HTTP)](docs/remote-http.md): run it as a shared server with OAuth and Redis
 - [Configuration](docs/configuration.md): all environment variables
 - [Development](docs/development.md): build, tests, releases
+- [Privacy](PRIVACY.md): what data goes where, and what the setup writes
 
 ## License
 
