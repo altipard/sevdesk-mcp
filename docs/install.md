@@ -311,7 +311,7 @@ Environment variables, set for `sh`:
 | `INSTALL_DIR` | `~/.local/bin` | Target directory, absolute path, created if missing, must be writable. |
 | `SEVDESK_MCP_VERSION` | `latest` | Release to install, for example `0.2.0` (tags have no `v` prefix). |
 | `SEVDESK_MODE` | the setup asks | Same as `--mode`; the option wins. |
-| `NO_COLOR` | | Set to any value to disable colored output. |
+| `NO_COLOR` | | Set to a non-empty value to disable colored output. |
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.sh \
