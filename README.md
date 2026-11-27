@@ -48,15 +48,20 @@ it. Paste your token into the dialog that opens. Done.
 claude plugin install sevdesk --marketplace altipard/sevdesk-mcp
 ```
 
-**Cursor, VS Code and others** (macOS and Linux). Run this in a terminal:
+**Cursor, VS Code and others** (macOS and Linux). With Node.js 24 or newer, run the npx
+command in a terminal, otherwise the curl command:
+
+```sh
+npx -y @altipard/sevdesk-mcp setup
+```
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.sh | sh
 ```
 
-The installer asks for your token once, checks it with sevdesk, and sets up the programs
-it finds. That includes Claude Desktop and Claude Code, so do not also add the extension or
-plugin, or you get two sevdesk servers.
+The setup preselects the programs it found: space changes the selection, Enter confirms.
+It asks for the mode and token, checks the token and stores it in your keychain. It also
+covers Claude Desktop and Claude Code; adding the extension or plugin too gives two servers.
 
 **Windows** (untested): use the Claude Desktop extension. Manual setup, checksums and all
 other options: [docs/install.md](docs/install.md).
@@ -67,9 +72,9 @@ The token is your key to sevdesk. In sevdesk, open **Settings > Users**, select 
 administrator user and copy the **API token** (32 characters, digits and the letters a
 to f).
 
-Claude Desktop keeps the token in its own protected settings. Claude Code and the installer
+Claude Desktop keeps the token in its own protected settings. Claude Code and the setup
 use your system keychain, so the token does not end up in a configuration file. The
-installer stores it there for you. On a Mac you can also store it yourself; this command
+setup stores it there for you. On a Mac you can also store it yourself; this command
 asks for the token:
 
 ```sh
@@ -118,11 +123,11 @@ Full list of tools: [docs/tools.md](docs/tools.md).
 ## Problems?
 
 - **The server does not start, or no sevdesk tools appear:** the token is missing, or
-  Node.js is older than 24 (Claude Code, npx). Store the token again or rerun the installer.
+  Node.js is older than 24 (Claude Code, npx). Store the token again or rerun the setup.
 - **Error 401 from sevdesk:** the token is wrong. Copy it again from sevdesk. In Claude
   Desktop, paste it into the extension settings. Elsewhere, store it again with the
-  command above or rerun the installer with
-  [`--replace-token`](docs/install.md#installer-options).
+  command above or run `npx -y @altipard/sevdesk-mcp setup --replace-token` (curl
+  install: `sevdesk-mcp setup --replace-token`, see [options](docs/install.md#setup-options)).
 - **Some tools are missing:** you are in read mode. Write tools need
   [write mode](docs/security.md#modes-per-client).
 
