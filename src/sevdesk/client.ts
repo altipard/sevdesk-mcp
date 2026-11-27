@@ -471,11 +471,10 @@ function createPolicyFetch(policy: FetchPolicy): (request: Request) => Promise<R
           : Math.max(policy.retry.baseDelayMs, retryAfter);
       // sevdesk throttles the token, not this call: hold back the other
       // calls of the token as well, whether or not this one is retried.
-      // Without Retry-After for the backoff this call would wait. Capped
-      // like our own wait, so a huge header cannot lock the token.
-      if (rateLimited) {
-        policy.limiter.pause(Math.min(retryAfter ?? delay, policy.retry.maxDelayMs));
-      }
+      // For as long as this call would wait (Retry-After with its minimum,
+      // else the backoff). Capped like our own wait, so a huge header
+      // cannot lock the token.
+      if (rateLimited) policy.limiter.pause(Math.min(delay, policy.retry.maxDelayMs));
 
       // Retries of other answers are bounded by maxRetries and GET only;
       // a 429 by its own budget, for every method.
