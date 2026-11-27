@@ -53,22 +53,24 @@ Pick your client; the first way listed is the simplest.
 
 | Client | Simplest way | Needs |
 | --- | --- | --- |
-| [Claude Code](#claude-code) | plugin, one command | Node.js 24+, token in the keychain |
+| [Claude Code](#claude-code) | plugin | Node.js 24+, token in the keychain |
 | [Claude Desktop](#claude-desktop) | `sevdesk-mcp.mcpb` extension, double-click | token typed into the extension; runs on Claude Desktop's built-in Node.js |
 | [Cursor, VS Code, others](#cursor-vs-code-and-others) | npx entry in the client config | Node.js 24+, token in the keychain |
 | any, without Node.js | [binary installer](#binary-installer) | macOS or Linux (glibc) |
 
 ### Claude Code
 
-Store the [token](#token) in the keychain first, then, in a Claude Code session (v2.1.275
-or later):
+Store the [token](#token) in the keychain first. Then, from your shell (Claude Code v2.1.292
+or later), one command adds the marketplace and installs the plugin:
 
-```text
-/plugin install sevdesk --marketplace altipard/sevdesk-mcp
+```sh
+claude plugin install sevdesk --marketplace altipard/sevdesk-mcp
 ```
 
-From your shell, `claude plugin install sevdesk --marketplace altipard/sevdesk-mcp` does the
-same (v2.1.292 or later). On older versions add the marketplace first, then install:
+In a Claude Code session (v2.1.275 or later) the same works as
+`/plugin install sevdesk --marketplace altipard/sevdesk-mcp`; Claude Code asks you to
+confirm the marketplace and opens the plugin's details, where you pick the installation
+scope. On older versions add the marketplace first, then install:
 
 ```text
 /plugin marketplace add altipard/sevdesk-mcp
@@ -82,6 +84,11 @@ Installed > Configure options. It starts the server with npx and reads the token
 invoices, vouchers, contacts and open items and through the preview and confirmation of
 changes. Without the plugin, register the server with `claude mcp add` (see
 [Connect your MCP client](#connect-your-mcp-client)).
+
+Use one way, not both: the plugin and a `claude mcp add` entry (also written by the
+[binary installer](#binary-installer)) would run two sevdesk servers side by side. Remove
+the entry with `claude mcp remove --scope user sevdesk`, or the plugin with
+`claude plugin uninstall sevdesk@sevdesk-mcp`.
 
 ### Claude Desktop
 
@@ -146,14 +153,17 @@ CLI), shows a plan and asks once:
     token:   ask for it once and store it in the macOS keychain
     mode:    read (--mode=write or SEVDESK_MODE=write to allow changes)
     clients: Claude Desktop, Claude Code
-             an existing "sevdesk" entry is replaced; JSON files are backed up first
+             an existing "sevdesk" entry is updated (command, SEVDESK_MODE; other
+             env kept); JSON files are backed up first
 
   Go ahead? [Y/n]
 ```
 
 The token is read once with hidden input, checked for the 32-hex format and against the
 sevdesk API (a rejected token is asked for again), and goes to the keychain, never into a
-client configuration. A token already in the keychain is kept. Changing JSON configurations
+client configuration. A token already in the keychain is kept. A Claude Code entry with its
+own command or env stays unchanged unless you pass `--replace-entries`: carrying its env over
+would put the values on a command line, and they are never printed. Changing JSON configurations
 needs `jq` or `python3`; files that are not valid JSON are left alone and the installer
 prints the entry to add by hand. Without a terminal, or with `--no-setup`, it installs only
 and prints the next steps.
@@ -171,6 +181,7 @@ and prints the next steps.
 | `--no-setup` | Install only, skip the keychain and MCP client setup. |
 | `--mode=MODE` | Mode for the client entries: `read` (default), `write` or `full`. |
 | `--replace-token` | Ask for a new token even if one is already in the keychain. |
+| `--replace-entries` | Replace a Claude Code entry that has its own command or env (its env is not kept). |
 | `--no-verify` | Store the token without checking it against the sevdesk API. |
 | `-h`, `--help` | Show the help. |
 
