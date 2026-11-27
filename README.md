@@ -48,16 +48,15 @@ it. Paste your token into the dialog that opens. Done.
 claude plugin install sevdesk --marketplace altipard/sevdesk-mcp
 ```
 
-**Cursor, VS Code and others** (macOS and Linux). Run the setup in a terminal, without
-Node.js or with Node.js 24 or newer:
+**Cursor, VS Code and others** (macOS and Linux). Run one of these lines in a terminal:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.sh | sh
-npx -y @altipard/sevdesk-mcp setup
+curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.sh | sh  # without Node.js
+npx -y @altipard/sevdesk-mcp setup  # or, with Node.js 24 or newer
 ```
 
-Pick one of the two lines. The setup lists the programs it found: select them with the
-space bar and press Enter to confirm. It then asks for the mode and your token, checks the
+The setup shows a menu with the programs it found already selected. The space bar changes
+the selection, Enter confirms. It then asks for the mode and your token, checks the
 token with sevdesk and stores it in your keychain. It can also set up Claude Desktop and
 Claude Code, so do not also add the extension or plugin, or you get two sevdesk servers.
 
