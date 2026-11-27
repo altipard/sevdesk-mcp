@@ -50,8 +50,13 @@ interface Setup {
   curlLog: string;
 }
 
-/** Fixture release + stub curl. checksum overrides the SHA256SUMS line of the asset. */
-function setup(options: { binaryVersion?: string; checksum?: string } = {}): Setup {
+/**
+ * Fixture release + stub curl. checksum overrides the SHA256SUMS line of the asset, latestUrl
+ * the URL the "latest" lookup ends at.
+ */
+function setup(
+  options: { binaryVersion?: string; checksum?: string; latestUrl?: string } = {},
+): Setup {
   const dir = mkdtempSync(join(tmpdir(), "sevdesk-mcp-install-"));
   const release = join(dir, "release");
   const stubs = join(dir, "stubs");
@@ -80,7 +85,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 echo "$url" >> '${curlLog}'
-if [ "$effective" = 1 ]; then printf '%s' "https://github.com/altipard/sevdesk-mcp/releases/tag/${VERSION}"; exit 0; fi
+if [ "$effective" = 1 ]; then printf '%s' "${options.latestUrl ?? `https://github.com/altipard/sevdesk-mcp/releases/tag/${VERSION}`}"; exit 0; fi
 file='${release}'/\${url##*/}
 [ -f "$file" ] || exit 22
 cp "$file" "$out"
@@ -127,6 +132,17 @@ describe("install.sh against a stub release", () => {
     const again = install(s);
     expect(again.status).toBe(0);
     expect(again.stdout).toContain(`Replaced the existing ${bin} with sevdesk-mcp ${VERSION}`);
+  });
+
+  it("says so when no release is published yet", () => {
+    const s = setup({ latestUrl: "https://github.com/altipard/sevdesk-mcp/releases" });
+    const result = install(s);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("no release published yet");
+    expect(result.stderr).toContain("npx -y @altipard/sevdesk-mcp");
+    expect(readFileSync(s.curlLog, "utf8")).toBe(
+      "https://github.com/altipard/sevdesk-mcp/releases/latest\n",
+    );
   });
 
   it("aborts on a wrong checksum and installs nothing", () => {

@@ -67,4 +67,22 @@ describe("install.sh", () => {
     expect(version.status).toBe(1);
     expect(version.stderr).toContain("invalid release version");
   });
+
+  it("accepts read, write and full as mode and refuses anything else", () => {
+    expect(run(["--dry-run", "--mode=write"]).status).toBe(0);
+    expect(run(["--dry-run"], { SEVDESK_MODE: "full" }).status).toBe(0);
+    const flag = run(["--dry-run", "--mode=admin"]);
+    expect(flag.status).toBe(1);
+    expect(flag.stderr).toContain("unknown mode 'admin'");
+    // The option wins over the environment.
+    expect(run(["--dry-run", "--mode=read"], { SEVDESK_MODE: "bogus" }).status).toBe(0);
+    // Without setup the variable is not used, so it cannot break an install.
+    expect(run(["--dry-run", "--no-setup"], { SEVDESK_MODE: "bogus" }).status).toBe(0);
+  });
+
+  it("accepts the setup options", () => {
+    const result = run(["--dry-run", "--no-setup", "--replace-token", "--no-verify"]);
+    expect(result.status).toBe(0);
+    expect(run(["--help"]).stdout).toMatch(/--replace-token[\s\S]*--no-verify/);
+  });
 });
