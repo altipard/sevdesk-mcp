@@ -25,6 +25,7 @@ import {
   classifyReverseCharge,
   countryOf,
   coverageNote,
+  freeTextSupplierNote,
   reverseChargeTotals,
 } from "../../src/tools/audit-vat.js";
 import { agingBucketOf } from "../../src/tools/invoices.js";
@@ -180,6 +181,23 @@ describe("audit_vat coverage note", () => {
     expect(note).toContain("supplier countries for 1 of 2 suppliers");
     expect(note).toContain("not done for 3 expense voucher(s) with rule 9 or 10 and no tax");
     expect(coverageNote({ ...full, countriesRead: 1 })).not.toContain("not done");
+  });
+});
+
+describe("free-text supplier note", () => {
+  it("names the count without asking to narrow the period", () => {
+    expect(freeTextSupplierNote(0)).toBeUndefined();
+    const note = freeTextSupplierNote(2);
+    expect(note).toContain("2 expense voucher(s) with rule 9 or 10");
+    expect(note).not.toContain("Narrow");
+  });
+
+  it("leaves the coverage note to what was not read", () => {
+    const full = { vouchers: 3, positionsRead: 3, suppliers: 1, countriesRead: 1 };
+    expect(coverageNote({ ...full, reverseChargeUnchecked: 0 })).toBeUndefined();
+    expect(coverageNote({ ...full, countriesRead: 0, reverseChargeUnchecked: 1 })).toContain(
+      "Narrow the period",
+    );
   });
 });
 

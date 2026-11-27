@@ -117,14 +117,12 @@ export function coverageNote(input: {
   reverseChargeUnchecked: number;
 }): string | undefined {
   const { vouchers, positionsRead, suppliers, countriesRead, reverseChargeUnchecked } = input;
-  if (positionsRead >= vouchers && countriesRead >= suppliers && reverseChargeUnchecked === 0) {
-    return undefined;
-  }
+  if (positionsRead >= vouchers && countriesRead >= suppliers) return undefined;
   const unchecked =
     reverseChargeUnchecked > 0
       ? ` The reverse charge check (section 13b UStG) was not done for ${reverseChargeUnchecked} ` +
-        "expense voucher(s) with rule 9 or 10 and no tax (positions, supplier country or a " +
-        "supplier contact missing)."
+        "expense voucher(s) with rule 9 or 10 and no tax (positions or supplier country " +
+        "missing)."
       : "";
   return (
     `Positions were read for ${positionsRead} of ${vouchers} vouchers (likely reverse charge ` +
@@ -132,6 +130,20 @@ export function coverageNote(input: {
     `(at most ${MAX_AUDIT_POSITIONS} and ${MAX_AUDIT_CONTACTS} per call within ` +
     `${AUDIT_DEADLINE_MS / 1000} s); vouchers without positions were checked on their header ` +
     `only.${unchecked} Narrow the period.`
+  );
+}
+
+/**
+ * Note for possible reverse charge cases whose supplier is only typed text:
+ * there is no contact to look up, so the country stays unknown however
+ * the period is cut. Not a truncation.
+ */
+export function freeTextSupplierNote(count: number): string | undefined {
+  if (count === 0) return undefined;
+  return (
+    `${count} expense voucher(s) with rule 9 or 10 and only 0 % positions have a supplier typed ` +
+    "as text, without a contact, so its country is unknown and the reverse charge check " +
+    "(section 13b UStG) was not done for them. Link the supplier contact to check them."
   );
 }
 
@@ -744,15 +756,20 @@ export const auditVat = defineTool({
       if (raw !== undefined) countries.set(id, countryOf(raw));
     });
 
-    // Possible reverse charge cases the check could not decide: positions
-    // missing for a voucher without tax, or the supplier's country missing.
+    // Possible reverse charge cases the check could not decide because
+    // something was not read: positions missing for a voucher without tax,
+    // or the supplier's country missing.
     const reverseChargeUnchecked = vouchers.filter(
       (v) =>
         domesticExpense(v) &&
         (positions.has(v.id)
-          ? // A supplier typed as free text has no contact to look up.
-            zeroOnly(v) && (v.supplierId === null || !countries.has(v.supplierId))
+          ? zeroOnly(v) && v.supplierId !== null && !countries.has(v.supplierId)
           : v.sumTax === 0 || v.sumTax === null),
+    ).length;
+    // A supplier typed as free text has no contact to look up: reading more
+    // would not help, so it is its own note, not a truncation.
+    const freeTextSuppliers = vouchers.filter(
+      (v) => domesticExpense(v) && v.supplierId === null && zeroOnly(v),
     ).length;
     const coverage = coverageNote({
       vouchers: vouchers.length,
@@ -801,6 +818,7 @@ export const auditVat = defineTool({
         ...run.noteField([
           version.note,
           euroNote(vouchers),
+          freeTextSupplierNote(freeTextSuppliers),
           vouchers.length > 0 &&
             guidance === undefined &&
             "Booking accounts were not checked: sevdesk's tax guidance was not available.",

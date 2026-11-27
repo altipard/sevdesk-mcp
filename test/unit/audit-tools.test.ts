@@ -395,7 +395,7 @@ describe("audit_vat", () => {
     expect(data.note).toContain("was not done for 1 expense voucher(s) with rule 9 or 10");
   });
 
-  it("counts a reverse charge case with a free-text supplier as unchecked", async () => {
+  it("reports a reverse charge case with a free-text supplier without truncating", async () => {
     api.server.use(
       version("2.0"),
       http.get(sevdeskUrl("/Voucher"), () =>
@@ -422,9 +422,49 @@ describe("audit_vat", () => {
     const c = await connect();
     const data = structured<{ note: string; truncated: boolean }>(await c.call("audit_vat", MARCH));
     expect(api.requests.filter((r) => pathOf(r).startsWith("/Contact"))).toHaveLength(0);
+    // Nothing was cut and narrowing the period would not help.
+    expect(data.truncated).toBe(false);
+    expect(data.note).toContain("1 expense voucher(s) with rule 9 or 10 and only 0 % positions");
+    expect(data.note).toContain("Link the supplier contact");
+    expect(data.note).not.toContain("Positions were read");
+    expect(data.note).not.toContain("Narrow the period");
+  });
+
+  it("keeps truncation for a missing country next to a free-text supplier", async () => {
+    api.server.use(
+      version("2.0"),
+      http.get(sevdeskUrl("/Voucher"), () =>
+        HttpResponse.json(
+          list([
+            voucher({ id: "8001", sumNet: "20", sumTax: "0", sumGross: "20" }),
+            voucher({
+              id: "8002",
+              supplier: null,
+              supplierName: "Cloud Ltd",
+              sumNet: "30",
+              sumTax: "0",
+              sumGross: "30",
+            }),
+          ]),
+        ),
+      ),
+      http.get(sevdeskUrl("/ReceiptGuidance/forAllAccounts"), () => HttpResponse.json(list([]))),
+      http.get(sevdeskUrl("/VoucherPos"), ({ request }) => {
+        const id = Number(new URL(request.url).searchParams.get("voucher[id]"));
+        return HttpResponse.json(
+          list([voucherPosition({ voucher: ref(id, "Voucher"), taxRate: "0", sumTax: "0" })]),
+        );
+      }),
+      http.get(sevdeskUrl("/Contact/2003"), () => sevdeskError(503)),
+    );
+    const c = await connect();
+    const data = structured<{ note: string; truncated: boolean }>(await c.call("audit_vat", MARCH));
     expect(data.truncated).toBe(true);
-    expect(data.note).toContain("Positions were read for 1 of 1 vouchers");
+    // The missing country counts as unchecked, the free-text supplier gets its own note.
+    expect(data.note).toContain("supplier countries for 0 of 1 suppliers");
     expect(data.note).toContain("was not done for 1 expense voucher(s) with rule 9 or 10");
+    expect(data.note).toContain("Narrow the period");
+    expect(data.note).toContain("1 expense voucher(s) with rule 9 or 10 and only 0 % positions");
   });
 
   it("sends nothing more after a 429 the retries could not get past", async () => {
