@@ -58,6 +58,24 @@ warns that only the documented table was checked; mention that to the user.
 Default tax text on documents: "Umsatzsteuer" for rule 1, otherwise the rule's German name
 (for rule 11 "Steuer nicht erhoben nach §19 UStG (Kleinunternehmer)").
 
+## Reverse charge (§13b UStG)
+
+With reverse charge the recipient, not the supplier, owes the VAT. Typical cases: software
+subscriptions and other services from businesses abroad, construction services. The
+supplier's invoice shows no German VAT, so a voucher with 0 % positions from a foreign
+supplier booked with rule 9 is often a reverse charge case booked as a normal expense.
+
+`reverse_charge_report` splits the 13b tax base (net amounts) into:
+
+- nets_to_zero: rules 12 and 14. You owe the tax and deduct it as input tax in the same
+  return, so it costs nothing, but it must appear in the VAT return.
+- payable: rule 13. You owe the tax without input tax deduction; it is a real cost.
+- revenue: rule 5. Your own sales where your customer owes the tax.
+
+Intra-EU acquisitions of goods (rule 8) are taxed under §1a UStG, not §13b, and are not in
+the report. Whether a case is reverse charge, and with or without input tax deduction, is a
+decision for the user and their Steuerberater; the tools only point to likely cases.
+
 ## Payment types for bookings
 
 | Type | When |

@@ -43,7 +43,7 @@ the Claude Desktop extension settings or the plugin settings (default read).
 
 | Mode | Adds | Confirmation |
 | --- | --- | --- |
-| read | All search and get tools | none |
+| read | All search, get, audit and summary tools | none |
 | write | Contacts, drafts, tags (run at once); payments, mark as sent, status resets (preview and token) | token for status changes and bookings |
 | full | Irreversible actions: `send_invoice_email`, `cancel_invoice`, `enshrine_document` | token, plus an approval prompt where the client supports it; only if the operator lists the tool in SEVDESK_ENABLE_TOOLS |
 
@@ -71,6 +71,9 @@ sevdesk:irreversible (needs write). Effective rights are the lower of mode and s
 | Bank accounts and transactions | `list_bank_accounts`, `search_transactions` |
 | Articles and prices | `search_parts` |
 | Printable list reports | `get_report` |
+| Revenue or costs per month, status or contact | `summarize_documents` |
+| Month-end close, VAT check | `audit_vat`, `find_duplicate_vouchers`, `find_subscription_gaps`, `reconcile_transactions` |
+| Reverse charge (13b) totals | `reverse_charge_report` |
 | Tag, reset, cancel, enshrine | `tag_document`, `reset_document_status`, `cancel_invoice`, `enshrine_document` |
 | Anything else the operator released | `sevdesk_api_request` (fallback, prefer dedicated tools) |
 
@@ -114,6 +117,10 @@ Step by step with the checks: [references/workflows.md](references/workflows.md)
   only when nothing fits, and confirm the data before `create_contact`.
 - **Open items:** `list_open_receivables` (optionally overdueOnly), then match payments
   with `search_transactions`.
+- **Month-end close and VAT check:** `reconcile_transactions`, `find_duplicate_vouchers`,
+  `find_subscription_gaps` and `audit_vat` for the month, `reverse_charge_report` for the
+  13b figures. Present findings as hints to check, never as tax advice; decisions on tax
+  rules belong to the user and their Steuerberater. Nothing is corrected automatically.
 
 ## Accounting rules that matter
 

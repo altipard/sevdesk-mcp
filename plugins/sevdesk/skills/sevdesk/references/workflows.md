@@ -77,3 +77,35 @@ Customer payments on invoices work the same way with `book_invoice_payment`.
 3. To check whether money arrived: `search_transactions` by payer name, reference or
    date range; propose a matching `book_invoice_payment`, but book only after a yes.
 4. Supplier side: `search_vouchers` with status unpaid or `partially_paid`.
+
+## Month-end close
+
+Read only; nothing is booked or changed. Use the month as period (startDate, endDate).
+
+1. `reconcile_transactions` for the month: present likely matches with their confidence,
+   payments without a document (receipts to collect) and open documents without payment.
+   Matches are hints: book a payment only through the payment tools, after a yes.
+2. `find_subscription_gaps` for the month: monthly suppliers without a voucher this month
+   usually mean a missing receipt. possiblyEnded may mean a cancelled subscription.
+3. `find_duplicate_vouchers` for the month: same number per supplier first, then same
+   amount within a few days, then old drafts to finish or delete in sevdesk.
+4. `audit_vat` for the month (next workflow).
+5. `summarize_documents` with documentType invoices and vouchers, groupBy month, for the
+   totals of the month.
+6. Whenever an answer says truncated, say the result is incomplete and repeat with a
+   shorter period instead of presenting partial totals as complete.
+
+## Check VAT bookings (reverse charge)
+
+1. `audit_vat` for the period, optionally minSeverity high first. It refuses bookkeeping
+   1.0 accounts; then say so and stop.
+2. Present findings by severity with voucher date, supplier, amount and number, the detail
+   and the suggestion. They are hints to check, not tax advice: where a tax rule has to be
+   decided (for example whether a foreign subscription is reverse charge), tell the user to
+   confirm it with their Steuerberater.
+3. Typical high finding: a supplier from abroad booked with rule 9 and 0 % VAT. A service
+   from an EU business is usually rule 14, goods from the EU rule 8, a service from outside
+   the EU rule 12 (or 13 without input tax deduction); see [accounting.md](accounting.md).
+4. `reverse_charge_report` for the 13b tax base of the period, split into the parts that net
+   to zero, the tax payable and own revenue.
+5. Corrections are made by the user in sevdesk; no tool changes the tax rule of a voucher.

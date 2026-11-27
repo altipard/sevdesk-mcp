@@ -8,6 +8,19 @@ import { IDEMPOTENCY_TTL_MS } from "../../src/policy/guard.js";
 import { OPERATIONS, type OperationId } from "../../src/policy/operations.js";
 import type { ToolDefinition } from "../../src/policy/registry.js";
 import { SCOPES } from "../../src/policy/rights.js";
+import {
+  AUDIT_CONCURRENCY,
+  AUDIT_DEADLINE_MS,
+  MAX_AUDIT_CONTACTS,
+  MAX_AUDIT_DOCUMENTS,
+  MAX_AUDIT_POSITIONS,
+} from "../../src/tools/audit-common.js";
+import {
+  DEFAULT_DRAFT_AGE_DAYS,
+  DEFAULT_DUPLICATE_WINDOW_DAYS,
+  DEFAULT_HISTORY_MONTHS,
+  DEFAULT_MIN_MONTHS,
+} from "../../src/tools/audit-documents.js";
 import { MAX_CONTACTS_SCANNED, MAX_EMAILS_SCANNED } from "../../src/tools/contacts.js";
 import { MAX_FILE_BYTES } from "../../src/tools/documents.js";
 import {
@@ -22,7 +35,9 @@ import {
 } from "../../src/tools/format.js";
 import { DEFAULT_API_ALLOW } from "../../src/tools/generic.js";
 import { TOOLS } from "../../src/tools/index.js";
-import { RECEIVABLES_DEADLINE_MS } from "../../src/tools/invoices.js";
+import { AGING_BUCKETS, RECEIVABLES_DEADLINE_MS } from "../../src/tools/invoices.js";
+import { DEFAULT_RECONCILE_WINDOW_DAYS } from "../../src/tools/reconcile.js";
+import { TAX_RULES } from "../../src/tools/tax-rules.js";
 import { MAX_VOUCHER_FILE_BYTES } from "../../src/tools/voucher-writes.js";
 import { MAX_VOUCHER_POSITIONS } from "../../src/tools/vouchers.js";
 import {
@@ -48,6 +63,12 @@ const tools = read("references/tools.md");
 const workflows = read("references/workflows.md");
 const accounting = read("references/accounting.md");
 const all = [skill, tools, workflows, accounting].join("\n");
+const docsTools = readFileSync(
+  fileURLToPath(new URL("../../docs/tools.md", import.meta.url)),
+  "utf8",
+);
+/** Text with line breaks and runs of spaces collapsed, for sentences wrapped in Markdown. */
+const flat = (text: string) => text.replace(/\s+/g, " ");
 
 const MIB = 1024 * 1024;
 
@@ -298,6 +319,12 @@ describe("skill values match the server", () => {
       book_invoice_payment: ["paymentType", "checkAccountId", "checkAccountTransactionId"],
       book_voucher_payment: ["paymentType", "checkAccountId"],
       get_tax_guidance: ["scope"],
+      summarize_documents: ["documentType", "groupBy", "includeDrafts"],
+      audit_vat: ["minSeverity"],
+      reverse_charge_report: ["includeDrafts"],
+      find_duplicate_vouchers: ["windowDays", "draftAgeDays"],
+      find_subscription_gaps: ["minMonths", "historyMonths"],
+      reconcile_transactions: ["windowDays"],
     };
     for (const [name, keys] of Object.entries(params)) {
       for (const key of keys) {
@@ -338,5 +365,68 @@ describe("skill values match the server", () => {
       const params = OPERATIONS[id].params.map((spec) => spec.name);
       expect(params, `${operationId}.${param}`).toContain(param);
     }
+  });
+
+  it("audit tools: class, caps, defaults, buckets and reverse charge rules", () => {
+    const section_ = section(tools, "## Audit and analysis (read, mode read and up)");
+    const names = rows(section_).map(([cell]) => backticked(cell ?? "")[0] ?? "");
+    expect(sorted(names)).toEqual(
+      sorted([
+        "summarize_documents",
+        "audit_vat",
+        "reverse_charge_report",
+        "find_duplicate_vouchers",
+        "find_subscription_gaps",
+        "reconcile_transactions",
+      ]),
+    );
+    for (const name of names) expect(tool(name).class, name).toBe("R");
+
+    const deadline = AUDIT_DEADLINE_MS / 1000;
+    expect(flat(section_)).toContain(
+      `stops at ${MAX_AUDIT_DOCUMENTS} documents per list or after ${deadline} s`,
+    );
+    expect(flat(section_)).toContain(
+      `reads positions for at most ${MAX_AUDIT_POSITIONS} vouchers and looks up at most ` +
+        `${MAX_AUDIT_CONTACTS} suppliers`,
+    );
+    expect(flat(section_)).toContain(`at most ${AUDIT_CONCURRENCY} at a time`);
+    expect(flat(docsTools)).toContain(
+      `at most ${MAX_AUDIT_DOCUMENTS} documents per list, stops after ${deadline} seconds and ` +
+        `sends at most ${AUDIT_CONCURRENCY} requests at a time`,
+    );
+    expect(flat(docsTools)).toContain(
+      `positions for at most ${MAX_AUDIT_POSITIONS} vouchers and looks up at most ` +
+        `${MAX_AUDIT_CONTACTS} suppliers`,
+    );
+
+    expect(section_).toContain(`windowDays (medium, default ${DEFAULT_DUPLICATE_WINDOW_DAYS})`);
+    expect(section_).toContain(`draftAgeDays (low, default ${DEFAULT_DRAFT_AGE_DAYS})`);
+    expect(section_).toContain(`minMonths months (default ${DEFAULT_MIN_MONTHS})`);
+    expect(section_).toContain(`historyMonths (default ${DEFAULT_HISTORY_MONTHS})`);
+    expect(section_).toContain(`windowDays (default ${DEFAULT_RECONCILE_WINDOW_DAYS})`);
+    expect(sorted(enumValues("summarize_documents", "groupBy"))).toEqual(
+      sorted(["month", "status", "contact"]),
+    );
+    expect(section_).toContain("groupBy month, status, contact");
+    expect(section_).toContain("documentType invoices or vouchers");
+
+    expect(tools).toContain(`aging buckets: ${AGING_BUCKETS.join(", ")} days overdue`);
+
+    const rulesOf = (kind: string) =>
+      Object.values(TAX_RULES)
+        .filter((rule) => rule.reverseCharge === kind)
+        .map((rule) => rule.id)
+        .sort((a, b) => a - b);
+    const listed = (ids: number[]) => `rule${ids.length > 1 ? "s" : ""} ${ids.join(", ")}`;
+    expect(section_).toContain(
+      `nets_to_zero (${listed(rulesOf("nets_to_zero"))}), payable (${listed(rulesOf("payable"))}), ` +
+        `revenue (${listed(rulesOf("revenue"))})`,
+    );
+    const and = (ids: number[]) =>
+      ids.length > 1 ? `rules ${ids.slice(0, -1).join(", ")} and ${ids.at(-1)}` : `rule ${ids[0]}`;
+    expect(accounting).toContain(`- nets_to_zero: ${and(rulesOf("nets_to_zero"))}.`);
+    expect(accounting).toContain(`- payable: ${and(rulesOf("payable"))}.`);
+    expect(accounting).toContain(`- revenue: ${and(rulesOf("revenue"))}.`);
   });
 });

@@ -21,7 +21,7 @@ Available in every mode.
 | `get_contact` | One contact with master data, addresses and communication ways. |
 | `search_invoices` | Lists invoices by status, date range, contact or invoice number, with open amounts. |
 | `get_invoice` | One invoice with positions, amounts, dates and status. |
-| `list_open_receivables` | Open and partially paid invoices with days overdue, totals per currency and type. Recurring-invoice templates (WKR) are left out by default; the answer can be marked incomplete after a timeout or failed page. |
+| `list_open_receivables` | Open and partially paid invoices with days overdue and aging bucket (not due, 0-30, 31-60, 61-90, over 90 days overdue), totals per currency and type, open amounts per aging bucket. Recurring-invoice templates (WKR) are left out by default; the answer can be marked incomplete after a timeout or failed page. |
 | `get_document_pdf` | The rendered PDF of an invoice, credit note or order, without marking it as sent. |
 | `search_orders` | Estimates, order confirmations and delivery notes by status, date, contact or number. |
 | `search_vouchers` | Vouchers (incoming invoices, receipts) by status, date, text, debit/credit or supplier. |
@@ -32,6 +32,29 @@ Available in every mode.
 | `get_tax_guidance` | Which booking accounts, tax rules and tax rates sevdesk allows together. |
 | `get_report` | sevdesk's rendered list report (usually a PDF) of invoices, orders, contacts or vouchers. |
 | `sevdesk_api_request` | Guarded fallback: calls one sevdesk operation without a dedicated tool by `operationId`. |
+
+## Audit and analysis tools
+
+Read tools (class `R`, every mode) that look at all documents of a period instead of one
+page, so questions like "check my month-end close" or "revenue in Q2" get a small answer.
+They never change anything. Each call reads at most 2000 documents per list, stops after
+45 seconds and sends at most 2 requests at a time; `audit_vat` also reads positions for at
+most 500 vouchers and looks up at most 200 suppliers. If a cap, the time limit or a failed
+request stopped a call early, the answer has `truncated: true` and a note naming the cause.
+
+| Tool | What it does |
+| --- | --- |
+| `summarize_documents` | Count, net, tax and gross of invoices or vouchers in a period, per month, status or contact and in total, per currency. |
+| `audit_vat` | Checks the vouchers of a period for likely VAT booking mistakes: foreign supplier with a domestic expense rule and only 0 % positions (possible reverse charge, with the fitting rule suggested), tax rule from the wrong side, rule not allowed for the booking account, rate contradicting the rule, sums that do not add up, one supplier with different rules. Findings are hints, not tax advice. |
+| `reverse_charge_report` | The §13b tax base of a period from vouchers and invoices: nets to zero (rules 12, 14), payable (rule 13) and own revenue (rule 5), with totals and document counts. |
+| `find_duplicate_vouchers` | Vouchers with the same number per supplier, the same supplier and amount within a few days, and old drafts. |
+| `find_subscription_gaps` | Detects suppliers billed monthly and lists the months of the period without a voucher. |
+| `reconcile_transactions` | Matches open bank transactions with open vouchers and invoices by amount and date, with a confidence, and lists payments without document and documents without payment. |
+
+`audit_vat` and `reverse_charge_report` need sevdesk bookkeeping 2.0 (tax rules); on
+bookkeeping 1.0 accounts they refuse with an explanation, the other tools work on both.
+The tax rule table they use is in `src/tools/tax-rules.ts`, taken from the "Tax Rules"
+section of the sevdesk OpenAPI spec.
 
 ## Write tools
 
