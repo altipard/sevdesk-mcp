@@ -1,4 +1,8 @@
-import { execFile as nodeExecFile } from "node:child_process";
+import {
+  type ChildProcess,
+  execFile as nodeExecFile,
+  spawn as nodeSpawn,
+} from "node:child_process";
 
 /** Keychain entry the installer writes and the server reads. */
 export const KEYCHAIN_SERVICE = "sevdesk-mcp";
@@ -49,9 +53,16 @@ export interface KeychainOptions {
 }
 
 /**
- * A copy of `env` without the server's secrets. The rest stays: PATH finds
- * secret-tool, and the Secret Service needs the D-Bus session variables.
+ * A copy of `env` without the server's secrets, for any child process. The rest stays: PATH
+ * finds secret-tool, and the Secret Service needs the D-Bus session variables.
  */
+export function withoutSecrets(
+  env: Record<string, string | undefined>,
+): Record<string, string | undefined> {
+  return childEnv(env);
+}
+
+/** withoutSecrets under the name the keychain functions here use. */
 function childEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
   const copy = { ...env };
   for (const name of SECRET_ENV_VARIABLES) delete copy[name];
@@ -172,4 +183,106 @@ export async function resolveApiToken(
     default:
       return { env };
   }
+}
+
+/**
+ * Runs a tool with `input` on stdin, output discarded. Resolves with its exit code, "missing"
+ * when the tool is not installed, or null when it could not run or was killed.
+ */
+export type StdinRunner = (
+  file: string,
+  args: readonly string[],
+  input: string,
+  options: { timeout: number; env: Record<string, string | undefined> },
+) => Promise<number | "missing" | null>;
+
+const runWithStdin: StdinRunner = (file, args, input, options) =>
+  new Promise((resolve) => {
+    let child: ChildProcess;
+    try {
+      // stdout and stderr are dropped: `security -i` repeats a failed command line, token included.
+      child = nodeSpawn(file, args, {
+        stdio: ["pipe", "ignore", "ignore"],
+        timeout: options.timeout,
+        windowsHide: true,
+        env: options.env,
+      });
+    } catch {
+      resolve(null);
+      return;
+    }
+    child.on("error", (error: NodeJS.ErrnoException) =>
+      resolve(error.code === "ENOENT" ? "missing" : null),
+    );
+    child.on("close", (code) => resolve(code));
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(input);
+  });
+
+export interface StoreOptions extends KeychainOptions {
+  run?: StdinRunner;
+}
+
+/**
+ * stored: written and read back unchanged. unavailable: no keychain tool. failed: fixed text,
+ * never output of the tool.
+ */
+export type StoreResult =
+  | { status: "stored" }
+  | { status: "unavailable" }
+  | { status: "failed"; reason: string };
+
+/** sevdesk API tokens are 32 hex characters. */
+export const TOKEN_PATTERN = /^[0-9A-Fa-f]{32}$/;
+
+/**
+ * Stores the API token where readKeychainToken finds it. The value reaches the tool on stdin
+ * only, never in an argument list: `security -i` reads the whole command from stdin,
+ * secret-tool reads the secret from stdin. Only a 32-hex token is accepted, which also keeps
+ * anything else out of the `security -i` command line. The result is read back to confirm.
+ */
+export async function storeKeychainToken(
+  token: string,
+  options: StoreOptions = {},
+): Promise<StoreResult> {
+  if (!TOKEN_PATTERN.test(token)) return { status: "failed", reason: "not a sevdesk API token" };
+  const platform = options.platform ?? process.platform;
+  const run = options.run ?? runWithStdin;
+  const env = childEnv(options.env ?? process.env);
+  const timeout = options.timeoutMs ?? KEYCHAIN_TIMEOUT_MS;
+  let code: number | "missing" | null;
+  switch (platform) {
+    case "darwin":
+      code = await run(
+        "/usr/bin/security",
+        ["-i"],
+        `add-generic-password -U -s ${KEYCHAIN_SERVICE} -a ${KEYCHAIN_ACCOUNT} -l ${KEYCHAIN_SERVICE} -w ${token}\n`,
+        { timeout, env },
+      );
+      break;
+    case "linux":
+      code = await run(
+        "secret-tool",
+        [
+          "store",
+          `--label=${KEYCHAIN_SERVICE}`,
+          "service",
+          KEYCHAIN_SERVICE,
+          "account",
+          KEYCHAIN_ACCOUNT,
+        ],
+        token,
+        { timeout, env },
+      );
+      break;
+    default:
+      return { status: "unavailable" };
+  }
+  if (code === "missing") return { status: "unavailable" };
+  if (code === null) return { status: "failed", reason: "the keychain tool did not run" };
+  if (code !== 0) return { status: "failed", reason: "the keychain tool failed" };
+  // `security -i` exits 0 even when its command failed: only a read-back proves the write.
+  const check = await readKeychainToken(options);
+  if (check.status === "found" && check.token === token) return { status: "stored" };
+  return { status: "failed", reason: "the stored token could not be read back" };
 }

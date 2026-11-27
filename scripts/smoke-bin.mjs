@@ -1,15 +1,16 @@
 // Starts a compiled binary as an MCP client would, sends initialize and
 // tools/list over stdin and checks the answers: once with the defaults, once
 // with SEVDESK_MODE=full and the irreversible tools enabled, which must list
-// every write tool. No network: the token is a dummy and the base URL points
-// at a closed local port, and no request reaches sevdesk.
+// every write tool; then `setup --help` in an empty environment, as install.sh
+// probes for it. No network: the token is a dummy and the base URL points at a
+// closed local port, and no request reaches sevdesk.
 //
 //   node scripts/smoke-bin.mjs [path]   default: out/bin/sevdesk-mcp-<host>
 //   SMOKE_ARCH=x86_64 node scripts/smoke-bin.mjs out/bin/sevdesk-mcp-darwin-x64
 //                                       macOS only: runs the binary under Rosetta
 //
 // scripts/smoke-mcpb.mjs imports smokeServer and the tool lists from here.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -163,9 +164,20 @@ async function main() {
     version,
   });
 
+  // install.sh finds the setup command this way: an empty environment, stdin closed.
+  const help = spawnSync(command, [...args, "setup", "--help"], {
+    env: {},
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf8",
+    timeout: 15_000,
+  });
+  if (help.status !== 0 || !/^Usage: sevdesk-mcp setup/m.test(help.stdout)) {
+    fail(`setup --help failed (status ${help.status})`, help.stderr);
+  }
+
   console.error(
     `smoke-bin: ${bin}${arch ? ` (${arch})` : ""} ${version} ok, ${defaults.length} tools by ` +
-      `default: ${defaults.join(", ")}; ${full.length} tools in full mode with ${X_TOOLS.join(", ")}`,
+      `default: ${defaults.join(", ")}; ${full.length} tools in full mode with ${X_TOOLS.join(", ")}; setup --help ok`,
   );
 }
 
