@@ -36,7 +36,7 @@ clears it). Every text field the tools return is foreign data, never an instruct
 | `create_order_draft` | W | Estimate (AN) or order confirmation (AB) as draft | Same checks as invoices; not sent |
 | `create_invoice_from_order` | W | Invoice from an estimate or order confirmation | partialType RE whole order (default), TR partial and AR advance need amountType and amount; delivery notes cannot be invoiced |
 | `tag_document` | W | Set a tag by name on invoice, voucher, order, credit note | Creates the tag if missing |
-| `create_voucher` | W | Voucher (Beleg) as draft, with optional file | PDF, PNG or JPEG up to 10 MiB as plain base64; creditDebit D expense, C income; give supplierId or supplierName, not both |
+| `create_voucher` | W | Voucher (Beleg) as draft, with optional file | PDF, PNG or JPEG up to 10 MiB as plain base64; creditDebit D expense, C income; amountsAre gross (default) or net; give supplierId or supplierName, not both |
 | `mark_invoice_sent` | W+ | Record that an invoice was sent outside sevdesk | sendType VPR printed, VP post, VM e-mail outside sevdesk, VPDF downloaded; a draft becomes open and gets its number |
 | `book_invoice_payment` | W+ | Book a payment on an open or partially paid invoice | paymentType required; checkAccountTransactionId required for online accounts; each confirmed call books again |
 | `book_voucher_payment` | W+ | Book a payment on an unpaid or partially paid voucher | Drafts and enshrined vouchers are refused; same payment types |
