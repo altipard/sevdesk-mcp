@@ -48,7 +48,7 @@
     "mode": {
       "type": "string",
       "title": "Mode",
-      "description": "read (default) or write. read allows only reads, write adds drafts, master data and status changes. Irreversible actions (sending e-mail, cancellation, enshrining) are only available in a manual configuration with SEVDESK_MODE=full and SEVDESK_ENABLE_TOOLS.",
+      "description": "read (default) or write, in lower case; an unknown value stops the server from starting. read allows only reads, write adds drafts, master data and status changes. Irreversible actions (sending e-mail, cancellation, enshrining) are only available in a manual configuration with SEVDESK_MODE=full and SEVDESK_ENABLE_TOOLS.",
       "default": "read",
       "required": false
     }

@@ -51,7 +51,9 @@ describe("mcpb manifest", () => {
   // one-click extension: the mode field offers read and write only.
   it("offers read and write as modes and points to the manual setup for the rest", () => {
     const { description } = manifest.user_config.mode;
-    expect(description).toMatch(/^read \(default\) or write\./);
+    expect(description).toMatch(/^read \(default\) or write, in lower case;/);
+    // The server rejects any other spelling at startup (SEVDESK_MODE is case-sensitive).
+    expect(description).toContain("an unknown value stops the server from starting");
     expect(MODES).toEqual(expect.arrayContaining(["read", "write"]));
     for (const text of [description, manifest.long_description]) {
       expect(text).toContain("SEVDESK_MODE=full");
