@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>Ask your AI assistant about your sevdesk bookkeeping.</b><br>
-  Read-only by default. Bookings and status changes need your confirmation.
+  Read-only by default. Bookings and status changes show a preview first.
 </p>
 
 <p align="center">
@@ -24,7 +24,7 @@ assistant looks up the answer in sevdesk. For example:
 - "Did the payment from ACME arrive?"
 - "Which customers still owe us money, and how much?"
 - "Show me all receipts from last month that are not booked yet."
-- "Draft an invoice for ACME: 8 hours of consulting at 95 euros."
+- "Draft an invoice for ACME: 8 hours of consulting at 95 euros." (needs write mode)
 
 > [!IMPORTANT]
 > **Unofficial.** Not affiliated with, endorsed by or supported by sevdesk GmbH.
@@ -55,9 +55,11 @@ curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.s
 ```
 
 The installer asks for your token once, checks it with sevdesk, and sets up the programs
-it finds.
+it finds. That includes Claude Desktop and Claude Code, so do not also add the extension or
+plugin, or you get two sevdesk servers.
 
-Windows, manual setup, checksums and all other options: [docs/install.md](docs/install.md).
+**Windows** (untested): use the Claude Desktop extension. Manual setup, checksums and all
+other options: [docs/install.md](docs/install.md).
 
 ## Your API token
 
@@ -84,7 +86,8 @@ In **write** mode it can also create drafts (invoices, estimates, receipts), add
 contacts, and book payments. Drafts and contact changes happen right away. A draft stays a
 draft: it gets no number and is not sent. Booking a payment or changing a status takes two
 steps: first a preview of what will change, then the confirmation. Read the preview before
-you agree.
+you agree. The confirmation does not protect you from a misled assistant, so stay in read
+mode when in doubt ([why](docs/security.md)).
 
 Sending invoices by e-mail, cancelling invoices and locking documents for good
 (festschreiben) cannot be undone. These stay off until you switch them on on purpose.
@@ -114,16 +117,18 @@ Full list of tools: [docs/tools.md](docs/tools.md).
 
 ## Problems?
 
-- **The server does not start, or no sevdesk tools appear:** the token is missing. Store
-  it again or run the installer again.
+- **The server does not start, or no sevdesk tools appear:** the token is missing, or
+  Node.js is older than 24 (Claude Code, npx). Store the token again or rerun the installer.
 - **Error 401 from sevdesk:** the token is wrong. Copy it again from sevdesk. In Claude
   Desktop, paste it into the extension settings. Elsewhere, store it again with the
-  command above.
+  command above or rerun the installer with
+  [`--replace-token`](docs/install.md#installer-options).
 - **Some tools are missing:** you are in read mode. Write tools need
   [write mode](docs/security.md#modes-per-client).
 
 Tip: ask the assistant to check the sevdesk connection. The answer also tells you the mode.
-More help: [docs/install.md](docs/install.md#troubleshooting).
+More help: [docs/install.md](docs/install.md#troubleshooting), or
+[open an issue](https://github.com/altipard/sevdesk-mcp/issues).
 
 ## More
 
