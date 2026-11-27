@@ -12,18 +12,21 @@ import {
   documentRefSchema,
   HINT_DISCLAIMER,
   invoiceRef,
-  isEuro,
   MAX_AUDIT_CONTACTS,
   MAX_AUDIT_POSITIONS,
   mapLimited,
   type Period,
+  partialInvoiceNote,
   periodInput,
   periodSchema,
+  revenueSign,
   SEVERITIES,
   type Severity,
+  scanCreditNotes,
   scanInvoices,
   scanVouchers,
   severityRank,
+  signed,
   supplierKey,
   voucherRef,
 } from "./audit-common.js";
@@ -138,10 +141,14 @@ interface PositionsRead {
 type Guidance = Map<number, Map<number, Set<number> | null>>;
 
 interface SupplierCountry {
-  /** true foreign, false German, null unknown. */
+  /** true: address (or VAT ID) abroad; false: German; null: unknown. */
   foreign: boolean | null;
-  /** eu, non_eu or unknown, for foreign suppliers. */
-  region: "eu" | "non_eu" | "unknown";
+  /**
+   * From the VAT ID prefix: eu (EU member other than Germany), xi (Northern
+   * Ireland, EU only for goods), non_eu, de_vat (German VAT ID despite a
+   * foreign address: not an EU-foreign business) or unknown (none, unclear).
+   */
+  region: "eu" | "xi" | "non_eu" | "de_vat" | "unknown";
 }
 
 function parseGuidance(body: unknown): Guidance {
@@ -185,17 +192,23 @@ function mapPositions(body: unknown, voucherId: number): PositionsRead {
 }
 
 /** Country of a contact from its invoice (or first) address, else from the VAT ID. */
-function countryOf(raw: Raw): SupplierCountry {
+export function countryOf(raw: Raw): SupplierCountry {
   const addresses = Array.isArray(raw.addresses) ? raw.addresses.map(asRecord) : [];
   const chosen = addresses.find((a) => refId(a.category) === 47) ?? addresses[0];
   const countryId = chosen === undefined ? null : refId(chosen.country);
   const prefix = vatPrefix(text(raw.vatNumber));
-  const region = (): SupplierCountry["region"] =>
-    prefix === null ? "unknown" : EU_VAT_PREFIXES.has(prefix) ? "eu" : "non_eu";
-  if (countryId !== null) {
-    return { foreign: countryId !== GERMANY_COUNTRY_ID, region: region() };
-  }
-  if (prefix !== null) return { foreign: prefix !== "DE", region: region() };
+  const region: SupplierCountry["region"] =
+    prefix === null
+      ? "unknown"
+      : prefix === "DE"
+        ? "de_vat"
+        : prefix === "XI"
+          ? "xi"
+          : EU_VAT_PREFIXES.has(prefix)
+            ? "eu"
+            : "non_eu";
+  if (countryId !== null) return { foreign: countryId !== GERMANY_COUNTRY_ID, region };
+  if (prefix !== null) return { foreign: prefix !== "DE", region };
   return { foreign: null, region: "unknown" };
 }
 
@@ -209,6 +222,44 @@ const sum = (values: readonly (number | null)[]): number | null =>
 
 const differs = (a: number | null, b: number | null, tolerance = SUM_TOLERANCE): boolean =>
   a !== null && b !== null && Math.abs(a - b) > tolerance + 1e-9;
+
+/**
+ * Rules where the recipient owes the tax (13b, intra-EU acquisition). The
+ * spec lists them as "0% (19%)" without saying whether sevdesk shows the
+ * self-assessed tax in sumTax, so tax amount checks are skipped for them
+ * and only net sums are compared.
+ */
+export const SELF_ASSESSED_RULES: ReadonlySet<number> = new Set([8, 12, 13, 14]);
+
+const FOREIGN_SUPPLIER_ADVICE: Readonly<
+  Record<"eu" | "xi" | "non_eu" | "unknown", { suggestion: string; rules: number[] }>
+> = {
+  eu: {
+    suggestion:
+      "For a service from an EU business rule 14 usually fits, for goods rule 8; check with " +
+      "the Steuerberater.",
+    rules: [14, 8],
+  },
+  xi: {
+    suggestion:
+      "Northern Ireland counts as EU for goods only: goods rule 8, a service rule 12 (with " +
+      "input tax deduction) or 13 (without); check with the Steuerberater.",
+    rules: [8, 12, 13],
+  },
+  non_eu: {
+    suggestion:
+      "For a service from a business outside the EU rule 12 (with input tax deduction) or 13 " +
+      "(without) usually fits; check with the Steuerberater.",
+    rules: [12, 13],
+  },
+  unknown: {
+    suggestion:
+      "The supplier's VAT ID is missing or unclear, so the fitting rule depends on where the " +
+      "business sits and what was bought: 14 (EU service), 8 (EU goods), 12 or 13 (service " +
+      "from outside the EU). Check with the Steuerberater.",
+    rules: [14, 8, 12, 13],
+  },
+};
 
 const ratesText = (rates: Iterable<number>) =>
   [...rates]
@@ -283,16 +334,23 @@ export function checkVoucher({ voucher, positions, country, guidance }: VoucherC
     );
   }
 
-  if (!isEuro(voucher.currency)) {
+  if (voucher.foreignCurrency !== null) {
     add(
       "low",
       "FOREIGN_CURRENCY",
-      `Amounts are in ${voucher.currency}; sums were compared in that currency.`,
+      `Document currency ${voucher.foreignCurrency}; the amounts shown are the euro amounts ` +
+        "sevdesk reports.",
       "Check the exchange rate and the euro amounts in sevdesk.",
     );
   }
 
-  if (voucher.sumNet !== null && voucher.sumTax !== null && voucher.sumGross !== null) {
+  const selfAssessed = ruleId !== null && SELF_ASSESSED_RULES.has(ruleId);
+  if (
+    !selfAssessed &&
+    voucher.sumNet !== null &&
+    voucher.sumTax !== null &&
+    voucher.sumGross !== null
+  ) {
     const expected = cents(voucher.sumNet + voucher.sumTax);
     if (differs(expected, voucher.sumGross)) {
       add(
@@ -310,19 +368,22 @@ export function checkVoucher({ voucher, positions, country, guidance }: VoucherC
 
   // Foreign supplier, domestic expense rule, no tax charged: typical reverse charge case.
   if (side === "expense" && (ruleId === 9 || ruleId === 10) && zeroOnly) {
-    if (country?.foreign === true) {
-      const eu = country.region === "eu";
+    if (country?.foreign === true && country.region !== "de_vat") {
+      const advice = FOREIGN_SUPPLIER_ADVICE[country.region];
+      const label = {
+        eu: " (EU VAT ID)",
+        xi: " (Northern Ireland VAT ID)",
+        non_eu: " (VAT ID outside the EU)",
+        unknown: "",
+      }[country.region];
       add(
-        ruleId === 9 ? "high" : "medium",
+        // Rule 10 with 0 % abroad is often right (hotels, travel abroad).
+        ruleId === 9 ? "high" : "low",
         "FOREIGN_SUPPLIER_DOMESTIC_RULE",
-        `Supplier from abroad${eu ? " (EU VAT ID)" : ""}, booked with ${describeRule(ruleId)} and ` +
-          "only 0 % positions: possibly a reverse charge case (section 13b UStG).",
-        eu
-          ? "For a service from an EU business rule 14 usually fits, for goods rule 8; " +
-              "check with the Steuerberater."
-          : "For a service from a business abroad rule 12 (with input tax deduction) or 13 " +
-              "(without) usually fits; check with the Steuerberater.",
-        eu ? [14, 8] : [12, 13],
+        `Supplier from abroad${label}, booked with ${describeRule(ruleId)} and only 0 % ` +
+          "positions: possibly a reverse charge case (section 13b UStG).",
+        advice.suggestion,
+        advice.rules,
       );
     } else if (country?.foreign === null && voucher.supplierId !== null) {
       add(
@@ -407,16 +468,23 @@ export function checkVoucher({ voucher, positions, country, guidance }: VoucherC
     const tolerance = Math.max(SUM_TOLERANCE, 0.01 * list.length);
     const net = sum(list.map((p) => p.sumNet));
     const gross = sum(list.map((p) => p.sumGross));
-    if (differs(net, voucher.sumNet, tolerance) || differs(gross, voucher.sumGross, tolerance)) {
+    // Self-assessed rules: gross may or may not carry the tax, compare net only.
+    if (
+      differs(net, voucher.sumNet, tolerance) ||
+      (!selfAssessed && differs(gross, voucher.sumGross, tolerance))
+    ) {
       add(
         "medium",
         "POSITIONS_DIFFER_FROM_HEADER",
-        `Positions add up to net ${net} / gross ${gross}, the voucher says net ` +
-          `${voucher.sumNet} / gross ${voucher.sumGross}.`,
+        selfAssessed
+          ? `Positions add up to net ${net}, the voucher says net ${voucher.sumNet}.`
+          : `Positions add up to net ${net} / gross ${gross}, the voucher says net ` +
+              `${voucher.sumNet} / gross ${voucher.sumGross}.`,
         "Check the positions against the receipt.",
       );
     }
   }
+  if (selfAssessed) return findings;
   const brokenPositions = list.filter(
     (p) =>
       p.sumNet !== null &&
@@ -636,6 +704,9 @@ export const auditVat = defineTool({
     ]);
     const findingCounts = { high: 0, medium: 0, low: 0 };
     for (const f of all) findingCounts[f.severity]++;
+    const selfAssessed = vouchers.filter(
+      (v) => v.taxRuleId !== null && SELF_ASSESSED_RULES.has(v.taxRuleId),
+    ).length;
     const shown = all.filter((f) => severityRank(f.severity) <= severityRank(args.minSeverity));
     const findings = shown.slice(args.offset, args.offset + args.limit);
     const page = pageOf(args.offset, args.limit, findings.length, shown.length);
@@ -660,6 +731,10 @@ export const auditVat = defineTool({
           vouchers.length > 0 &&
             guidance === undefined &&
             "Booking accounts were not checked: sevdesk's tax guidance was not available.",
+          selfAssessed > 0 &&
+            `Tax amount checks were skipped for ${selfAssessed} vouchers with rule 8, 12, 13 or ` +
+              "14: the spec does not say whether sevdesk shows the self-assessed tax in sumTax; " +
+              "only net sums were compared.",
           vouchers.length === 0 && "No vouchers in the period.",
         ]),
       },
@@ -697,21 +772,27 @@ const REVERSE_CHARGE_RULES: Readonly<Record<ReverseChargeKind, number[]>> = {
 const CATEGORIES = ["nets_to_zero", "payable", "revenue"] as const;
 
 /** Invoice types counted as revenue: reminders repeat amounts, WKR are templates. */
-const REVENUE_INVOICE_TYPES = new Set(["RE", "TR", "AR", "ER", "SR"]);
+export const REVENUE_INVOICE_TYPES: ReadonlySet<string> = new Set(["RE", "TR", "AR", "ER", "SR"]);
 
 const categoryTotalSchema = z.object({
   category: z.enum(CATEGORIES),
   meaning: z.string(),
   taxRules: z.array(z.number().int()),
-  currency: z.string().nullable(),
   documents: z.number().int(),
-  net: z.number().describe("Tax base: sum of net amounts."),
+  net: z
+    .number()
+    .describe("Tax base in euro: sum of net amounts, cancellations and credit notes subtracted."),
+  foreignCurrencyDocuments: z
+    .number()
+    .int()
+    .describe("Documents in another currency; their euro amounts are included."),
 });
+type CategoryTotal = z.infer<typeof categoryTotalSchema>;
 
 const reverseChargeDocumentSchema = z.object({
   category: z.enum(CATEGORIES),
   taxRuleId: z.number().int(),
-  net: z.number().nullable(),
+  net: z.number().nullable().describe("Net in euro, negative for cancellations and credit notes."),
   document: documentRefSchema,
 });
 
@@ -721,6 +802,9 @@ interface Classified {
   net: number | null;
   document: DocumentRef;
 }
+
+/** Draft status per revenue document kind (invoice 100, credit note 100). */
+const isRevenueDraft = (i: AuditInvoice) => i.status === 100;
 
 export function classifyReverseCharge(
   vouchers: readonly AuditVoucher[],
@@ -742,14 +826,14 @@ export function classifyReverseCharge(
     });
   }
   for (const i of invoices) {
-    if (!includeDrafts && i.status === 100) continue;
-    if (i.status === 50) continue;
+    if (!includeDrafts && isRevenueDraft(i)) continue;
+    if (i.kind === "invoice" && i.status === 50) continue;
     if (i.invoiceType !== null && !REVENUE_INVOICE_TYPES.has(i.invoiceType)) continue;
     if (i.taxRuleId === null || TAX_RULES[i.taxRuleId]?.reverseCharge !== "revenue") continue;
     out.push({
       category: "revenue",
       taxRuleId: i.taxRuleId,
-      net: i.sumNet,
+      net: signed(i.sumNet, revenueSign(i)),
       document: invoiceRef(i),
     });
   }
@@ -761,56 +845,54 @@ export function classifyReverseCharge(
   );
 }
 
-export function reverseChargeTotals(
-  classified: readonly Classified[],
-): z.infer<typeof categoryTotalSchema>[] {
-  const totals = new Map<string, z.infer<typeof categoryTotalSchema>>();
+export function reverseChargeTotals(classified: readonly Classified[]): CategoryTotal[] {
+  const totals = new Map<ReverseChargeKind, CategoryTotal>();
   for (const category of CATEGORIES) {
-    totals.set(`${category}\u0000EUR`, {
+    totals.set(category, {
       category,
       meaning: CATEGORY_MEANING[category],
       taxRules: REVERSE_CHARGE_RULES[category],
-      currency: "EUR",
       documents: 0,
       net: 0,
+      foreignCurrencyDocuments: 0,
     });
   }
   for (const c of classified) {
-    const currency = isEuro(c.document.currency) ? "EUR" : c.document.currency;
-    const key = `${c.category}\u0000${currency}`;
-    const entry = totals.get(key) ?? {
-      category: c.category,
-      meaning: CATEGORY_MEANING[c.category],
-      taxRules: REVERSE_CHARGE_RULES[c.category],
-      currency,
-      documents: 0,
-      net: 0,
-    };
+    const entry = totals.get(c.category) as CategoryTotal;
     entry.documents++;
     entry.net = cents(entry.net + (c.net ?? 0));
-    totals.set(key, entry);
+    if (c.document.foreignCurrency !== null) entry.foreignCurrencyDocuments++;
   }
   return [...totals.values()];
 }
+
+/** Tax period caveat: documents are placed by their date, not by when the tax arises. */
+export const DOCUMENT_DATE_NOTE =
+  "Documents are assigned to the period by their document date, an approximation of the tax " +
+  "period (delivery date and cash or accrual taxation can move them).";
 
 export const reverseChargeReport = defineTool({
   name: "reverse_charge_report",
   title: "Report sevdesk reverse charge (13b) bases",
   description:
-    "Sums the reverse charge tax base (section 13b UStG, bookkeeping 2.0) of a period from " +
-    "vouchers and invoices, split into: nets_to_zero (expense rules 12 and 14, tax owed and " +
-    "deducted as input tax), payable (expense rule 13, tax owed without deduction) and revenue " +
-    "(rule 5, own sales where the customer owes the tax). Returns totals and document counts " +
-    "per category and currency, plus the documents. Drafts, reminders and recurring templates " +
-    "are left out; intra-EU acquisitions (rule 8) are not 13b and not included. Figures to " +
-    "check, not tax advice. Refuses bookkeeping 1.0 accounts." +
+    "Sums the reverse charge tax base (section 13b UStG, bookkeeping 2.0) of a period in euro " +
+    "from vouchers, invoices and credit notes, split into: nets_to_zero (expense rules 12 and " +
+    "14, tax owed and deducted as input tax), payable (expense rule 13, tax owed without " +
+    "deduction) and revenue (rule 5, own sales where the customer owes the tax; cancellation " +
+    "invoices and credit notes subtracted). Returns totals and document counts per category, " +
+    "plus the documents. Drafts, reminders and recurring templates are left out; intra-EU " +
+    "acquisitions (rule 8) are not 13b and not included. Documents count by their date. " +
+    "Figures to check, not tax advice. Refuses bookkeeping 1.0 accounts." +
     FOREIGN_DATA_NOTE,
   class: "R",
   operationId: "getVouchers",
-  operations: ["bookkeepingSystemVersion", "getInvoices"],
+  operations: ["bookkeepingSystemVersion", "getInvoices", "getCreditNotes"],
   inputSchema: z.object({
     ...periodInput,
-    includeDrafts: z.boolean().default(false).describe("Also count draft vouchers and invoices."),
+    includeDrafts: z
+      .boolean()
+      .default(false)
+      .describe("Also count draft vouchers, invoices and credit notes."),
     ...pageInput,
   }),
   outputSchema: z.object({
@@ -829,13 +911,21 @@ export const reverseChargeReport = defineTool({
     const run = new AuditRun(call);
     const vouchers = await scanVouchers(run, period);
     const invoices = await scanInvoices(run, period);
-    const classified = classifyReverseCharge(vouchers, invoices, args.includeDrafts);
+    const creditNotes = await scanCreditNotes(run, period);
+    const classified = classifyReverseCharge(
+      vouchers,
+      [...invoices, ...creditNotes],
+      args.includeDrafts,
+    );
     const totals = reverseChargeTotals(classified);
     const documents = classified.slice(args.offset, args.offset + args.limit);
     const page = pageOf(args.offset, args.limit, documents.length, classified.length);
-    const euro = (category: ReverseChargeKind) =>
-      totals.find((t) => t.category === category && t.currency === "EUR")?.net ?? 0;
+    const net = (category: ReverseChargeKind) =>
+      totals.find((t) => t.category === category)?.net ?? 0;
     const truncated = run.truncated;
+    const revenueInvoices = invoices.filter(
+      (i) => i.taxRuleId !== null && TAX_RULES[i.taxRuleId]?.reverseCharge === "revenue",
+    );
     return present(
       {
         period,
@@ -843,19 +933,18 @@ export const reverseChargeReport = defineTool({
         totals,
         documents,
         page,
-        disclaimer: HINT_DISCLAIMER,
+        disclaimer: `${HINT_DISCLAIMER} ${DOCUMENT_DATE_NOTE}`,
         truncated,
         ...run.noteField([
           version.note,
-          totals.some((t) => t.currency !== "EUR") &&
-            "Some documents are in a foreign currency; their totals are listed per currency.",
+          partialInvoiceNote(revenueInvoices),
           classified.length === 0 && "No reverse charge documents in the period.",
         ]),
       },
       {
         summary:
-          `13b ${period.startDate} to ${period.endDate} (EUR net): nets to zero ${euro("nets_to_zero")}, ` +
-          `payable ${euro("payable")}, own revenue ${euro("revenue")}; ${classified.length} documents.` +
+          `13b ${period.startDate} to ${period.endDate} (EUR net): nets to zero ${net("nets_to_zero")}, ` +
+          `payable ${net("payable")}, own revenue ${net("revenue")}; ${classified.length} documents.` +
           `${truncated ? " Incomplete, see note." : ""}`,
       },
     );

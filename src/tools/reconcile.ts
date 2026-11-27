@@ -9,7 +9,6 @@ import {
   documentRefSchema,
   inPeriod,
   invoiceRef,
-  isEuro,
   normalized,
   type Period,
   periodInput,
@@ -110,7 +109,8 @@ export function reconcile(
     const direction = t.amount > 0 ? 1 : -1;
     for (const doc of documents) {
       if (doc.direction !== direction) continue;
-      if (Math.abs(Math.abs(t.amount) - doc.amount) > AMOUNT_TOLERANCE) continue;
+      // Same tolerance logic as the audit sum checks: float noise never decides.
+      if (Math.abs(Math.abs(t.amount) - doc.amount) > AMOUNT_TOLERANCE + 1e-9) continue;
       const days = doc.date === null ? windowDays : daysBetween(doc.date, t.date);
       if (Math.abs(days) > windowDays) continue;
       const verdict = judge(t, doc, days);
@@ -165,7 +165,8 @@ export const reconcileTransactions = defineTool({
     "(high: document number in the reference or payee name and close date; medium: name or " +
     "date within 3 days; low: amount and window only), payments without a document, and open " +
     "documents of the period without a payment. offset and limit apply to each of the three " +
-    "lists; counts gives their full sizes. Documents in a foreign currency are not matched. " +
+    "lists; counts gives their full sizes. Documents in a foreign currency are not matched, " +
+    "and credit notes are not read. " +
     "Nothing is booked; use the matches as hints." +
     FOREIGN_DATA_NOTE,
   class: "R",
@@ -206,11 +207,12 @@ export const reconcileTransactions = defineTool({
     const period = checkPeriod(args);
     const run = new AuditRun(call);
     const transactions = await scanTransactions(run, period, args.checkAccountId);
-    // Documents are read from windowDays before the period: an invoice from
-    // late last month is often paid in this one.
+    // Documents are read windowDays before and after the period: an invoice
+    // from late last month is often paid in this one, and a payment late in
+    // the period may belong to a document dated a few days later.
     const docPeriod: Period = {
       startDate: addDays(period.startDate, -args.windowDays),
-      endDate: period.endDate,
+      endDate: addDays(period.endDate, args.windowDays),
     };
     const vouchers = await scanVouchers(run, docPeriod);
     const invoices = await scanInvoices(run, docPeriod);
@@ -221,7 +223,7 @@ export const reconcileTransactions = defineTool({
       if (v.status === null || !UNPAID_VOUCHER.has(v.status)) continue;
       const owed = v.openAmount ?? v.sumGross;
       if (owed === null || owed === 0) continue;
-      if (!isEuro(v.currency)) {
+      if (v.foreignCurrency !== null) {
         foreign++;
         continue;
       }
@@ -239,7 +241,7 @@ export const reconcileTransactions = defineTool({
       if (i.invoiceType !== null && SKIPPED_INVOICE_TYPES.has(i.invoiceType)) continue;
       const owed = i.openAmount ?? i.sumGross;
       if (owed === null || owed === 0) continue;
-      if (!isEuro(i.currency)) {
+      if (i.foreignCurrency !== null) {
         foreign++;
         continue;
       }

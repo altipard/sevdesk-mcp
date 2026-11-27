@@ -145,35 +145,51 @@ export class AuditRun {
     );
   }
 
+  /** Set once the first scan of the call started; only that scan's first page must succeed. */
+  private scanned = false;
+
   /**
-   * Every object of a paged list, up to `cap`. The first page must succeed;
-   * a later failure or the deadline keeps what was read and is recorded.
+   * Every object of a paged list, up to `cap`. The first page of the call's
+   * first scan must succeed; any later failure or the deadline keeps what
+   * was read and is recorded. The cap is recorded only when sevdesk has
+   * more after it (one probe request of a single object).
    */
   async scan(
     what: string,
     send: (page: { limit: number; offset: number }, signal: AbortSignal) => Promise<unknown>,
     cap: number = MAX_AUDIT_DOCUMENTS,
   ): Promise<Raw[]> {
+    const first = !this.scanned;
+    this.scanned = true;
     const items: Raw[] = [];
     for (let offset = 0; ; offset += SCAN_PAGE) {
       if (items.length >= cap) {
-        this.hit(
-          `cap:${what}`,
-          `Only the first ${cap} ${what} of the period were read (cap); narrow the period.`,
-        );
+        const probe = await this.request(what, (signal) => send({ limit: 1, offset: cap }, signal));
+        if (probe !== undefined && objectsOf(probe.body).length > 0) {
+          this.hit(
+            `cap:${what}`,
+            `Only the first ${cap} ${what} of the period were read (cap); narrow the period.`,
+          );
+        }
         break;
       }
+      const limit = Math.min(SCAN_PAGE, cap - items.length);
       const answer = await this.request(
         what,
-        (signal) => send({ limit: SCAN_PAGE, offset }, signal),
-        offset === 0,
+        (signal) => send({ limit, offset }, signal),
+        first && offset === 0,
       );
       if (answer === undefined) break;
       const page = objectsOf(answer.body);
       items.push(...page);
-      if (page.length < SCAN_PAGE) break;
+      if (page.length < limit) break;
     }
     return items.slice(0, cap);
+  }
+
+  /** True when a cap stopped reading `what` (see scan). */
+  capped(what: string): boolean {
+    return this.limits.has(`cap:${what}`);
   }
 
   /** The notes joined, or nothing, for the optional `note` field. */
@@ -205,16 +221,46 @@ export async function mapLimited<T, R>(
 // Documents
 
 export const documentRefSchema = z.object({
-  type: z.enum(["voucher", "invoice", "transaction"]),
+  type: z.enum(["voucher", "invoice", "credit_note", "transaction"]),
   id: z.number().int(),
-  date: z.string().nullable().describe("Voucher, invoice or value date, YYYY-MM-DD."),
-  number: z.string().nullable().describe("Invoice number, voucher description or purpose."),
+  date: z.string().nullable().describe("Voucher, invoice, credit note or value date, YYYY-MM-DD."),
+  number: z
+    .string()
+    .nullable()
+    .describe("Invoice or credit note number, voucher description, or payment reference."),
   contactId: z.number().int().nullable(),
   contactName: z.string().nullable(),
-  amount: z.number().nullable().describe("Gross amount (transactions: signed amount)."),
-  currency: z.string().nullable(),
+  amount: z
+    .number()
+    .nullable()
+    .describe(
+      "Gross amount in euro (the account currency) as sevdesk reports it; transactions: signed " +
+        "amount of the bank account.",
+    ),
+  foreignCurrency: z
+    .string()
+    .nullable()
+    .describe("Document currency when it is not EUR (ISO code, or unknown), else null."),
+  foreignAmount: z
+    .number()
+    .nullable()
+    .describe("Gross amount in that currency where sevdesk reports it (invoices, credit notes)."),
 });
 export type DocumentRef = z.infer<typeof documentRefSchema>;
+
+/**
+ * Currency of a document when it is not the euro: the ISO code, or
+ * "unknown" for anything that is not one (never free text). sevdesk's sum
+ * fields are in the account currency: invoices and credit notes carry the
+ * document currency in separate *ForeignCurrency fields, and vouchers
+ * have sumDiscountsForeignCurrency next to sumDiscounts.
+ */
+export function foreignCurrencyOf(currency: string | null): string | null {
+  if (currency === null) return null;
+  const code = currency.trim().toUpperCase();
+  if (code === "" || code === "EUR") return null;
+  return /^[A-Z]{3}$/.test(code) ? code : "unknown";
+}
 
 export interface AuditVoucher {
   readonly id: number;
@@ -224,7 +270,8 @@ export interface AuditVoucher {
   readonly supplierName: string | null;
   readonly status: number | null;
   readonly creditDebit: string | null;
-  readonly currency: string | null;
+  /** Document currency if not EUR; the sums are in euro either way. */
+  readonly foreignCurrency: string | null;
   readonly sumNet: number | null;
   readonly sumTax: number | null;
   readonly sumGross: number | null;
@@ -243,7 +290,7 @@ export function mapAuditVoucher(raw: Raw): AuditVoucher {
     supplierName: summary.supplierName,
     status: summary.status,
     creditDebit: summary.creditDebit,
-    currency: summary.currency,
+    foreignCurrency: foreignCurrencyOf(summary.currency),
     sumNet: summary.sumNet,
     sumTax: amount(raw.sumTax),
     sumGross: summary.sumGross,
@@ -262,7 +309,8 @@ export function voucherRef(v: AuditVoucher): DocumentRef {
     contactId: v.supplierId,
     contactName: v.supplierName,
     amount: v.sumGross,
-    currency: v.currency,
+    foreignCurrency: v.foreignCurrency,
+    foreignAmount: null,
   };
 }
 
@@ -295,6 +343,7 @@ export async function scanVouchers(
 }
 
 export interface AuditInvoice {
+  readonly kind: "invoice" | "credit_note";
   readonly id: number;
   readonly date: string | null;
   readonly invoiceNumber: string | null;
@@ -302,7 +351,8 @@ export interface AuditInvoice {
   readonly contactId: number | null;
   readonly contactName: string | null;
   readonly status: number | null;
-  readonly currency: string | null;
+  readonly foreignCurrency: string | null;
+  readonly foreignGross: number | null;
   readonly sumNet: number | null;
   readonly sumTax: number | null;
   readonly sumGross: number | null;
@@ -334,7 +384,9 @@ export async function scanInvoices(run: AuditRun, period: Period): Promise<Audit
   return rows
     .map((raw) => {
       const summary = mapInvoiceSummary(raw);
+      const foreignCurrency = foreignCurrencyOf(summary.currency);
       return {
+        kind: "invoice" as const,
         id: summary.id,
         date: summary.invoiceDate,
         invoiceNumber: summary.invoiceNumber,
@@ -342,7 +394,8 @@ export async function scanInvoices(run: AuditRun, period: Period): Promise<Audit
         contactId: summary.contactId,
         contactName: recipientOf(raw),
         status: summary.status,
-        currency: summary.currency,
+        foreignCurrency,
+        foreignGross: foreignCurrency === null ? null : amount(raw.sumGrossForeignCurrency),
         sumNet: summary.sumNet,
         sumTax: amount(raw.sumTax),
         sumGross: summary.sumGross,
@@ -353,16 +406,102 @@ export async function scanInvoices(run: AuditRun, period: Period): Promise<Audit
     .filter((i) => i.id > 0 && inPeriod(i.date, period));
 }
 
+/**
+ * GET /CreditNote declares no paging in the spec; sevdesk answers unpaged
+ * list requests with up to 100 objects, so a full answer may be cut.
+ */
+export const MAX_CREDIT_NOTES = 100;
+
+/** Credit notes dated in the period, one unpaged request. */
+export async function scanCreditNotes(run: AuditRun, period: Period): Promise<AuditInvoice[]> {
+  const { sevdesk } = run.call;
+  const answer = await run.request("credit notes", (signal) =>
+    sevdesk.call(
+      sevdesk.api.GET("/CreditNote", {
+        params: {
+          query: {
+            startDate: unixSeconds(period.startDate),
+            endDate: unixSeconds(period.endDate, true),
+          },
+        },
+        signal,
+      }),
+    ),
+  );
+  if (answer === undefined) return [];
+  const rows = objectsOf(answer.body);
+  if (rows.length >= MAX_CREDIT_NOTES) {
+    run.hit(
+      "cap:credit notes",
+      `sevdesk returned ${rows.length} credit notes in one answer (the API offers no paging ` +
+        "for them); more may exist. Narrow the period.",
+    );
+  }
+  return rows
+    .map((raw) => {
+      const foreignCurrency = foreignCurrencyOf(text(raw.currency));
+      return {
+        kind: "credit_note" as const,
+        id: integer(raw.id) ?? 0,
+        date: isoDateOf(raw.creditNoteDate),
+        invoiceNumber: text(raw.creditNoteNumber),
+        invoiceType: null,
+        contactId: refId(raw.contact),
+        contactName: recipientOf(raw),
+        status: integer(raw.status),
+        foreignCurrency,
+        foreignGross: foreignCurrency === null ? null : amount(raw.sumGrossForeignCurrency),
+        sumNet: amount(raw.sumNet),
+        sumTax: amount(raw.sumTax),
+        sumGross: amount(raw.sumGross),
+        openAmount: null,
+        taxRuleId: refId(raw.taxRule),
+      };
+    })
+    .filter((c) => c.id > 0 && inPeriod(c.date, period));
+}
+
+/**
+ * Sign of a revenue document in sums: cancellation invoices (SR) and credit
+ * notes reduce revenue. The spec does not say whether sevdesk stores them
+ * negative, so they count as -|amount| either way: never added, never
+ * subtracted twice.
+ */
+export function revenueSign(i: Pick<AuditInvoice, "kind" | "invoiceType">): 1 | -1 {
+  return i.kind === "credit_note" || i.invoiceType === "SR" ? -1 : 1;
+}
+
+/** `value` with the sign revenueSign gives; null stays null. */
+export function signed(value: number | null, sign: 1 | -1): number | null {
+  if (value === null) return null;
+  return sign === -1 ? -Math.abs(value) : value;
+}
+
+/**
+ * Final invoices (ER) next to advance or partial invoices (AR, TR): the spec
+ * does not say whether an ER's sums repeat the advances it settles, so the
+ * answer says the total may count them twice instead of guessing.
+ */
+export function partialInvoiceNote(invoices: readonly AuditInvoice[]): string | undefined {
+  const types = new Set(invoices.map((i) => i.invoiceType));
+  if (!types.has("ER") || !(types.has("AR") || types.has("TR"))) return undefined;
+  return (
+    "The period has final invoices (ER) and advance or partial invoices (AR, TR). If a final " +
+    "invoice repeats the amounts of its advances, they are counted twice; check those invoices."
+  );
+}
+
 export function invoiceRef(i: AuditInvoice): DocumentRef {
   return {
-    type: "invoice",
+    type: i.kind,
     id: i.id,
     date: i.date,
     number: i.invoiceNumber,
     contactId: i.contactId,
     contactName: i.contactName,
     amount: i.sumGross,
-    currency: i.currency,
+    foreignCurrency: i.foreignCurrency,
+    foreignAmount: i.foreignGross,
   };
 }
 
@@ -422,7 +561,8 @@ export function transactionRef(t: AuditTransaction): DocumentRef {
     contactId: null,
     contactName: t.payeePayerName,
     amount: t.amount,
-    currency: null,
+    foreignCurrency: null,
+    foreignAmount: null,
   };
 }
 
@@ -436,10 +576,6 @@ export function supplierKey(v: { supplierId: number | null; supplierName: string
   const name = normalized(v.supplierName);
   return name === "" ? null : `name:${name}`;
 }
-
-/** Document currency counts as euro when it is EUR or missing. */
-export const isEuro = (currency: string | null): boolean =>
-  currency === null || currency.toUpperCase() === "EUR";
 
 export const SEVERITIES = ["high", "medium", "low"] as const;
 export type Severity = (typeof SEVERITIES)[number];

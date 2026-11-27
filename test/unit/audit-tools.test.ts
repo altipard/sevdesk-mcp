@@ -194,7 +194,8 @@ describe("audit_vat", () => {
           contactId: 2003,
           contactName: "Cloud Ltd",
           amount: 20,
-          currency: "EUR",
+          foreignCurrency: null,
+          foreignAmount: null,
         },
       }),
     ]);
@@ -312,6 +313,25 @@ describe("reverse_charge_report", () => {
           ]),
         ),
       ),
+      http.get(sevdeskUrl("/CreditNote"), () =>
+        HttpResponse.json(
+          list([
+            {
+              id: "70",
+              objectName: "CreditNote",
+              creditNoteNumber: "GU-70",
+              creditNoteDate: "2026-03-12T00:00:00+01:00",
+              contact: ref(2001, "Contact"),
+              status: "200",
+              taxRule: ref(5, "TaxRule"),
+              currency: "EUR",
+              sumNet: "50",
+              sumTax: "0",
+              sumGross: "50",
+            },
+          ]),
+        ),
+      ),
     );
     const c = await connect();
     const result = await c.call("reverse_charge_report", MARCH);
@@ -320,15 +340,40 @@ describe("reverse_charge_report", () => {
       documents: Array<Record<string, unknown>>;
       page: { total: number };
     }>(result);
-    expect(data.totals.map((t) => [t.category, t.currency, t.documents, t.net])).toEqual([
-      ["nets_to_zero", "EUR", 1, 100],
-      ["payable", "EUR", 1, 40],
-      ["revenue", "EUR", 1, 500],
+    expect(data.totals.map((t) => [t.category, t.documents, t.net])).toEqual([
+      ["nets_to_zero", 1, 100],
+      ["payable", 1, 40],
+      ["revenue", 2, 450],
     ]);
-    expect(data.page.total).toBe(3);
-    expect(textOf(result).split("\n")[0]).toBe(
-      "13b 2026-03-01 to 2026-03-31 (EUR net): nets to zero 100, payable 40, own revenue 500; 3 documents.",
+    expect(data.page.total).toBe(4);
+    expect(queryOf(requestsTo("/CreditNote")[0])).toEqual({
+      startDate: String(unixSeconds("2026-03-01")),
+      endDate: String(unixSeconds("2026-03-31", true)),
+    });
+    expect((result.structuredContent as { disclaimer: string }).disclaimer).toContain(
+      "document date",
     );
+    expect(textOf(result).split("\n")[0]).toBe(
+      "13b 2026-03-01 to 2026-03-31 (EUR net): nets to zero 100, payable 40, own revenue 450; 4 documents.",
+    );
+  });
+
+  it("keeps the voucher part when a later scan fails", async () => {
+    api.server.use(
+      version("2.0"),
+      http.get(sevdeskUrl("/Voucher"), () =>
+        HttpResponse.json(list([voucher({ id: "1", taxRule: ref(12, "TaxRule"), sumNet: "100" })])),
+      ),
+      http.get(sevdeskUrl("/Invoice"), () => sevdeskError(500)),
+      http.get(sevdeskUrl("/CreditNote"), () => HttpResponse.json(list([]))),
+    );
+    const c = await connect();
+    const data = structured<{ truncated: boolean; note: string; totals: Array<{ net: number }> }>(
+      await c.call("reverse_charge_report", MARCH),
+    );
+    expect(data.truncated).toBe(true);
+    expect(data.note).toContain("Reading invoices failed");
+    expect(data.totals[0]?.net).toBe(100);
   });
 
   it("refuses bookkeeping 1.0", async () => {
@@ -419,6 +464,9 @@ describe("reconcile_transactions", () => {
       endDate: berlinDateTime("2026-03-31", true),
     });
     expect(queryOf(requestsTo("/Voucher")[0]).startDate).toBe(String(unixSeconds("2026-02-19")));
+    expect(queryOf(requestsTo("/Voucher")[0]).endDate).toBe(
+      String(unixSeconds("2026-04-10", true)),
+    );
     expect(data.counts).toEqual({
       openTransactions: 2,
       bookedTransactions: 1,
@@ -460,6 +508,31 @@ describe("summarize_documents", () => {
           ]),
         ),
       ),
+      http.get(sevdeskUrl("/CreditNote"), () =>
+        HttpResponse.json(
+          list([
+            {
+              id: "70",
+              objectName: "CreditNote",
+              creditNoteDate: "2026-06-02T00:00:00+02:00",
+              status: "1000",
+              currency: "EUR",
+              sumNet: "10",
+              sumTax: "1.9",
+              sumGross: "11.9",
+            },
+            {
+              id: "71",
+              objectName: "CreditNote",
+              creditNoteDate: "2026-06-03T00:00:00+02:00",
+              status: "100",
+              sumNet: "99",
+              sumTax: "0",
+              sumGross: "99",
+            },
+          ]),
+        ),
+      ),
     );
     const c = await connect();
     const result = await c.call("summarize_documents", {
@@ -472,16 +545,76 @@ describe("summarize_documents", () => {
       totals: unknown[];
       documents: number;
     }>(result);
-    expect(data.documents).toBe(3);
+    expect(data.documents).toBe(4);
     expect(data.groups.map((g) => [g.group, g.count, g.gross])).toEqual([
       ["2026-04", 1, 119],
       ["2026-05", 1, 119],
-      ["2026-06", 1, -119],
+      ["2026-06", 2, -130.9],
     ]);
-    expect(data.totals).toEqual([{ currency: "EUR", count: 3, net: 100, tax: 19, gross: 119 }]);
+    expect(data.totals).toEqual([
+      {
+        creditDebit: null,
+        count: 4,
+        net: 90,
+        tax: 17.1,
+        gross: 107.1,
+        foreignCurrencyDocuments: 0,
+      },
+    ]);
     expect(textOf(result).split("\n")[0]).toBe(
-      "3 invoices 2026-04-01 to 2026-06-30, gross 119 EUR.",
+      "4 invoices 2026-04-01 to 2026-06-30, gross 107.1 EUR.",
     );
+  });
+
+  it("sums income and expense vouchers separately", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Voucher"), () =>
+        HttpResponse.json(
+          list([
+            voucher({ id: "1", creditDebit: "D", sumGross: "50" }),
+            voucher({ id: "2", creditDebit: "C", sumGross: "500", currency: "CHF" }),
+          ]),
+        ),
+      ),
+    );
+    const c = await connect();
+    const result = await c.call("summarize_documents", { documentType: "vouchers", ...MARCH });
+    const data = structured<{ totals: Array<Record<string, unknown>>; note: string }>(result);
+    expect(data.totals.map((t) => [t.creditDebit, t.gross, t.foreignCurrencyDocuments])).toEqual([
+      ["C", 500, 1],
+      ["D", 50, 0],
+    ]);
+    expect(data.note).toContain("euro amounts");
+    expect(textOf(result).split("\n")[0]).toBe(
+      "2 vouchers 2026-03-01 to 2026-03-31, gross income 500 EUR, expenses 50 EUR.",
+    );
+  });
+
+  it("marks the answer truncated when sevdesk returns a full unpaged list of credit notes", async () => {
+    api.server.use(
+      http.get(sevdeskUrl("/Invoice"), () => HttpResponse.json(list([]))),
+      http.get(sevdeskUrl("/CreditNote"), () =>
+        HttpResponse.json(
+          list(
+            Array.from({ length: 100 }, (_, i) => ({
+              id: String(i + 1),
+              creditNoteDate: "2026-03-05T00:00:00+01:00",
+              status: "200",
+              sumNet: "1",
+              sumTax: "0",
+              sumGross: "1",
+            })),
+          ),
+        ),
+      ),
+    );
+    const c = await connect();
+    const data = structured<{ documents: number; truncated: boolean; note: string }>(
+      await c.call("summarize_documents", { documentType: "invoices", ...MARCH }),
+    );
+    expect(data.documents).toBe(100);
+    expect(data.truncated).toBe(true);
+    expect(data.note).toContain("100 credit notes");
   });
 
   it("refuses creditDebit for invoices", async () => {
@@ -505,10 +638,28 @@ describe("summarize_documents", () => {
     const data = structured<{ documents: number; truncated: boolean; note: string }>(
       await c.call("summarize_documents", { documentType: "vouchers", ...MARCH }),
     );
-    expect(requestsTo("/Voucher")).toHaveLength(MAX_AUDIT_DOCUMENTS / 100);
+    // 20 pages plus one probe of a single object after the cap.
+    expect(requestsTo("/Voucher")).toHaveLength(MAX_AUDIT_DOCUMENTS / 100 + 1);
+    expect(queryOf(requestsTo("/Voucher").at(-1))).toMatchObject({
+      limit: "1",
+      offset: String(MAX_AUDIT_DOCUMENTS),
+    });
     expect(data.documents).toBe(MAX_AUDIT_DOCUMENTS);
     expect(data.truncated).toBe(true);
     expect(data.note).toContain(`first ${MAX_AUDIT_DOCUMENTS} vouchers`);
+  });
+
+  it("does not report the cap when exactly the cap exists", async () => {
+    const vouchers = Array.from({ length: MAX_AUDIT_DOCUMENTS }, (_, i) =>
+      voucher({ id: String(i + 1) }),
+    );
+    api.server.use(http.get(sevdeskUrl("/Voucher"), paged(vouchers)));
+    const c = await connect();
+    const data = structured<{ documents: number; truncated: boolean }>(
+      await c.call("summarize_documents", { documentType: "vouchers", ...MARCH }),
+    );
+    expect(data.documents).toBe(MAX_AUDIT_DOCUMENTS);
+    expect(data.truncated).toBe(false);
   });
 
   it("keeps what was read when a later page fails, fails when the first does", async () => {

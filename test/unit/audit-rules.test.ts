@@ -8,15 +8,18 @@ import {
   mapLimited,
 } from "../../src/tools/audit-common.js";
 import {
+  billedMonths,
   findDuplicates,
   findGaps,
   monthsBefore,
+  type Summable,
   summarize,
 } from "../../src/tools/audit-documents.js";
 import {
   checkSupplierConsistency,
   checkVoucher,
   classifyReverseCharge,
+  countryOf,
   reverseChargeTotals,
 } from "../../src/tools/audit-vat.js";
 import { agingBucketOf } from "../../src/tools/invoices.js";
@@ -31,7 +34,7 @@ function voucher(overrides: Partial<AuditVoucher> = {}): AuditVoucher {
     supplierName: "Cloud Ltd",
     status: 100,
     creditDebit: "D",
-    currency: "EUR",
+    foreignCurrency: null,
     sumNet: 100,
     sumTax: 0,
     sumGross: 100,
@@ -94,7 +97,7 @@ describe("audit_vat rules", () => {
     expect(finding?.suggestion).toContain("Steuerberater");
   });
 
-  it("suggests 12 or 13 for a supplier outside the EU, medium for rule 10", () => {
+  it("suggests 12 or 13 for a supplier outside the EU, low for rule 10", () => {
     const [nonEu] = checkVoucher({
       voucher: voucher(),
       positions: zeroPositions,
@@ -106,7 +109,34 @@ describe("audit_vat rules", () => {
       positions: zeroPositions,
       country: { foreign: true, region: "unknown" },
     });
-    expect(ten).toMatchObject({ severity: "medium", code: "FOREIGN_SUPPLIER_DOMESTIC_RULE" });
+    expect(ten).toMatchObject({ severity: "low", code: "FOREIGN_SUPPLIER_DOMESTIC_RULE" });
+  });
+
+  it("names all candidates neutrally without a usable VAT ID, 8 or 12/13 for XI", () => {
+    const [unknown] = checkVoucher({
+      voucher: voucher(),
+      positions: zeroPositions,
+      country: { foreign: true, region: "unknown" },
+    });
+    expect(unknown?.suggestedTaxRules).toEqual([14, 8, 12, 13]);
+    expect(unknown?.suggestion).toContain("missing or unclear");
+    const [xi] = checkVoucher({
+      voucher: voucher(),
+      positions: zeroPositions,
+      country: { foreign: true, region: "xi" },
+    });
+    expect(xi?.suggestedTaxRules).toEqual([8, 12, 13]);
+    expect(xi?.suggestion).toContain("goods only");
+  });
+
+  it("does not treat a foreign address with a German VAT ID as EU-foreign", () => {
+    expect(
+      checkVoucher({
+        voucher: voucher(),
+        positions: zeroPositions,
+        country: { foreign: true, region: "de_vat" },
+      }),
+    ).toEqual([]);
   });
 
   it("does not flag a German supplier, or a foreign one charging VAT", () => {
@@ -259,9 +289,33 @@ describe("audit_vat rules", () => {
   });
 
   it("flags foreign currency as low", () => {
-    expect(codes(checkVoucher({ voucher: voucher({ currency: "USD" }) }))).toEqual([
-      "FOREIGN_CURRENCY",
-    ]);
+    const [finding] = checkVoucher({ voucher: voucher({ foreignCurrency: "USD" }) });
+    expect(finding).toMatchObject({ severity: "low", code: "FOREIGN_CURRENCY" });
+    expect(finding?.detail).toContain("Document currency USD");
+    expect(finding?.document.amount).toBe(100);
+    expect(finding?.document.foreignCurrency).toBe("USD");
+  });
+
+  it("skips tax amount checks for self-assessed rules and compares net only", () => {
+    // 13b voucher where sevdesk may show 19 % self-assessed tax: no sum findings.
+    const rc = voucher({ taxRuleId: 12, sumNet: 100, sumTax: 19, sumGross: 100 });
+    const positions = {
+      partial: false,
+      positions: [{ accountDatevId: 6815, taxRate: 0, sumNet: 100, sumTax: 19, sumGross: 119 }],
+    };
+    expect(checkVoucher({ voucher: rc, positions })).toEqual([]);
+    expect(
+      codes(
+        checkVoucher({
+          voucher: voucher({ taxRuleId: 14, sumNet: 200, sumTax: 0, sumGross: 200 }),
+          positions,
+        }),
+      ),
+    ).toEqual(["POSITIONS_DIFFER_FROM_HEADER"]);
+    // The same amounts under rule 9 are findings.
+    expect(
+      codes(checkVoucher({ voucher: voucher({ sumNet: 100, sumTax: 19, sumGross: 100 }) })),
+    ).toEqual(["NET_PLUS_TAX_NOT_GROSS"]);
   });
 
   it("finds suppliers booked with different rules, per supplier once", () => {
@@ -283,8 +337,39 @@ describe("audit_vat rules", () => {
   });
 });
 
+describe("supplier country", () => {
+  const addr = (countryId: number) => ({
+    country: { id: String(countryId) },
+    category: { id: "47" },
+  });
+  it("reads the address country and the VAT ID prefix", () => {
+    expect(countryOf({ addresses: [addr(1)], vatNumber: "DE123" })).toEqual({
+      foreign: false,
+      region: "de_vat",
+    });
+    expect(countryOf({ addresses: [addr(13)], vatNumber: "IE123" })).toEqual({
+      foreign: true,
+      region: "eu",
+    });
+    // Foreign address, German VAT ID: not an EU-foreign business.
+    expect(countryOf({ addresses: [addr(13)], vatNumber: "DE123" })).toEqual({
+      foreign: true,
+      region: "de_vat",
+    });
+    expect(countryOf({ addresses: [addr(13)], vatNumber: "XI123" }).region).toBe("xi");
+    expect(countryOf({ addresses: [addr(13)], vatNumber: "CHE-1" }).region).toBe("non_eu");
+    expect(countryOf({ addresses: [addr(13)], vatNumber: null })).toEqual({
+      foreign: true,
+      region: "unknown",
+    });
+    expect(countryOf({ vatNumber: "FR12" })).toEqual({ foreign: true, region: "eu" });
+    expect(countryOf({})).toEqual({ foreign: null, region: "unknown" });
+  });
+});
+
 describe("reverse charge", () => {
   const invoice = (overrides: Partial<AuditInvoice> = {}): AuditInvoice => ({
+    kind: "invoice",
     id: 50,
     date: "2026-03-05",
     invoiceNumber: "RE-50",
@@ -292,7 +377,8 @@ describe("reverse charge", () => {
     contactId: 9,
     contactName: "Kunde GmbH",
     status: 200,
-    currency: "EUR",
+    foreignCurrency: null,
+    foreignGross: null,
     sumNet: 1000,
     sumTax: 0,
     sumGross: 1000,
@@ -318,7 +404,11 @@ describe("reverse charge", () => {
         invoice({ id: 51, invoiceType: "MA" }),
         invoice({ id: 52, status: 100 }),
         invoice({ id: 53, taxRuleId: 1 }),
-        invoice({ id: 54, currency: "USD", sumNet: 10 }),
+        invoice({ id: 54, foreignCurrency: "USD", foreignGross: 12, sumNet: 10 }),
+        invoice({ id: 55, invoiceType: "SR", sumNet: 300 }),
+        invoice({ id: 56, invoiceType: "SR", sumNet: -300 }),
+        invoice({ id: 57, kind: "credit_note", invoiceType: null, sumNet: 100 }),
+        invoice({ id: 58, kind: "credit_note", invoiceType: null, status: 100, sumNet: 5 }),
       ],
       false,
     );
@@ -329,13 +419,19 @@ describe("reverse charge", () => {
       "payable:voucher:3",
       "revenue:invoice:50",
       "revenue:invoice:54",
+      "revenue:invoice:55",
+      "revenue:invoice:56",
+      "revenue:credit_note:57",
       "revenue:voucher:6",
+    ]);
+    // Cancellations and credit notes reduce, whatever sign sevdesk stores.
+    expect(classified.filter((c) => c.net !== null && c.net < 0).map((c) => c.net)).toEqual([
+      -20, -300, -300, -100,
     ]);
     const totals = reverseChargeTotals(classified);
     expect(totals).toContainEqual(
       expect.objectContaining({
         category: "nets_to_zero",
-        currency: "EUR",
         documents: 3,
         net: 130.5,
         taxRules: [12, 14],
@@ -345,11 +441,14 @@ describe("reverse charge", () => {
       expect.objectContaining({ category: "payable", documents: 1, net: 30, taxRules: [13] }),
     );
     expect(totals).toContainEqual(
-      expect.objectContaining({ category: "revenue", currency: "EUR", documents: 2, net: 1200 }),
+      expect.objectContaining({
+        category: "revenue",
+        documents: 6,
+        net: 1000 + 10 - 300 - 300 - 100 + 200,
+        foreignCurrencyDocuments: 1,
+      }),
     );
-    expect(totals).toContainEqual(
-      expect.objectContaining({ category: "revenue", currency: "USD", documents: 1, net: 10 }),
-    );
+    expect(totals).toHaveLength(3);
     expect(classifyReverseCharge([voucher({ taxRuleId: 12, status: 50 })], [], true)).toHaveLength(
       1,
     );
@@ -367,7 +466,7 @@ describe("reverse charge", () => {
 describe("duplicates", () => {
   const options = { windowDays: 7, draftAgeDays: 30, today: "2026-04-30" };
 
-  it("finds the same number per supplier, not across suppliers or sides", () => {
+  it("finds the same number and amount per supplier, not across suppliers or sides", () => {
     const findings = findDuplicates(
       [
         voucher({ id: 1, description: "INV-1" }),
@@ -388,8 +487,8 @@ describe("duplicates", () => {
         voucher({ id: 1, description: "A", date: "2026-03-01" }),
         voucher({ id: 2, description: "B", date: "2026-03-05" }),
         voucher({ id: 3, description: "C", date: "2026-04-01" }),
-        voucher({ id: 4, description: "X", date: "2026-03-01", sumGross: 50 }),
-        voucher({ id: 5, description: "X", date: "2026-03-02", sumGross: 50 }),
+        voucher({ id: 4, description: "X-9", date: "2026-03-01", sumGross: 50 }),
+        voucher({ id: 5, description: "X-9", date: "2026-03-02", sumGross: 50 }),
         voucher({ id: 6, description: "Z", date: "2026-03-01", sumGross: 0 }),
         voucher({ id: 7, description: "Y", date: "2026-03-01", sumGross: 0 }),
       ],
@@ -399,6 +498,22 @@ describe("duplicates", () => {
       "SAME_NUMBER:4,5",
       "SAME_AMOUNT_NEAR_DATE:1,2",
     ]);
+  });
+
+  it("treats text without a digit as no number, and the same number with other amounts as low", () => {
+    const findings = findDuplicates(
+      [
+        voucher({ id: 1, description: "Miete", date: "2026-01-01", sumGross: 900 }),
+        voucher({ id: 2, description: "Miete", date: "2026-02-01", sumGross: 900 }),
+        voucher({ id: 3, description: "R-77", date: "2026-02-01", sumGross: 10 }),
+        voucher({ id: 4, description: "R-77", date: "2026-03-20", sumGross: 12 }),
+      ],
+      options,
+    );
+    expect(findings).toEqual([expect.objectContaining({ severity: "low", code: "SAME_NUMBER" })]);
+    expect(findings[0]?.documents.map((d) => d.id)).toEqual([3, 4]);
+    // Free text never reaches the detail.
+    expect(findings[0]?.detail).not.toContain("R-77");
   });
 
   it("lists drafts older than draftAgeDays", () => {
@@ -445,7 +560,7 @@ describe("subscription gaps", () => {
         firstSeen: "2025-12",
         lastSeen: "2026-06",
         typicalAmount: 29.99,
-        currency: "EUR",
+        foreignCurrency: null,
         missingMonths: ["2026-03", "2026-05"],
         possiblyEnded: false,
       }),
@@ -481,6 +596,21 @@ describe("subscription gaps", () => {
     ).toBe(0);
   });
 
+  it("does not see a gap when month-end billing drifts into the next month", () => {
+    const dates = ["2026-01-31", "2026-03-01", "2026-03-31", "2026-04-30", "2026-05-31"];
+    const vouchers = dates.map((date, i) => voucher({ id: 200 + i, date }));
+    const { gaps, detected } = findGaps(
+      vouchers,
+      { startDate: "2026-01-01", endDate: "2026-05-31" },
+      { minMonths: 3, today: "2026-06-15" },
+    );
+    expect(detected).toBe(1);
+    expect(gaps).toEqual([]);
+    expect([...billedMonths(["2026-01-31", "2026-03-01"])].sort()).toHaveLength(2);
+    // A single early voucher without a month-end one before it stays in its month.
+    expect(billedMonths(["2026-01-15", "2026-03-02"]).size).toBe(2);
+  });
+
   it("monthsBefore", () => {
     expect(monthsBefore("2026-03-15", 6)).toBe("2025-09-01");
     expect(monthsBefore("2026-01-31", 0)).toBe("2026-01-01");
@@ -489,38 +619,76 @@ describe("subscription gaps", () => {
 });
 
 describe("summarize", () => {
-  const doc = (overrides: Record<string, unknown> = {}) => ({
+  const doc = (overrides: Partial<Summable> = {}): Summable => ({
     date: "2026-04-10",
     statusName: "paid",
     contactKey: "9",
     contactName: "Kunde GmbH",
-    currency: "EUR",
+    creditDebit: null,
+    foreign: false,
     net: 100,
     tax: 19,
     gross: 119,
     ...overrides,
   });
 
-  it("groups by month per currency with totals; credit notes reduce", () => {
+  it("groups by month in euro with totals; negative documents reduce", () => {
     const result = summarize(
       [
         doc(),
         doc({ date: "2026-04-20", net: -50, tax: -9.5, gross: -59.5 }),
         doc({ date: "2026-05-01" }),
-        doc({ currency: "USD" }),
+        doc({ foreign: true }),
         doc({ date: null, tax: null }),
       ],
       "month",
     );
+    const row = (
+      group: string,
+      count: number,
+      net: number,
+      tax: number,
+      gross: number,
+      foreign = 0,
+    ) => ({
+      group,
+      label: null,
+      creditDebit: null,
+      count,
+      net,
+      tax,
+      gross,
+      foreignCurrencyDocuments: foreign,
+    });
     expect(result.groups).toEqual([
-      { group: "2026-04", label: null, currency: "EUR", count: 2, net: 50, tax: 9.5, gross: 59.5 },
-      { group: "2026-04", label: null, currency: "USD", count: 1, net: 100, tax: 19, gross: 119 },
-      { group: "2026-05", label: null, currency: "EUR", count: 1, net: 100, tax: 19, gross: 119 },
-      { group: "unknown", label: null, currency: "EUR", count: 1, net: 100, tax: 19, gross: 119 },
+      row("2026-04", 3, 150, 28.5, 178.5, 1),
+      row("2026-05", 1, 100, 19, 119),
+      row("unknown", 1, 100, 19, 119),
     ]);
     expect(result.totals).toEqual([
-      { currency: "EUR", count: 4, net: 250, tax: 47.5, gross: 297.5 },
-      { currency: "USD", count: 1, net: 100, tax: 19, gross: 119 },
+      {
+        creditDebit: null,
+        count: 5,
+        net: 350,
+        tax: 66.5,
+        gross: 416.5,
+        foreignCurrencyDocuments: 1,
+      },
+    ]);
+  });
+
+  it("never mixes income and expense vouchers", () => {
+    const result = summarize(
+      [doc({ creditDebit: "C", gross: 500 }), doc({ creditDebit: "D", gross: 200 })],
+      "month",
+    );
+    expect(result.groups.map((g) => [g.group, g.creditDebit, g.gross])).toEqual([
+      ["2026-04", "C", 500],
+      ["2026-04", "D", 200],
+    ]);
+    expect(result.totals.map((t) => [t.creditDebit, t.gross])).toEqual([
+      ["C", 500],
+      ["D", 200],
     ]);
   });
 
@@ -557,7 +725,8 @@ describe("reconcile", () => {
       contactId: 7,
       contactName: "Cloud Ltd",
       amount: 100,
-      currency: "EUR",
+      foreignCurrency: null,
+      foreignAmount: null,
     },
     direction: -1,
     amount: 100,
@@ -601,6 +770,11 @@ describe("reconcile", () => {
     );
     expect(result.matches.map((m) => m.transaction.id)).toEqual([902]);
     expect(result.unmatchedTransactions.map((t) => t.id)).toEqual([900, 901, 903]);
+  });
+
+  it("treats amounts within one cent as equal despite float noise", () => {
+    expect(reconcile([tx({ amount: -100.01 })], [doc()], 14).matches).toHaveLength(1);
+    expect(reconcile([tx({ amount: -100.02 })], [doc()], 14).matches).toHaveLength(0);
   });
 
   it("rates a name match within a week high, a close date medium", () => {

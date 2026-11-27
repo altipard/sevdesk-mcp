@@ -1,26 +1,30 @@
 import { z } from "zod";
 import { defineTool } from "../policy/registry.js";
 import {
+  type AuditInvoice,
   AuditRun,
   type AuditVoucher,
   auditFields,
   checkPeriod,
   documentRefSchema,
-  invoiceRef,
-  isEuro,
   normalized,
   type Period,
+  partialInvoiceNote,
   periodInput,
   periodSchema,
+  revenueSign,
   SEVERITIES,
+  scanCreditNotes,
   scanInvoices,
   scanVouchers,
   severityRank,
+  signed,
   supplierKey,
   voucherRef,
 } from "./audit-common.js";
 import {
   badInput,
+  CREDIT_NOTE_STATUS,
   cents,
   daysBetween,
   FOREIGN_DATA_NOTE,
@@ -67,28 +71,50 @@ export function findDuplicates(
     return [...groups.values()];
   };
 
-  // Same voucher number (description) for the same supplier and side.
+  // Same voucher number for the same supplier and side. The description is
+  // free text ("Miete" every month), so it only counts as a number when it
+  // has a digit, and only the same number with the same amount is high.
   const numbered = new Set<string>();
+  const pair = (x: AuditVoucher, y: AuditVoucher) =>
+    `${Math.min(x.id, y.id)}-${Math.max(x.id, y.id)}`;
   for (const group of groupBy((v) => {
     const supplier = supplierKey(v);
     const number = normalized(v.description);
-    return supplier === null || number === ""
+    return supplier === null || !/\d/.test(number)
       ? null
       : `${supplier}\u0000${v.creditDebit}\u0000${number}`;
   })) {
     if (group.length < 2) continue;
-    const sorted = [...group].sort(byDate);
-    for (let i = 1; i < sorted.length; i++) {
-      numbered.add(`${(sorted[0] as AuditVoucher).id}-${(sorted[i] as AuditVoucher).id}`);
+    const byAmount = new Map<string, AuditVoucher[]>();
+    for (const v of group) {
+      const key = v.sumGross === null ? "none" : String(cents(v.sumGross));
+      byAmount.set(key, [...(byAmount.get(key) ?? []), v]);
     }
-    findings.push({
-      severity: "high",
-      code: "SAME_NUMBER",
-      documents: sorted.map(voucherRef),
-      detail:
-        `${group.length} vouchers of the same supplier with the number "${sorted[0]?.description}"; ` +
-        "possibly booked twice.",
-    });
+    let same = false;
+    for (const [key, members] of byAmount) {
+      if (members.length < 2 || key === "none") continue;
+      same = true;
+      const sorted = [...members].sort(byDate);
+      for (const x of sorted) for (const y of sorted) if (x.id !== y.id) numbered.add(pair(x, y));
+      findings.push({
+        severity: "high",
+        code: "SAME_NUMBER",
+        documents: sorted.map(voucherRef),
+        detail:
+          `${sorted.length} vouchers of the same supplier with the same voucher number and ` +
+          "amount; possibly booked twice.",
+      });
+    }
+    if (!same) {
+      findings.push({
+        severity: "low",
+        code: "SAME_NUMBER",
+        documents: [...group].sort(byDate).map(voucherRef),
+        detail:
+          `${group.length} vouchers of the same supplier with the same voucher number but ` +
+          "different amounts; check whether one corrects or repeats the other.",
+      });
+    }
   }
 
   // Same supplier and amount within the window.
@@ -97,7 +123,7 @@ export function findDuplicates(
     if (supplier === null || v.sumGross === null || v.sumGross === 0 || v.date === null) {
       return null;
     }
-    return `${supplier}\u0000${v.creditDebit}\u0000${cents(v.sumGross)}\u0000${v.currency ?? ""}`;
+    return `${supplier}\u0000${v.creditDebit}\u0000${cents(v.sumGross)}\u0000${v.foreignCurrency ?? ""}`;
   })) {
     if (group.length < 2) continue;
     const sorted = [...group].sort(byDate);
@@ -105,16 +131,15 @@ export function findDuplicates(
     const flush = () => {
       if (cluster.length >= 2) {
         const first = cluster[0] as AuditVoucher;
-        const covered = cluster.slice(1).every((v) => numbered.has(`${first.id}-${v.id}`));
+        const covered = cluster.slice(1).every((v) => numbered.has(pair(first, v)));
         if (!covered) {
           findings.push({
             severity: "medium",
             code: "SAME_AMOUNT_NEAR_DATE",
             documents: cluster.map(voucherRef),
             detail:
-              `${cluster.length} vouchers of the same supplier over ${first.sumGross} ` +
-              `${first.currency ?? ""} within ${options.windowDays} days; check whether one is a ` +
-              "duplicate.",
+              `${cluster.length} vouchers of the same supplier over ${first.sumGross} EUR within ` +
+              `${options.windowDays} days; check whether one is a duplicate.`,
           });
         }
       }
@@ -244,8 +269,11 @@ const gapSchema = z.object({
   monthsSeen: z.number().int().describe("Distinct months with a voucher, history included."),
   firstSeen: z.string().describe("YYYY-MM"),
   lastSeen: z.string().describe("YYYY-MM"),
-  typicalAmount: z.number().nullable().describe("Median gross amount."),
-  currency: z.string().nullable(),
+  typicalAmount: z.number().nullable().describe("Median gross amount in euro."),
+  foreignCurrency: z
+    .string()
+    .nullable()
+    .describe("Document currency if the supplier bills in another currency, else null."),
   missingMonths: z.array(z.string()).describe("Months of the period without a voucher, YYYY-MM."),
   possiblyEnded: z
     .boolean()
@@ -261,6 +289,32 @@ const median = (values: number[]): number | null => {
     ? (sorted[mid] as number)
     : cents(((sorted[mid - 1] as number) + (sorted[mid] as number)) / 2);
 };
+
+/**
+ * Months a supplier's vouchers cover. Billing at month end drifts into the
+ * next month (31.01., then 01.03. for February): a voucher on day 1-3 counts
+ * for the month before when that month has none and either its own month
+ * has another voucher or the month before that ends with one on day 28+.
+ */
+export function billedMonths(dates: readonly string[]): Set<number> {
+  const days = new Map<number, number[]>();
+  for (const date of dates) {
+    const month = monthIndex(date.slice(0, 7));
+    days.set(month, [...(days.get(month) ?? []), Number(date.slice(8, 10))]);
+  }
+  const covered = new Set(days.keys());
+  for (const month of [...days.keys()].sort((a, b) => a - b)) {
+    const inMonth = days.get(month) ?? [];
+    if (!inMonth.some((day) => day <= 3) || covered.has(month - 1)) continue;
+    const lateBefore = (days.get(month - 2) ?? []).some((day) => day >= 28);
+    if (inMonth.length >= 2) covered.add(month - 1);
+    else if (lateBefore) {
+      covered.add(month - 1);
+      covered.delete(month);
+    }
+  }
+  return covered;
+}
 
 /**
  * Suppliers with a monthly cadence (vouchers in at least minMonths distinct
@@ -285,9 +339,7 @@ export function findGaps(
   const gaps: Gap[] = [];
   let detected = 0;
   for (const group of groups.values()) {
-    const months = [...new Set(group.map((v) => monthIndex((v.date as string).slice(0, 7))))].sort(
-      (a, b) => a - b,
-    );
+    const months = [...billedMonths(group.map((v) => v.date as string))].sort((a, b) => a - b);
     if (months.length < options.minMonths) continue;
     const steps = months.slice(1).map((m, i) => m - (months[i] as number));
     // Monthly when at least half the steps are one month; missing months show as longer steps.
@@ -303,7 +355,7 @@ export function findGaps(
     let trailing = 0;
     for (let m = periodEnd; m >= periodStart && !seen.has(m); m--) trailing++;
     const latest = [...group].sort(byDate)[group.length - 1] as AuditVoucher;
-    const currencies = new Set(group.map((v) => v.currency ?? "EUR"));
+    const foreign = group.map((v) => v.foreignCurrency).find((c) => c !== null) ?? null;
     gaps.push({
       supplierId: latest.supplierId,
       supplierName: latest.supplierName,
@@ -311,7 +363,7 @@ export function findGaps(
       firstSeen: monthOf(first),
       lastSeen: monthOf(months[months.length - 1] as number),
       typicalAmount: median(group.map((v) => v.sumGross).filter((a): a is number => a !== null)),
-      currency: currencies.size === 1 ? ([...currencies][0] ?? null) : null,
+      foreignCurrency: foreign,
       missingMonths: missing.map(monthOf),
       possiblyEnded: trailing >= 2,
     });
@@ -384,7 +436,13 @@ export const findSubscriptionGaps = defineTool({
         gaps,
         page,
         truncated: run.truncated,
-        ...run.noteField([vouchers.length === 0 && "No expense vouchers in the period."]),
+        ...run.noteField([
+          run.capped("vouchers") &&
+            `The cap was hit with ${args.historyMonths} months of history included, so months ` +
+              "reported missing may simply not have been read; lower historyMonths or narrow " +
+              "the period.",
+          vouchers.length === 0 && "No expense vouchers in the period.",
+        ]),
       },
       {
         summary:
@@ -407,22 +465,32 @@ export const SUMMARY_INVOICE_TYPES = ["RE", "TR", "AR", "ER", "SR"] as const;
 const groupSchema = z.object({
   group: z.string().describe("YYYY-MM, status name, or contact ID (name if there is none)."),
   label: z.string().nullable().describe("Contact name for groupBy contact."),
-  currency: z.string(),
+  creditDebit: z
+    .enum(["C", "D"])
+    .nullable()
+    .describe("Vouchers: C income or D expenses, never mixed in one group; null for invoices."),
   count: z.number().int(),
-  net: z.number(),
-  tax: z.number(),
-  gross: z.number(),
+  net: z.number().describe("Euro."),
+  tax: z.number().describe("Euro."),
+  gross: z.number().describe("Euro."),
+  foreignCurrencyDocuments: z
+    .number()
+    .int()
+    .describe("Documents in another currency; their euro amounts are included."),
 });
 type Group = z.infer<typeof groupSchema>;
 
 const totalSchema = groupSchema.omit({ group: true, label: true });
+type Total = z.infer<typeof totalSchema>;
 
-interface Summable {
+export interface Summable {
   date: string | null;
   statusName: string;
   contactKey: string;
   contactName: string | null;
-  currency: string | null;
+  creditDebit: "C" | "D" | null;
+  foreign: boolean;
+  /** Euro amounts, already signed (cancellations and credit notes negative). */
   net: number | null;
   tax: number | null;
   gross: number | null;
@@ -431,11 +499,10 @@ interface Summable {
 export function summarize(
   docs: readonly Summable[],
   groupBy: Grouping,
-): { groups: Group[]; totals: z.infer<typeof totalSchema>[] } {
+): { groups: Group[]; totals: Total[] } {
   const groups = new Map<string, Group>();
-  const totals = new Map<string, z.infer<typeof totalSchema>>();
+  const totals = new Map<string, Total>();
   for (const d of docs) {
-    const currency = isEuro(d.currency) ? "EUR" : (d.currency as string);
     const group =
       groupBy === "month"
         ? (d.date?.slice(0, 7) ?? "unknown")
@@ -445,52 +512,65 @@ export function summarize(
     const net = d.net ?? 0;
     const gross = d.gross ?? 0;
     const tax = d.tax ?? (d.net !== null && d.gross !== null ? d.gross - d.net : 0);
-    const key = `${group}\u0000${currency}`;
+    const side = d.creditDebit ?? "";
+    const key = `${group}\u0000${side}`;
+    const empty = { creditDebit: d.creditDebit, count: 0, net: 0, tax: 0, gross: 0 };
     const entry = groups.get(key) ?? {
       group,
       label: groupBy === "contact" ? d.contactName : null,
-      currency,
-      count: 0,
-      net: 0,
-      tax: 0,
-      gross: 0,
+      ...empty,
+      foreignCurrencyDocuments: 0,
     };
-    const total = totals.get(currency) ?? { currency, count: 0, net: 0, tax: 0, gross: 0 };
+    const total = totals.get(side) ?? { ...empty, foreignCurrencyDocuments: 0 };
     for (const target of [entry, total]) {
       target.count++;
       target.net = cents(target.net + net);
       target.tax = cents(target.tax + tax);
       target.gross = cents(target.gross + gross);
+      if (d.foreign) target.foreignCurrencyDocuments++;
     }
     if (entry.label === null && groupBy === "contact") entry.label = d.contactName;
     groups.set(key, entry);
-    totals.set(currency, total);
+    totals.set(side, total);
   }
+  const sideOrder = (g: { creditDebit: string | null }) => g.creditDebit ?? "";
   const list = [...groups.values()].sort((a, b) =>
     groupBy === "contact"
-      ? b.gross - a.gross || a.group.localeCompare(b.group)
-      : a.group.localeCompare(b.group) || a.currency.localeCompare(b.currency),
+      ? sideOrder(a).localeCompare(sideOrder(b)) ||
+        Math.abs(b.gross) - Math.abs(a.gross) ||
+        a.group.localeCompare(b.group)
+      : a.group.localeCompare(b.group) || sideOrder(a).localeCompare(sideOrder(b)),
   );
-  return { groups: list, totals: [...totals.values()] };
+  return {
+    groups: list,
+    totals: [...totals.values()].sort((a, b) => sideOrder(a).localeCompare(sideOrder(b))),
+  };
 }
 
 const contactKeyOf = (id: number | null, name: string | null) =>
   id !== null ? String(id) : (name ?? "none");
+
+const statusNameOf = (i: AuditInvoice): string => {
+  if (i.status === null) return "unknown";
+  if (i.kind === "credit_note") return `credit_note_${CREDIT_NOTE_STATUS[i.status] ?? "unknown"}`;
+  return INVOICE_STATUS[i.status] ?? "unknown";
+};
 
 export const summarizeDocuments = defineTool({
   name: "summarize_documents",
   title: "Summarize sevdesk invoices or vouchers",
   description:
     "Adds up invoices or vouchers of a period on the server and returns count, net, tax and " +
-    "gross per month, status or contact and in total, per currency. Use it for questions like " +
-    "revenue in Q2 or costs per supplier instead of listing every document. Invoices: reminders " +
-    "(MA) and recurring templates (WKR) are left out, cancellations (SR) count with their own " +
-    "sign; drafts are left out unless includeDrafts." +
+    "gross in euro per month, status or contact and in total. Use it for questions like " +
+    "revenue in Q2 or costs per supplier instead of listing every document. Vouchers: income " +
+    "(C) and expenses (D) are summed separately, never mixed. Invoices: credit notes are " +
+    "included and, like cancellation invoices (SR), subtracted; reminders (MA) and recurring " +
+    "templates (WKR) are left out; drafts are left out unless includeDrafts." +
     FOREIGN_DATA_NOTE,
   class: "R",
   operationId: (args: { documentType: "invoices" | "vouchers" }) =>
     args.documentType === "invoices" ? "getInvoices" : "getVouchers",
-  operations: ["getInvoices", "getVouchers"],
+  operations: ["getInvoices", "getVouchers", "getCreditNotes"],
   inputSchema: z.object({
     documentType: z.enum(["invoices", "vouchers"]),
     ...periodInput,
@@ -505,7 +585,9 @@ export const summarizeDocuments = defineTool({
     groupBy: z.enum(GROUPINGS),
     documents: z.number().int().describe("Documents summed."),
     groups: z.array(groupSchema),
-    totals: z.array(totalSchema).describe("Per currency, over all groups."),
+    totals: z
+      .array(totalSchema)
+      .describe("Over all groups: one entry for invoices, one per side for vouchers."),
     page: pageSchema,
     ...auditFields,
   }),
@@ -517,21 +599,30 @@ export const summarizeDocuments = defineTool({
     }
     const run = new AuditRun(call);
     let docs: Summable[];
+    const extra: (string | undefined)[] = [];
     if (args.documentType === "invoices") {
       const types = new Set<string>(SUMMARY_INVOICE_TYPES);
-      docs = (await scanInvoices(run, period))
+      const invoices = (await scanInvoices(run, period))
         .filter((i) => i.status !== 50 && (args.includeDrafts || i.status !== 100))
-        .filter((i) => i.invoiceType === null || types.has(i.invoiceType))
-        .map((i) => ({
+        .filter((i) => i.invoiceType === null || types.has(i.invoiceType));
+      const creditNotes = (await scanCreditNotes(run, period)).filter(
+        (c) => args.includeDrafts || c.status !== 100,
+      );
+      extra.push(partialInvoiceNote(invoices));
+      docs = [...invoices, ...creditNotes].map((i) => {
+        const sign = revenueSign(i);
+        return {
           date: i.date,
-          statusName: i.status === null ? "unknown" : (INVOICE_STATUS[i.status] ?? "unknown"),
+          statusName: statusNameOf(i),
           contactKey: contactKeyOf(i.contactId, i.contactName),
-          contactName: invoiceRef(i).contactName,
-          currency: i.currency,
-          net: i.sumNet,
-          tax: i.sumTax,
-          gross: i.sumGross,
-        }));
+          contactName: i.contactName,
+          creditDebit: null,
+          foreign: i.foreignCurrency !== null,
+          net: signed(i.sumNet, sign),
+          tax: signed(i.sumTax, sign),
+          gross: signed(i.sumGross, sign),
+        };
+      });
     } else {
       docs = (await scanVouchers(run, period, args.creditDebit))
         .filter((v) => args.includeDrafts || v.status !== 50)
@@ -540,7 +631,8 @@ export const summarizeDocuments = defineTool({
           statusName: v.status === null ? "unknown" : (VOUCHER_STATUS[v.status] ?? "unknown"),
           contactKey: contactKeyOf(v.supplierId, v.supplierName),
           contactName: v.supplierName,
-          currency: v.currency,
+          creditDebit: v.creditDebit === "C" || v.creditDebit === "D" ? v.creditDebit : null,
+          foreign: v.foreignCurrency !== null,
           net: v.sumNet,
           tax: v.sumTax,
           gross: v.sumGross,
@@ -549,10 +641,9 @@ export const summarizeDocuments = defineTool({
     const { groups: all, totals } = summarize(docs, args.groupBy);
     const groups = all.slice(args.offset, args.offset + args.limit);
     const page = pageOf(args.offset, args.limit, groups.length, all.length);
-    // Only ISO currency codes go into the summary line, never free text.
-    const sums = totals
-      .map((t) => `${t.gross} ${/^[A-Z]{3}$/.test(t.currency) ? t.currency : ""}`.trim())
-      .join(", ");
+    const label = (side: string | null) =>
+      side === "C" ? "income " : side === "D" ? "expenses " : "";
+    const sums = totals.map((t) => `${label(t.creditDebit)}${t.gross} EUR`).join(", ");
     return present(
       {
         period,
@@ -564,7 +655,10 @@ export const summarizeDocuments = defineTool({
         page,
         truncated: run.truncated,
         ...run.noteField([
-          totals.length > 1 && "Documents in several currencies; sums are per currency.",
+          ...extra,
+          totals.some((t) => t.foreignCurrencyDocuments > 0) &&
+            "Some documents are in another currency; their euro amounts as sevdesk reports them " +
+              "are included.",
         ]),
       },
       {
