@@ -26,6 +26,8 @@ der Assistent sucht die Antwort in sevdesk. Zum Beispiel:
 - „Ist die Zahlung von ACME eingegangen?“
 - „Welche Kunden schulden uns noch Geld, und wie viel?“
 - „Zeig mir alle Belege vom letzten Monat, die noch nicht gebucht sind.“
+- „Prüf meine Buchhaltung für Juni: Entwürfe, Zahlungen ohne Beleg, Umsatzsteuer-Probleme.“
+- „Sind meine ausländischen Software-Abos als Reverse Charge gebucht?“
 - „Erstelle einen Rechnungsentwurf für ACME: 8 Stunden Beratung zu 95 Euro.“ (braucht den
   Schreibmodus)
 
@@ -128,6 +130,9 @@ KI-Programm und von dort an dessen Anbieter.
 - **Bank:** deine Konten und Salden sehen, Umsätze finden, Zahlungen buchen.
 - **Auswertungen:** die Listen-Auswertungen von sevdesk als PDF, und welche Steuersätze
   und Buchungskonten zusammenpassen.
+- **Prüfungen:** Umsatzsteuer- und Reverse-Charge-Prüfung (§13b), doppelte Belege, fehlende
+  monatliche Abos, Umsätze ohne Beleg, Summen pro Monat oder Kunde, wie lange offene Posten
+  überfällig sind. Das sind Hinweise zum Nachprüfen, keine Steuerberatung.
 
 Alle Werkzeuge im Überblick: [docs/tools.md](docs/tools.md).
 
