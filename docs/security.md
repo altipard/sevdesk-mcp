@@ -71,8 +71,8 @@ in [Configuration](configuration.md); the tools and their classes in [Tools](too
   [manual configuration](install.md#connect-your-mcp-client-by-hand).
 - **Claude Code plugin:** `read`, `write` or `full`, chosen when you enable the plugin;
   change it later under `/plugin` > Installed > Configure options.
-- **Installer and manual entries:** `SEVDESK_MODE` in the client's `env` block, or
-  `--mode` for the [installer](install.md#installer-options).
+- **Guided setup and manual entries:** `SEVDESK_MODE` in the client's `env` block. The
+  [setup](install.md#guided-setup) asks for the mode or takes it from `--mode`.
 
 In every case `full` registers the irreversible tools only once they are also listed in
 `SEVDESK_ENABLE_TOOLS`.

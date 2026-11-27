@@ -40,7 +40,13 @@ the binary, and builds and checks the Claude Desktop extension.
   [`plugins/sevdesk/`](../plugins/sevdesk): its `plugin.json` starts the server with npx
   (no pinned version) and passes the chosen mode, and `skills/sevdesk/` holds the
   `sevdesk` skill with its references.
-- [`install.sh`](../install.sh) is the binary installer, a POSIX shell script.
+- [`install.sh`](../install.sh) is the binary installer, a POSIX shell script. After the
+  download it hands over to `sevdesk-mcp setup` ([`src/setup/`](../src/setup)), which writes
+  the client configurations through add-mcp.
+- `src/setup/skill-files.ts` is a generated copy of `plugins/sevdesk/skills/sevdesk`, so the
+  binary can install the skill. After changing the skill, regenerate it with
+  `UPDATE_SKILL_FILES=1 npx vitest run test/unit/setup-skill.test.ts`; `npm run check` fails
+  while the two differ.
 
 ## Live smoke test
 
