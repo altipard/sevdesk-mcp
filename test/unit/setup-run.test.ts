@@ -148,6 +148,7 @@ async function run(argv: string[], options: Options = {}): Promise<Run> {
     claudeCodeRunning: async () => options.claudeRunning ?? false,
     cwd: project,
     home,
+    stateDir: join(home, ".local", "state", "sevdesk-mcp"),
     platform: options.platform ?? "darwin",
     launch: { command: BIN, args: [] },
     version: "9.9.9",
@@ -490,6 +491,8 @@ describe("runSetup with prompts", () => {
         { select: "global" },
         { select: "read" },
         { confirm: true },
+        // The entry sets SEVDESK_API_TOKEN: keep it this time.
+        { multiselect: [] },
         { password: "" },
         { confirm: false },
         { confirm: true },
@@ -607,5 +610,79 @@ describe("runSetup with prompts", () => {
     expect(result.code).toBe(EXIT.cancelled);
     expect(result.stored).toEqual([]);
     expect(tree()).toEqual(before);
+  });
+
+  it("offers to remove SEVDESK_API_TOKEN from entries, showing only its name", async () => {
+    const entry = {
+      command: BIN,
+      args: [],
+      env: { SEVDESK_MODE: "read", SEVDESK_API_TOKEN: OTHER },
+    };
+    mkdirSync(dirname(cursorFile), { recursive: true });
+    writeFileSync(cursorFile, JSON.stringify({ mcpServers: { sevdesk: entry } }));
+    const result = await run([], {
+      steps: [
+        { multiselect: ["cursor"] },
+        { select: "global" },
+        { select: "read" },
+        { multiselect: ["cursor"] },
+        { password: TOKEN },
+        { confirm: false },
+        { confirm: true },
+      ],
+    });
+    expect(result.code).toBe(EXIT.ok);
+    expect(result.asked[3]).toMatchObject({ kind: "multiselect", initial: ["cursor"] });
+    expect(result.asked[3]?.message).toContain("SEVDESK_API_TOKEN");
+    expect(json(cursorFile).mcpServers.sevdesk.env).toEqual({ SEVDESK_MODE: "read" });
+    expect(result.output).toContain("removes SEVDESK_API_TOKEN from the entry's env");
+    expect(result.output).toContain("the backup still holds SEVDESK_API_TOKEN in plain text");
+    expect(result.output).not.toContain(OTHER);
+  });
+
+  it("keeps the env token without prompts unless --remove-env-token, and warns", async () => {
+    const entry = {
+      command: BIN,
+      args: [],
+      env: { SEVDESK_MODE: "read", SEVDESK_API_TOKEN: OTHER },
+    };
+    mkdirSync(dirname(cursorFile), { recursive: true });
+    writeFileSync(cursorFile, JSON.stringify({ mcpServers: { sevdesk: entry } }));
+    const kept = await run(["--yes", "--agents=cursor"], { interactive: false });
+    expect(kept.output).toContain(
+      "keeps SEVDESK_API_TOKEN in the entry's env: it wins over the keychain token (--remove-env-token removes it)",
+    );
+    expect(kept.output).not.toContain(OTHER);
+    expect(json(cursorFile).mcpServers.sevdesk.env.SEVDESK_API_TOKEN).toBe(OTHER);
+    const removed = await run(["--yes", "--agents=cursor", "--remove-env-token"], {
+      interactive: false,
+    });
+    expect(removed.code).toBe(EXIT.ok);
+    expect(json(cursorFile).mcpServers.sevdesk.env).toEqual({ SEVDESK_MODE: "read" });
+  });
+
+  it("warns about the binary path in project files and keeps their backups out of the project", async () => {
+    const projectFile = join(project, ".cursor", "mcp.json");
+    mkdirSync(dirname(projectFile), { recursive: true });
+    writeFileSync(projectFile, "{}");
+    const result = await run(["--yes", "--agents=cursor", "--scope=project"], {
+      interactive: false,
+    });
+    expect(result.code).toBe(EXIT.ok);
+    expect(result.output).toContain(`absolute path of the binary (${BIN})`);
+    const stateBackups = join(home, ".local", "state", "sevdesk-mcp", "backups");
+    expect(result.output).toContain(`Backups of project files go to ${stateBackups}`);
+    expect(readdirSync(stateBackups)).toHaveLength(1);
+    expect(readdirSync(dirname(projectFile))).toEqual(["mcp.json"]);
+  });
+
+  it("says in the plan when comments get lost", async () => {
+    const codexFile = configPath(addMcp, "codex", "global", project);
+    mkdirSync(dirname(codexFile), { recursive: true });
+    writeFileSync(codexFile, '# mine\nmodel = "x"\n');
+    const result = await run(["--yes", "--agents=codex"], { interactive: false });
+    expect(result.output).toContain(
+      `comments in this file are lost; the backup goes to ${dirname(codexFile)}`,
+    );
   });
 });

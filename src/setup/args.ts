@@ -12,6 +12,8 @@ export interface SetupArgs {
   yes: boolean;
   replaceEntries: boolean;
   replaceToken: boolean;
+  /** Remove SEVDESK_API_TOKEN from existing entries (it wins over the keychain). */
+  removeEnvToken: boolean;
   /** Read the token from stdin instead of asking (non-interactive only). */
   tokenStdin: boolean;
   /** Do not touch the keychain at all. */
@@ -38,6 +40,9 @@ Options:
   --replace-entries   also replace a "sevdesk" entry with its own command;
                       its env is kept either way
   --replace-token     ask for a new token even if one is in the keychain
+  --remove-env-token  remove SEVDESK_API_TOKEN from the env of existing entries;
+                      it wins over the keychain token (default: ask; without
+                      prompts: keep it and warn)
   --token-stdin       read the token from stdin (without prompts)
   --skip-token        leave the keychain alone
   --no-verify         store the token without checking it with sevdesk
@@ -90,6 +95,7 @@ export function parseSetupArgs(argv: readonly string[]): SetupArgs {
     yes: values.yes ?? false,
     replaceEntries: values["replace-entries"] ?? false,
     replaceToken: values["replace-token"] ?? false,
+    removeEnvToken: values["remove-env-token"] ?? false,
     tokenStdin: values["token-stdin"] ?? false,
     skipToken: values["skip-token"] ?? false,
     ...(values.skill ? { skill: true } : values["no-skill"] ? { skill: false } : {}),
@@ -110,6 +116,7 @@ function parse(argv: readonly string[]) {
       yes: { type: "boolean", short: "y" },
       "replace-entries": { type: "boolean" },
       "replace-token": { type: "boolean" },
+      "remove-env-token": { type: "boolean" },
       "token-stdin": { type: "boolean" },
       "skip-token": { type: "boolean" },
       skill: { type: "boolean" },

@@ -1,6 +1,12 @@
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
-import { readKeychainToken, storeKeychainToken } from "../keychain.js";
+import { join } from "node:path";
+import {
+  readKeychainToken,
+  SECRET_ENV_VARIABLES,
+  storeKeychainToken,
+  withoutSecrets,
+} from "../keychain.js";
 import { VERSION } from "../version.js";
 import { detectAgents, detectLaunch, loadAddMcp } from "./agents.js";
 import { HELP } from "./args.js";
@@ -24,8 +30,11 @@ function claudeCodeRunning(): Promise<boolean> {
   if (process.platform === "win32") return Promise.resolve(false);
   return new Promise((resolve) => {
     try {
-      execFile("pgrep", ["-x", "claude"], { timeout: 2000, windowsHide: true }, (error) =>
-        resolve(error === null),
+      execFile(
+        "pgrep",
+        ["-x", "claude"],
+        { timeout: 2000, windowsHide: true, env: withoutSecrets(process.env) },
+        (error) => resolve(error === null),
       );
     } catch {
       resolve(false);
@@ -60,6 +69,9 @@ export async function main(argv: readonly string[], moduleUrl: string): Promise<
     process.stdout.write(`${HELP}`);
     return 0;
   }
+  // The setup needs none of the server's secrets; no child process (pgrep, the keychain tools,
+  // anything add-mcp starts) gets them.
+  for (const name of SECRET_ENV_VARIABLES) delete process.env[name];
   const addMcp = await loadAddMcp();
   const home = homedir();
   const deps: SetupDeps = {
@@ -78,6 +90,7 @@ export async function main(argv: readonly string[], moduleUrl: string): Promise<
     claudeCodeRunning,
     cwd: process.cwd(),
     home,
+    stateDir: join(process.env.XDG_STATE_HOME || join(home, ".local", "state"), "sevdesk-mcp"),
     ...(process.env.XDG_CONFIG_HOME ? { xdgConfigHome: process.env.XDG_CONFIG_HOME } : {}),
     ...(process.env.CLAUDE_CONFIG_DIR ? { claudeConfigDir: process.env.CLAUDE_CONFIG_DIR } : {}),
     platform: process.platform,

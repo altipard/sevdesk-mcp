@@ -8,6 +8,7 @@ import {
   type KeychainResult,
   type StdinRunner,
   storeKeychainToken,
+  withoutSecrets,
 } from "../../src/keychain.js";
 import {
   type AddMcp,
@@ -18,7 +19,7 @@ import {
   onPath,
 } from "../../src/setup/agents.js";
 import { parseSetupArgs, UsageError } from "../../src/setup/args.js";
-import { parseJsonc } from "../../src/setup/jsonc.js";
+import { countHashComments, countJsoncComments, parseJsonc } from "../../src/setup/jsonc.js";
 import { checkToken, TOKEN_CHECK_URL, tokenFormatProblem } from "../../src/setup/token.js";
 
 const TOKEN = "0123456789abcdef0123456789abcdef";
@@ -116,6 +117,7 @@ describe("parseSetupArgs", () => {
         "-y",
         "--replace-entries",
         "--replace-token",
+        "--remove-env-token",
         "--token-stdin",
         "--skill",
       ]),
@@ -128,6 +130,7 @@ describe("parseSetupArgs", () => {
       yes: true,
       replaceEntries: true,
       replaceToken: true,
+      removeEnvToken: true,
       tokenStdin: true,
       skipToken: false,
       skill: true,
@@ -338,5 +341,31 @@ describe("storeKeychainToken", () => {
     expect(await storeKeychainToken(TOKEN, { platform: "win32" })).toEqual({
       status: "unavailable",
     });
+  });
+});
+
+describe("comment counting", () => {
+  it("counts JSONC comment groups outside strings", () => {
+    expect(countJsoncComments('{"a": "//x", "b": "/*y*/"}')).toBe(0);
+    expect(countJsoncComments('{\n // a\n "a": 1, /* b */ "b": 2\n}')).toBe(2);
+    expect(countJsoncComments("{ /* open")).toBe(0);
+  });
+
+  it("counts # comments outside quotes in TOML and YAML", () => {
+    expect(countHashComments("# top\nurl = \"http://x/#frag\" # tail\nname = 'a#b'\n")).toBe(2);
+    expect(countHashComments('key = "a \\" # still a string"\n')).toBe(0);
+  });
+});
+
+describe("withoutSecrets", () => {
+  it("drops the server's secrets and keeps the rest", () => {
+    expect(
+      withoutSecrets({
+        PATH: "/bin",
+        SEVDESK_API_TOKEN: TOKEN,
+        SEVDESK_CONFIRM_SECRET: "s",
+        HOME: "/h",
+      }),
+    ).toEqual({ PATH: "/bin", HOME: "/h" });
   });
 });

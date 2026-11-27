@@ -1,5 +1,16 @@
-import { randomBytes } from "node:crypto";
-import { chmod, lstat, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { AgentType, McpServerConfig } from "add-mcp";
@@ -15,7 +26,7 @@ import {
   supportsProject,
   withConfigAt,
 } from "./agents.js";
-import { parseJsonc } from "./jsonc.js";
+import { countHashComments, countJsoncComments, parseJsonc } from "./jsonc.js";
 
 export type Mode = "read" | "write" | "full";
 
@@ -27,7 +38,17 @@ export interface EntryRequest {
   mode: Mode;
   /** Replace an entry with its own command or args (its env is still kept). */
   replaceEntries: boolean;
+  /** Drop SEVDESK_API_TOKEN from the entry's env, so the server uses the keychain token. */
+  removeEnvToken: boolean;
+  /**
+   * Where backups go; next to the configuration when unset. A project file gets its backups in
+   * a user directory, so they do not end up in the repository.
+   */
+  backupDir?: string;
 }
+
+/** The env variable that, set in an entry, wins over the keychain token. */
+export const ENV_TOKEN = "SEVDESK_API_TOKEN";
 
 /**
  * What the setup will do with one agent, found before anything is written:
@@ -41,8 +62,19 @@ export type EntryPlan =
       kind: EntryKind["kind"];
       /** replace: what the existing entry loses (names only). */
       dropped?: string[];
+      /** The existing entry has SEVDESK_API_TOKEN in its env. */
+      envToken?: boolean;
+      /** Writing loses comments of the file (add-mcp rewrites that part without them). */
+      commentsLost?: boolean;
     }
-  | { action: "skip"; path: string; reason: string; snippet?: string; custom?: boolean };
+  | {
+      action: "skip";
+      path: string;
+      reason: string;
+      snippet?: string;
+      custom?: boolean;
+      envToken?: boolean;
+    };
 
 export type EntryOutcome =
   | { status: "ok"; path: string; backup?: string; action: "add" | "update" | "replace" }
@@ -156,7 +188,14 @@ async function inspect(addMcp: AddMcp, request: EntryRequest): Promise<Inspectio
     original,
     env,
   });
-  if (kind.kind === "none") return result({ action: "add", path, kind: "none" });
+  if (kind.kind === "none") {
+    const env = {};
+    const commentsLost = await predictCommentLoss(addMcp, request, path, original, env);
+    return result(
+      { action: "add", path, kind: "none", ...(commentsLost ? { commentsLost } : {}) },
+      env,
+    );
+  }
   if (kind.kind === "remote") {
     return {
       plan: {
@@ -168,21 +207,74 @@ async function inspect(addMcp: AddMcp, request: EntryRequest): Promise<Inspectio
       env: {},
     };
   }
+  const envToken = (kind.env[ENV_TOKEN] ?? "") !== "";
   const own = ownSettings(addMcp, request, read.entry ?? {}, kind);
-  if (own.length > 0) {
-    if (!request.replaceEntries) {
-      return skip(
-        path,
-        `the "${SERVER_NAME}" entry has its own ${own.join(", ")} and stays unchanged`,
-        { custom: true },
-      );
-    }
-    return result({ action: "replace", path, kind: "custom", dropped: own }, kind.env);
+  if (own.length > 0 && !request.replaceEntries) {
+    return skip(
+      path,
+      `the "${SERVER_NAME}" entry has its own ${own.join(", ")} and stays unchanged`,
+      { custom: true, ...(envToken ? { envToken } : {}) },
+    );
   }
-  if (kind.env.SEVDESK_MODE === request.mode) {
-    return result({ action: "unchanged", path, kind: "ours" }, kind.env);
+  const env = { ...kind.env };
+  if (request.removeEnvToken) delete env[ENV_TOKEN];
+  const removing = envToken && request.removeEnvToken;
+  if (own.length === 0 && kind.env.SEVDESK_MODE === request.mode && !removing) {
+    return result(
+      { action: "unchanged", path, kind: "ours", ...(envToken ? { envToken } : {}) },
+      env,
+    );
   }
-  return result({ action: "update", path, kind: "ours" }, kind.env);
+  const commentsLost = await predictCommentLoss(addMcp, request, path, original, env);
+  return result(
+    {
+      action: own.length > 0 ? "replace" : "update",
+      path,
+      kind: own.length > 0 ? "custom" : "ours",
+      ...(own.length > 0 ? { dropped: own } : {}),
+      ...(envToken ? { envToken } : {}),
+      ...(commentsLost ? { commentsLost } : {}),
+    },
+    env,
+  );
+}
+
+function countComments(text: string, format: string): number {
+  return format === "json" ? countJsoncComments(text) : countHashComments(text);
+}
+
+/**
+ * Whether writing drops comments: add-mcp rewrites TOML and YAML without them, and in JSON the
+ * whole servers block. A dry run on a copy in a temporary directory tells for sure.
+ */
+async function predictCommentLoss(
+  addMcp: AddMcp,
+  request: EntryRequest,
+  path: string,
+  original: string | null,
+  env: Record<string, string>,
+): Promise<boolean> {
+  if (original === null) return false;
+  const format = addMcp.agents[request.agent].format;
+  const before = countComments(original, format);
+  if (before === 0) return false;
+  const dir = await mkdtemp(join(tmpdir(), "sevdesk-mcp-dry-"));
+  try {
+    const copy = join(dir, basename(path));
+    await writeFile(copy, original, { mode: 0o600 });
+    const result = await withConfigAt(addMcp, request.agent, copy, () =>
+      addMcp.upsertServer(request.agent, SERVER_NAME, serverConfig(request, env), {
+        local: request.scope === "project",
+        cwd: request.cwd,
+      }),
+    );
+    if (!result.success) return false;
+    return countComments(await readFile(copy, "utf8"), format) < before;
+  } catch {
+    return false;
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 const CORE_KEYS = new Set(["command", "args", "env", "cmd", "envs", "environment"]);
@@ -237,9 +329,18 @@ function timestamp(now: Date): string {
   return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
 }
 
-/** A private copy of the original next to it; a name that exists already is never overwritten. */
-async function backup(path: string, content: string, now: Date): Promise<string> {
-  const base = `${path}.backup-${timestamp(now)}`;
+/**
+ * A private copy of the original, next to it or in `dir` (named after the file plus a hash of
+ * its path, so files of different projects do not collide); an existing name is never
+ * overwritten.
+ */
+async function backup(path: string, content: string, now: Date, dir?: string): Promise<string> {
+  let base = `${path}.backup-${timestamp(now)}`;
+  if (dir) {
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    const hash = createHash("sha256").update(path).digest("hex").slice(0, 8);
+    base = join(dir, `${basename(path)}.${hash}.backup-${timestamp(now)}`);
+  }
   for (let n = 0; ; n++) {
     const name = n === 0 ? base : `${base}-${n}`;
     try {
@@ -255,6 +356,8 @@ export interface WriteOptions {
   now?: () => Date;
   /** Called after staging, before the final check; tests change the file here. */
   beforeCommit?: (path: string) => Promise<void> | void;
+  /** Called after the backup is written, before the last read; tests change the file here. */
+  afterBackup?: (path: string) => Promise<void> | void;
   /** Replaced in tests to make the final rename fail. */
   rename?: (from: string, to: string) => Promise<void>;
 }
@@ -267,7 +370,8 @@ export interface WriteOptions {
  * 3. read the copy back and check the entry and that no other entry disappeared,
  * 4. check the original did not change meanwhile (a running client may rewrite it); if it did,
  *    start over once,
- * 5. back up the original (mode 600) and rename the copy over it.
+ * 5. back up the original (mode 600) and rename the copy over it, after reading the original
+ *    once more.
  */
 export async function writeEntry(
   addMcp: AddMcp,
@@ -341,6 +445,7 @@ async function writeOnce(
       Object.entries(env).some(
         ([key, value]) => key !== "SEVDESK_MODE" && kind.env[key] !== value,
       ) ||
+      (request.removeEnvToken && kind.env[ENV_TOKEN] !== undefined) ||
       lost.length > 0
     ) {
       return fail("the written configuration did not check out; the original is unchanged");
@@ -356,7 +461,22 @@ async function writeOnce(
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
     if (current !== original) return "changed";
-    const saved = original === null ? undefined : await backup(path, original, now());
+    const saved =
+      original === null ? undefined : await backup(path, original, now(), request.backupDir);
+    await options.afterBackup?.(path);
+    // Once more right before the rename: the backup must hold exactly what is replaced.
+    let latest: string | null = null;
+    try {
+      latest = await readFile(path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (latest !== original) {
+      if (saved) await rm(saved, { force: true }).catch(() => {});
+      return "changed";
+    }
+    // rename keeps the staged file's mode (copied from the original) but not the original's
+    // owner, ACLs, extended attributes or hard links: the new file replaces the old inode.
     try {
       await (options.rename ?? rename)(stage, path);
       staged = false;

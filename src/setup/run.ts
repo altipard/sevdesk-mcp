@@ -1,3 +1,4 @@
+import { dirname, isAbsolute, join } from "node:path";
 import type { AgentType } from "add-mcp";
 import {
   KEYCHAIN_ACCOUNT,
@@ -18,6 +19,7 @@ import { type Answer, CANCELLED, type Prompter } from "./prompter.js";
 import { installSkill, type SkillOutcome, skillLocations, supportsSkill } from "./skill.js";
 import { checkToken, isTokenFormat, normalizeToken, tokenFormatProblem } from "./token.js";
 import {
+  ENV_TOKEN,
   type EntryOutcome,
   type EntryPlan,
   type EntryRequest,
@@ -42,6 +44,8 @@ export interface SetupDeps {
   cwd: string;
   home: string;
   xdgConfigHome?: string;
+  /** The setup's own state directory (XDG_STATE_HOME/sevdesk-mcp); project backups go there. */
+  stateDir: string;
   /** CLAUDE_CONFIG_DIR: where Claude Code keeps its settings and skills instead of ~/.claude. */
   claudeConfigDir?: string;
   platform: NodeJS.Platform;
@@ -207,9 +211,15 @@ async function flow(args: SetupArgs, deps: SetupDeps, ui: Prompter | undefined):
       }),
     );
   }
+  const backupDir = scope === "project" ? join(deps.stateDir, "backups") : undefined;
   if (scope === "project") {
     say.warn(
-      "Project files are often committed: the token never goes into them, it stays in the keychain.",
+      "Project files are often committed: the token never goes into them, it stays in the keychain." +
+        (isAbsolute(deps.launch.command)
+          ? ` The entry does hold the absolute path of the binary (${deps.launch.command}), which ` +
+            "usually includes your user name."
+          : "") +
+        ` Backups of project files go to ${backupDir}, not into the project.`,
     );
   }
 
@@ -237,6 +247,7 @@ async function flow(args: SetupArgs, deps: SetupDeps, ui: Prompter | undefined):
 
   // What happens per agent
   let replaceEntries = args.replaceEntries;
+  let removeTokenFor = new Set<AgentType>(args.removeEnvToken ? selected : []);
   const request = (agent: AgentType): EntryRequest => ({
     agent,
     scope,
@@ -244,6 +255,8 @@ async function flow(args: SetupArgs, deps: SetupDeps, ui: Prompter | undefined):
     launch: deps.launch,
     mode,
     replaceEntries,
+    removeEnvToken: removeTokenFor.has(agent),
+    ...(backupDir ? { backupDir } : {}),
   });
   const planAll = async () => {
     const out = new Map<AgentType, EntryPlan>();
@@ -263,6 +276,24 @@ async function flow(args: SetupArgs, deps: SetupDeps, ui: Prompter | undefined):
       }),
     );
     if (replaceEntries) plans = await planAll();
+  }
+  // SEVDESK_API_TOKEN in an entry's env wins over the keychain: offer to remove it.
+  const withEnvToken = selected.filter((agent) => {
+    const plan = plans.get(agent);
+    return plan?.envToken === true && plan.action !== "skip";
+  });
+  if (withEnvToken.length > 0 && ui && !args.removeEnvToken) {
+    removeTokenFor = new Set(
+      answer(
+        await ui.multiselect({
+          message: `These entries set ${ENV_TOKEN} in their env, which wins over the keychain token. Remove it from:`,
+          choices: withEnvToken.map((agent) => ({ value: agent, label: name(agent) })),
+          initial: withEnvToken,
+          required: false,
+        }),
+      ),
+    );
+    if (removeTokenFor.size > 0) plans = await planAll();
   }
 
   // Token
@@ -297,8 +328,21 @@ async function flow(args: SetupArgs, deps: SetupDeps, ui: Prompter | undefined):
   const lines: string[] = [];
   for (const agent of selected) {
     const plan = plans.get(agent);
-    if (plan)
-      lines.push(`${name(agent)}: ${describePlan(plan)}${plan.path ? `\n  ${plan.path}` : ""}`);
+    if (!plan) continue;
+    lines.push(`${name(agent)}: ${describePlan(plan)}${plan.path ? `\n  ${plan.path}` : ""}`);
+    if (plan.envToken) {
+      lines.push(
+        plan.action !== "skip" && removeTokenFor.has(agent)
+          ? `  removes ${ENV_TOKEN} from the entry's env (the backup still holds it)`
+          : `  keeps ${ENV_TOKEN} in the entry's env: it wins over the keychain token` +
+              (plan.action === "skip" ? "" : " (--remove-env-token removes it)"),
+      );
+    }
+    if (plan.action !== "skip" && plan.commentsLost) {
+      lines.push(
+        `  comments in this file are lost; the backup goes to ${backupDir ?? dirname(plan.path)}`,
+      );
+    }
   }
   lines.push(`mode: ${MODE_TEXT[mode]}`);
   lines.push(`token: ${describeToken(token)}`);
@@ -359,6 +403,11 @@ async function flow(args: SetupArgs, deps: SetupDeps, ui: Prompter | undefined):
         say.success(
           `${name(agent)}: ${outcome.action === "add" ? "added" : "updated"} ${outcome.path}${outcome.backup ? `\n  backup: ${outcome.backup}` : ""}`,
         );
+        if (removeTokenFor.has(agent) && plans.get(agent)?.envToken && outcome.backup) {
+          say.warn(
+            `${name(agent)}: the backup still holds ${ENV_TOKEN} in plain text; delete it once the agent works: ${outcome.backup}`,
+          );
+        }
         break;
       case "unchanged":
         say.success(`${name(agent)}: already set up (${outcome.path})`);

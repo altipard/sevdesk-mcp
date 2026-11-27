@@ -68,6 +68,7 @@ function request(overrides: Partial<EntryRequest> = {}): EntryRequest {
     launch: LAUNCH,
     mode: "read",
     replaceEntries: false,
+    removeEnvToken: false,
     ...overrides,
   };
 }
@@ -386,6 +387,105 @@ describe("writeEntry", () => {
     expect(readFileSync(cursorFile, "utf8")).toBe(original);
     expect(backups(cursorFile)).toEqual([]);
     expect(leftovers(cursorFile)).toEqual([]);
+  });
+});
+
+describe("writeEntry: token in env, comments, backups", () => {
+  const withToken = {
+    mcpServers: {
+      sevdesk: { command: BIN, args: [], env: { SEVDESK_MODE: "read", SEVDESK_API_TOKEN: TOKEN } },
+    },
+  };
+
+  it("reports a SEVDESK_API_TOKEN in the entry's env by name only and keeps it unless asked", async () => {
+    write(cursorFile, withToken);
+    const plan = await planEntry(addMcp, request());
+    expect(plan).toMatchObject({ action: "unchanged", envToken: true });
+    expect(JSON.stringify(plan)).not.toContain(TOKEN);
+    await writeEntry(addMcp, request({ mode: "write" }));
+    expect(json(cursorFile).mcpServers.sevdesk.env.SEVDESK_API_TOKEN).toBe(TOKEN);
+  });
+
+  it("removes the env token on request; the backup still holds it", async () => {
+    write(cursorFile, withToken);
+    expect(await planEntry(addMcp, request({ removeEnvToken: true }))).toMatchObject({
+      action: "update",
+      envToken: true,
+    });
+    const outcome = await writeEntry(addMcp, request({ removeEnvToken: true }));
+    expect(outcome).toMatchObject({ status: "ok", action: "update" });
+    expect(json(cursorFile).mcpServers.sevdesk.env).toEqual({ SEVDESK_MODE: "read" });
+    expect(readFileSync(outcome.status === "ok" ? (outcome.backup ?? "") : "", "utf8")).toContain(
+      TOKEN,
+    );
+  });
+
+  it("flags the env token of an entry it skips, too", async () => {
+    write(cursorFile, {
+      mcpServers: { sevdesk: { command: "npx", env: { SEVDESK_API_TOKEN: TOKEN } } },
+    });
+    expect(await planEntry(addMcp, request())).toMatchObject({
+      action: "skip",
+      custom: true,
+      envToken: true,
+    });
+  });
+
+  it("predicts lost comments: TOML for Codex and the servers block of VS Code", async () => {
+    const codexFile = configPath(addMcp, "codex", "global", project);
+    write(codexFile, '# my settings\nmodel = "x" # inline\n');
+    expect(await planEntry(addMcp, request({ agent: "codex" }))).toMatchObject({
+      commentsLost: true,
+    });
+    const vscodeFile = configPath(addMcp, "vscode", "global", project);
+    write(vscodeFile, '{\n  "servers": {\n    // keep me\n    "a": { "command": "a" }\n  }\n}\n');
+    expect(await planEntry(addMcp, request({ agent: "vscode" }))).toMatchObject({
+      commentsLost: true,
+    });
+    // Nothing is left behind by the dry run, and the files are unchanged.
+    expect(readFileSync(codexFile, "utf8")).toBe('# my settings\nmodel = "x" # inline\n');
+    expect(leftovers(codexFile)).toEqual([]);
+  });
+
+  it("does not warn when the comments survive or there are none", async () => {
+    write(cursorFile, '{\n  // top\n  "mcpServers": {}\n}\n');
+    expect(await planEntry(addMcp, request())).not.toHaveProperty("commentsLost");
+    write(desktopFile(), { mcpServers: {} });
+    expect(await planEntry(addMcp, request({ agent: "claude-desktop" }))).not.toHaveProperty(
+      "commentsLost",
+    );
+  });
+
+  it("puts backups into the backup directory when one is given, named after the file", async () => {
+    const projectCursor = join(project, ".cursor", "mcp.json");
+    write(projectCursor, { mcpServers: {} });
+    const dir = join(home, "state", "backups");
+    const outcome = await writeEntry(addMcp, request({ scope: "project", backupDir: dir }));
+    expect(outcome.status).toBe("ok");
+    const backup = outcome.status === "ok" ? (outcome.backup ?? "") : "";
+    expect(dirname(backup)).toBe(dir);
+    expect(backup.split("/").at(-1)).toMatch(/^mcp\.json\.[0-9a-f]{8}\.backup-\d{14}$/);
+    expect(statSync(backup).mode & 0o777).toBe(0o600);
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
+    expect(backups(projectCursor)).toEqual([]);
+  });
+
+  it("starts over when the file changes after the backup, keeping no stale backup", async () => {
+    write(cursorFile, { mcpServers: {} });
+    let changes = 0;
+    const outcome = await writeEntry(addMcp, request(), {
+      afterBackup: (path) => {
+        if (changes++ === 0)
+          writeFileSync(path, JSON.stringify({ mcpServers: { other: { command: "o" } } }));
+      },
+    });
+    expect(outcome.status).toBe("ok");
+    expect(Object.keys(json(cursorFile).mcpServers).sort()).toEqual(["other", "sevdesk"]);
+    const all = backups(cursorFile);
+    expect(all).toHaveLength(1);
+    expect(json(join(dirname(cursorFile), all[0] ?? ""))).toEqual({
+      mcpServers: { other: { command: "o" } },
+    });
   });
 });
 

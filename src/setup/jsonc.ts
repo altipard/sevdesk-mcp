@@ -5,7 +5,43 @@
  * untouched. Returns the parsed value or throws.
  */
 export function parseJsonc(text: string): unknown {
-  return JSON.parse(stripJsonc(text.replace(/^﻿/, "")));
+  return JSON.parse(stripJsonc(text.replace(/^\uFEFF/, "")).text);
+}
+
+/**
+ * Number of comment groups (consecutive comments count once) in JSON-with-comments text; 0 for
+ * text that cannot be scanned. Only used to tell whether comments disappeared.
+ */
+export function countJsoncComments(text: string): number {
+  try {
+    return stripJsonc(text).comments;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Number of `#` comments in TOML or YAML text: a `#` outside a quoted string. Multi-line strings
+ * are not tracked; the count only has to tell whether comments disappeared.
+ */
+export function countHashComments(text: string): number {
+  let count = 0;
+  for (const line of text.split("\n")) {
+    let quote: string | undefined;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (quote) {
+        if (ch === "\\" && quote === '"') i++;
+        else if (ch === quote) quote = undefined;
+      } else if (ch === '"' || ch === "'") {
+        quote = ch;
+      } else if (ch === "#") {
+        count++;
+        break;
+      }
+    }
+  }
+  return count;
 }
 
 /** Index after the blanks and comments starting at `from`; -1 for an unterminated comment. */
@@ -25,9 +61,10 @@ function skipTrivia(text: string, from: number): number {
   }
 }
 
-/** Removes comments and trailing commas outside of strings. */
-function stripJsonc(text: string): string {
+/** Removes comments and trailing commas outside of strings, counting the comments. */
+function stripJsonc(text: string): { text: string; comments: number } {
   let out = "";
+  let comments = 0;
   let i = 0;
   const n = text.length;
   while (i < n) {
@@ -47,6 +84,7 @@ function stripJsonc(text: string): string {
     if (ch === "/" && (text[i + 1] === "/" || text[i + 1] === "*")) {
       const next = skipTrivia(text, i);
       if (next === -1) throw new SyntaxError("unterminated block comment");
+      comments++;
       // Keep a separator so that `1/**/2` does not turn into `12`.
       out += " ";
       i = next;
@@ -62,5 +100,5 @@ function stripJsonc(text: string): string {
     out += ch;
     i++;
   }
-  return out;
+  return { text: out, comments };
 }
