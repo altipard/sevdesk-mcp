@@ -1,7 +1,9 @@
 #!/bin/sh
-# sevdesk-mcp installer: downloads the release binary for this machine, checks it against the
-# release's SHA256SUMS and installs it. With a terminal it then starts the guided setup of the
-# installed binary (`sevdesk-mcp setup`): agents, scope, mode, token into the system keychain.
+# sevdesk-mcp installer: downloads the release for this machine, checks it against the
+# release's SHA256SUMS and installs it: the xz-compressed tarball when the release carries
+# one and tar can unpack xz here, otherwise the single binary. With a terminal it then starts
+# the guided setup of the installed binary (`sevdesk-mcp setup`): agents, scope, mode, token
+# into the system keychain.
 #
 #   curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.sh | sh
 #
@@ -274,6 +276,19 @@ sha256_of() { # file
     printf '%s\n' "${sum%% *}"
 }
 
+# Prints the checksum SHA256SUMS lists for the file named $1, nothing when it is not there.
+checksum_for() { # name
+    awk -v name="$1" '$2 == name || $2 == "*" name { print $1 }' "$tmp/SHA256SUMS"
+}
+
+# Can tar unpack an xz archive on this machine? macOS ships bsdtar with liblzma, which always
+# can; the GNU tar on Linux shells out to the xz command.
+can_unpack_xz() {
+    if ! command -v tar >/dev/null 2>&1; then return 1; fi
+    if [ "$OS" = darwin ]; then return 0; fi
+    command -v xz >/dev/null 2>&1
+}
+
 # Sets VERSION and PINNED. With $1 = dry, "latest" is not looked up.
 resolve_version() {
     if [ -n "${SEVDESK_MCP_VERSION:-}" ] && [ "${SEVDESK_MCP_VERSION:-}" != latest ]; then
@@ -328,11 +343,27 @@ prepare_dest() {
     fi
 }
 
-verify_checksum() {
+fetch_sums() {
     fetch "$RELEASES/download/$VERSION/SHA256SUMS" "$tmp/SHA256SUMS" ||
         fail "could not download SHA256SUMS of release $VERSION. Nothing was installed."
+}
+
+# Sets USE_ARCHIVE: 1 when the release lists the .tar.xz archive of the asset with exactly
+# one valid checksum and tar can unpack xz here. Releases from before the archives, and
+# systems without xz, keep downloading the single binary.
+prefer_archive() {
+    USE_ARCHIVE=0
+    if ! can_unpack_xz; then return 0; fi
+    listed=$(checksum_for "$asset.tar.xz")
+    case "$listed" in
+        '' | *[!0-9a-f]*) return 0 ;;
+    esac
+    if [ "${#listed}" -eq 64 ]; then USE_ARCHIVE=1; fi
+}
+
+verify_checksum() { # asset, already in $tmp
     say "Verifying checksum..."
-    expected=$(awk -v name="$asset" '$2 == name || $2 == "*" name { print $1 }' "$tmp/SHA256SUMS")
+    expected=$(checksum_for "$asset")
     # Exactly one SHA-256: anything else (missing, duplicate, malformed) is refused.
     case "$expected" in
         '' | *[!0-9a-f]*) fail "no valid checksum for $asset in SHA256SUMS. Nothing was installed." ;;
@@ -341,6 +372,24 @@ verify_checksum() {
     actual=$(sha256_of "$tmp/$asset") || fail "could not compute the checksum of $asset. Nothing was installed."
     [ "$actual" = "$expected" ] ||
         fail "checksum mismatch for $asset; the download is corrupt or has been tampered with. Nothing was installed."
+}
+
+# Unpacks the checksum-verified archive $1 into $tmp/unpacked and sets EXTRACTED to the
+# binary. The archive must hold exactly one entry: a regular file named sevdesk-mcp - no
+# path, no symlink, nothing else - so nothing can land outside the directory and no other
+# file is ever used.
+extract_archive() { # asset
+    entries=$(tar -tf "$tmp/$1") || fail "could not read $1. Nothing was installed."
+    if [ "$entries" != "$BIN_NAME" ]; then
+        fail "$1 does not hold exactly one file named $BIN_NAME. Nothing was installed."
+    fi
+    dir="$tmp/unpacked"
+    mkdir "$dir" || fail "cannot create $dir. Nothing was installed."
+    tar -xf "$tmp/$1" -C "$dir" || fail "could not unpack $1. Nothing was installed."
+    if [ "$(ls -A "$dir")" != "$BIN_NAME" ] || [ -L "$dir/$BIN_NAME" ] || [ ! -f "$dir/$BIN_NAME" ]; then
+        fail "$1 does not hold a regular file named $BIN_NAME. Nothing was installed."
+    fi
+    EXTRACTED="$dir/$BIN_NAME"
 }
 
 # Prints the version a freshly downloaded sevdesk-mcp binary reports in its MCP initialize
@@ -534,6 +583,7 @@ main() {
         say "platform:  $OS-$ARCH"
         say "release:   $VERSION"
         say "asset:     $url"
+        say "package:   $asset.tar.xz when it is listed in SHA256SUMS and tar can unpack xz, else $asset"
         say "checksums: ${url%/*}/SHA256SUMS"
         say "target:    $DEST/$BIN_NAME"
         blank
@@ -553,10 +603,20 @@ main() {
         say "Found ${ACC}$VERSION${RST} for $OS-$ARCH"
     fi
     say "Downloading..."
+    fetch_sums
+    prefer_archive
+    if [ "$USE_ARCHIVE" = 1 ]; then
+        asset="$asset.tar.xz"
+    fi
     fetch "$RELEASES/download/$VERSION/$asset" "$tmp/$asset" ||
         fail "download failed: $RELEASES/download/$VERSION/$asset (does release $VERSION exist for $OS-$ARCH?)"
     verify_checksum
-    install_binary "$tmp/$asset"
+    if [ "$USE_ARCHIVE" = 1 ]; then
+        extract_archive "$asset"
+        install_binary "$EXTRACTED"
+    else
+        install_binary "$tmp/$asset"
+    fi
 
     blank
     if [ "$REPLACED" = 1 ]; then
