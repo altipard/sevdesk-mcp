@@ -96,8 +96,9 @@ code --add-mcp '{"name":"sevdesk","type":"stdio","command":"npx","args":["-y","@
 ```
 
 GUI clients often start without your shell's `PATH`; if the server does not start, give
-the full path to `npx` (`which npx`) or use the [binary installer](#binary-installer). More clients and token
-options: [Connect your MCP client by hand](#connect-your-mcp-client-by-hand).
+the full path to `npx` (`which npx`) or use the [binary installer](#binary-installer).
+More clients and token options:
+[Connect your MCP client by hand](#connect-your-mcp-client-by-hand).
 
 ## Guided setup
 
@@ -106,9 +107,12 @@ stores the token in the system keychain. Start it in a terminal in one of three 
 
 ```sh
 npx -y @altipard/sevdesk-mcp setup   # with Node.js 24 or newer
-curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.sh | sh  # without Node.js
 sevdesk-mcp setup                    # binary already installed; run it again any time
 ```
+
+If `~/.local/bin` is not on your `PATH`, call the binary by its full path,
+`~/.local/bin/sevdesk-mcp setup`.
 
 The [binary installer](#binary-installer) downloads the binary and then starts the setup.
 The setup shows menus: arrow keys move, the space bar selects, Enter confirms. It asks, in
@@ -152,8 +156,10 @@ to supply it (see [API token](#api-token)).
 The setup never deletes other servers and changes only the entry named `sevdesk`:
 
 - **No entry:** it is added. A new configuration file gets mode 600.
-- **An entry this setup wrote:** the mode is updated and every other `env` variable stays.
-  If nothing differs, the file stays untouched.
+- **An entry with the same start command:** the mode is updated and every other `env`
+  variable stays. If nothing differs, the file stays untouched. An entry written by the npx
+  setup has another command than one written by the binary, so switching between the two
+  counts as "own command" below.
 - **An entry with its own command or settings** (another command or arguments, settings
   such as `disabled`, `autoApprove` or `timeout`, `env` values that are not strings): it
   stays unchanged, and the setup prints the entry to add by hand. With your confirmation or
@@ -499,8 +505,8 @@ Other settings from [Configuration](configuration.md), for example
   `--replace-token`.
 - **The setup cannot check the token** (offline, proxy): it warns and stores it anyway;
   pass `--no-verify` to skip the check.
-- **The setup skipped an agent:** the report says why and prints the entry to add by hand
-  (see [Existing entries](#existing-entries)).
+- **The setup skipped an agent:** the report says why and, for an entry it left alone,
+  prints the entry to add by hand (see [Existing entries](#existing-entries)).
 - **"no terminal for the prompts":** run the setup in a terminal, or pass `--yes` with the
   options (see [Setup options](#setup-options)).
 - **Write tools are missing:** the server runs in `read` mode. Set `write` (see
