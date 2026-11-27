@@ -33,6 +33,10 @@ with compact answers, plus a guarded fallback for everything else.
 ## Contents
 
 - [Install](#install)
+  - [Claude Code](#claude-code) · [Claude Desktop](#claude-desktop) ·
+    [Cursor, VS Code and others](#cursor-vs-code-and-others) ·
+    [Binary installer](#binary-installer) · [Token](#token) ·
+    [Troubleshooting](#troubleshooting)
 - [Connect your MCP client](#connect-your-mcp-client)
 - [What it can do](#what-it-can-do)
 - [Security model](#security-model)
@@ -45,9 +49,87 @@ with compact answers, plus a guarded fallback for everything else.
 ## Install
 
 You need a sevdesk API token (32 hex characters; sevdesk issues one per administrator).
-Pick one of the following.
+Pick your client; the first way listed is the simplest.
 
-**Installer** (macOS and Linux with glibc, x64 and arm64):
+| Client | Simplest way | Needs |
+| --- | --- | --- |
+| [Claude Code](#claude-code) | plugin, one command | Node.js 24+, token in the keychain |
+| [Claude Desktop](#claude-desktop) | `sevdesk-mcp.mcpb` extension, double-click | token typed into the extension |
+| [Cursor, VS Code, others](#cursor-vs-code-and-others) | npx entry in the client config | Node.js 24+, token in the keychain |
+| any, without Node.js | [binary installer](#binary-installer) | macOS or Linux (glibc) |
+
+### Claude Code
+
+In a Claude Code session (v2.1.275 or later):
+
+```text
+/plugin install sevdesk --marketplace altipard/sevdesk-mcp
+```
+
+From your shell, `claude plugin install sevdesk --marketplace altipard/sevdesk-mcp` does the
+same (v2.1.292 or later). On older versions add the marketplace first, then install:
+
+```text
+/plugin marketplace add altipard/sevdesk-mcp
+/plugin install sevdesk@sevdesk-mcp
+```
+
+The plugin needs Claude Code v2.1.271 or later, because it lets you pick the mode (`read`,
+`write` or `full`, default `read`) when you enable it; change it later under `/plugin` >
+Installed > Configure options. It starts the server with npx and reads the token from the
+[keychain](#token). It also brings the `sevdesk` skill, which guides the assistant through
+invoices, vouchers, contacts and open items and through the preview and confirmation of
+changes. Without the plugin, register the server with `claude mcp add` (see
+[Connect your MCP client](#connect-your-mcp-client)).
+
+### Claude Desktop
+
+Download `sevdesk-mcp.mcpb` from the
+[latest release](https://github.com/altipard/sevdesk-mcp/releases/latest), double-click it
+and enter your token in the dialog Claude Desktop shows. The extension keeps the token in
+its own settings, not in the keychain entry below. It offers the modes `read` (default) and
+`write`; `full` is only available through a [manual configuration](#connect-your-mcp-client).
+
+To check the download before opening it:
+
+```sh
+base=https://github.com/altipard/sevdesk-mcp/releases/latest/download
+curl -fsSLO "$base/sevdesk-mcp.mcpb"
+curl -fsSLO "$base/SHA256SUMS"
+grep ' sevdesk-mcp.mcpb$' SHA256SUMS | shasum -a 256 -c -   # Linux: sha256sum -c -
+gh attestation verify sevdesk-mcp.mcpb --repo altipard/sevdesk-mcp
+```
+
+### Cursor, VS Code and others
+
+Store the [token](#token) in the keychain, then add the server with npx (Node.js 24 or
+newer). Cursor (`~/.cursor/mcp.json`) and most other clients:
+
+```json
+{
+  "mcpServers": {
+    "sevdesk": {
+      "command": "npx",
+      "args": ["-y", "@altipard/sevdesk-mcp"],
+      "env": { "SEVDESK_MODE": "read" }
+    }
+  }
+}
+```
+
+VS Code:
+
+```sh
+code --add-mcp '{"name":"sevdesk","type":"stdio","command":"npx","args":["-y","@altipard/sevdesk-mcp"],"env":{"SEVDESK_MODE":"read"}}'
+```
+
+GUI clients often start without your shell's `PATH`; if the server does not start, give
+the full path to `npx` (`which npx`) or use the binary installer. More clients and token
+options: [Connect your MCP client](#connect-your-mcp-client).
+
+### Binary installer
+
+For macOS and Linux with glibc (x64 and arm64), no Node.js needed:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.sh | sh
@@ -55,22 +137,25 @@ curl -fsSL https://raw.githubusercontent.com/altipard/sevdesk-mcp/main/install.s
 
 It downloads the release binary for your platform, verifies it against the release's
 `SHA256SUMS` (nothing is installed on a mismatch) and installs it to `~/.local/bin`. In a
-terminal it then offers a guided setup, asking before every step:
+terminal it then finds the installed clients (Claude Desktop, Claude Code, Cursor, VS Code
+CLI), shows a plan and asks once:
 
-1. store the API token in the system keychain,
-2. pick the mode for the client entries (`read`, `write` or `full`, default `read`),
-3. register the server with Claude Desktop, Claude Code, Cursor and VS Code.
+```text
+  Setup plan
+    token:   ask for it once and store it in the macOS keychain
+    mode:    read (--mode=write or SEVDESK_MODE=write to allow changes)
+    clients: Claude Desktop, Claude Code
+             an existing "sevdesk" entry is replaced; JSON files are backed up first
 
-The token never goes into a client configuration file. Existing client configs are backed
-up before they are changed and are left alone if they are not valid JSON; changing them
-needs `jq` or `python3`, otherwise the installer prints the snippet to add by hand.
-Without a terminal it installs only and prints the next steps.
-
-**npx** (any platform with Node.js 24 or newer), nothing to install up front:
-
-```sh
-npx -y @altipard/sevdesk-mcp
+  Go ahead? [Y/n]
 ```
+
+The token is read once with hidden input, checked for the 32-hex format and against the
+sevdesk API (a rejected token is asked for again), and goes to the keychain, never into a
+client configuration. A token already in the keychain is kept. Changing JSON configurations
+needs `jq` or `python3`; files that are not valid JSON are left alone and the installer
+prints the entry to add by hand. Without a terminal, or with `--no-setup`, it installs only
+and prints the next steps.
 
 <details>
 <summary>installer options, manual download, from source</summary>
@@ -83,6 +168,9 @@ npx -y @altipard/sevdesk-mcp
 | --- | --- |
 | `--dry-run` | Show platform, release and target without downloading or changing anything. |
 | `--no-setup` | Install only, skip the keychain and MCP client setup. |
+| `--mode=MODE` | Mode for the client entries: `read` (default), `write` or `full`. |
+| `--replace-token` | Ask for a new token even if one is already in the keychain. |
+| `--no-verify` | Store the token without checking it against the sevdesk API. |
 | `-h`, `--help` | Show the help. |
 
 **Environment variables**, set for `sh`:
@@ -91,6 +179,7 @@ npx -y @altipard/sevdesk-mcp
 | --- | --- | --- |
 | `INSTALL_DIR` | `~/.local/bin` | Target directory, absolute path, created if missing, must be writable. |
 | `SEVDESK_MCP_VERSION` | `latest` | Release to install, for example `0.2.0` (tags have no `v` prefix). |
+| `SEVDESK_MODE` | `read` | Same as `--mode`; the option wins. |
 | `NO_COLOR` | | Set to any value to disable colored output. |
 
 ```sh
@@ -127,11 +216,12 @@ node dist/bin/stdio.js
 
 </details>
 
-### Keep the token in the keychain
+### Token
 
-If `SEVDESK_API_TOKEN` is unset, the server reads the token from the system keychain at
-start: service `sevdesk-mcp`, account `api-token`. That way no client configuration holds
-the token. The installer's setup stores it there; to do it by hand:
+Store the token once in the system keychain: service `sevdesk-mcp`, account `api-token`.
+The plugin, npx and the binary read it from there at start when `SEVDESK_API_TOKEN` is
+unset, so no configuration file holds it. Never put the token into a project file that
+goes into a repository. The binary installer stores it for you; by hand:
 
 macOS (prompts for the token, so it does not land in your shell history):
 
@@ -147,13 +237,26 @@ secret-tool store --label=sevdesk-mcp service sevdesk-mcp account api-token
 ```
 
 `SEVDESK_API_TOKEN` always wins over the keychain. On systems without a keychain, set it in
-the client's `env` block.
+the client's `env` block. The Claude Desktop extension asks for the token itself.
+
+### Troubleshooting
+
+- **No sevdesk tools, or the server does not start:** no token (neither in the keychain
+  nor in `SEVDESK_API_TOKEN`), or Node.js older than 24 for npx and the plugin
+  (`node --version`). The client's MCP log shows the reason.
+- **HTTP 401 from sevdesk:** the token is wrong. Store it again with the command above
+  (`-U` replaces the entry) or run the installer with `--replace-token`.
+- **The installer cannot check the token** (offline, proxy): it stores it anyway; pass
+  `--no-verify` to skip the check.
+- **`full` shows no irreversible tools:** they are off by default and also need
+  `SEVDESK_ENABLE_TOOLS`, see [Security model](#security-model).
 
 ## Connect your MCP client
 
 All clients below start the server as a local process over stdio; to run it as a shared
-service instead, see [Remote (HTTP)](#remote-http). The installer's setup writes
-these entries for you; the snippets below are for doing it by hand. Replace
+service instead, see [Remote (HTTP)](#remote-http). The plugin, the Desktop extension and
+the [binary installer](#binary-installer) write these entries for you; the snippets below
+are for doing it by hand, including `full` mode and other settings. Replace
 `/Users/you/.local/bin/sevdesk-mcp` with the absolute path of your binary (`echo
 ~/.local/bin/sevdesk-mcp`).
 
@@ -164,8 +267,8 @@ these entries for you; the snippets below are for doing it by hand. Replace
 > `${env:SEVDESK_API_TOKEN}`, in VS Code let it prompt with `${input:…}` (below).
 
 **npx instead of the binary.** Set `"command": "npx"` and
-`"args": ["-y", "@altipard/sevdesk-mcp"]`. GUI clients often start without your shell's
-`PATH`, so give the full path to `npx` (`which npx`) or, better, use the binary.
+`"args": ["-y", "@altipard/sevdesk-mcp"]`, as in
+[Cursor, VS Code and others](#cursor-vs-code-and-others).
 
 **Windows** (untested) has no release binary and no keychain lookup: use npx through
 `cmd`, for example `"command": "cmd", "args": ["/c", "npx", "-y", "@altipard/sevdesk-mcp"]`,
