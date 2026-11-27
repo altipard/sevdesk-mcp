@@ -1,0 +1,17 @@
+{
+  "name": "sevdesk-mcp",
+  "owner": {
+    "name": "altipard",
+    "url": "https://github.com/altipard"
+  },
+  "description": "Unofficial sevdesk MCP server and accounting skill for Claude Code",
+  "plugins": [
+    {
+      "name": "sevdesk",
+      "source": "./plugins/sevdesk",
+      "description": "sevdesk accounting tools (invoices, vouchers, contacts, banking) with a skill for safe bookkeeping workflows",
+      "category": "productivity",
+      "tags": ["sevdesk", "accounting", "invoices", "buchhaltung", "germany"]
+    }
+  ]
+}

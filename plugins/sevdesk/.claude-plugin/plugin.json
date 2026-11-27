@@ -1,0 +1,31 @@
+{
+  "name": "sevdesk",
+  "displayName": "sevdesk",
+  "description": "Unofficial sevdesk MCP server (read-only by default) plus a skill for invoices, vouchers, contacts and open items. The API token comes from the system keychain or SEVDESK_API_TOKEN, never from this plugin.",
+  "author": {
+    "name": "altipard",
+    "url": "https://github.com/altipard"
+  },
+  "homepage": "https://github.com/altipard/sevdesk-mcp",
+  "repository": "https://github.com/altipard/sevdesk-mcp",
+  "license": "MIT",
+  "keywords": ["sevdesk", "accounting", "bookkeeping", "invoices", "buchhaltung", "germany"],
+  "userConfig": {
+    "mode": {
+      "type": "string",
+      "title": "sevdesk access mode",
+      "description": "read: only reading tools. write: also drafts, contacts, payments and status changes, each status change or booking with a preview and confirmation. full: also irreversible actions, which additionally need SEVDESK_ENABLE_TOOLS in your environment.",
+      "options": ["read", "write", "full"],
+      "default": "read"
+    }
+  },
+  "mcpServers": {
+    "sevdesk": {
+      "command": "npx",
+      "args": ["-y", "@altipard/sevdesk-mcp"],
+      "env": {
+        "SEVDESK_MODE": "${user_config.mode}"
+      }
+    }
+  }
+}
