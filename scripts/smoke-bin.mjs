@@ -7,21 +7,22 @@
 //   node scripts/smoke-bin.mjs [path]   default: out/bin/sevdesk-mcp-<host>
 //   SMOKE_ARCH=x86_64 node scripts/smoke-bin.mjs out/bin/sevdesk-mcp-darwin-x64
 //                                       macOS only: runs the binary under Rosetta
+//
+// scripts/smoke-mcpb.mjs imports smokeServer and the tool lists from here.
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = new URL("../", import.meta.url);
-const host = `${process.platform}-${process.arch}`;
-const bin = process.argv[2] ?? fileURLToPath(new URL(`out/bin/sevdesk-mcp-${host}`, root));
-const { version } = JSON.parse(readFileSync(new URL("package.json", root), "utf8"));
-const DUMMY_TOKEN = "0123456789abcdef0123456789abcdef";
-const EXPECTED_TOOLS = ["get_account_info", "search_invoices", "sevdesk_api_request"];
+export const DUMMY_TOKEN = "0123456789abcdef0123456789abcdef";
+/** No listener on port 9: a request that slipped through fails instead of reaching sevdesk. */
+export const OFFLINE_BASE_URL = "http://127.0.0.1:9/api/v1";
+export const EXPECTED_TOOLS = ["get_account_info", "search_invoices", "sevdesk_api_request"];
 // Written out: a write tool missing from the binary must fail here. A unit
 // test keeps both lists in line with the tool definitions.
-const X_TOOLS = ["send_invoice_email", "cancel_invoice", "enshrine_document"];
-const WRITE_TOOLS = [
+export const X_TOOLS = ["send_invoice_email", "cancel_invoice", "enshrine_document"];
+export const WRITE_TOOLS = [
   "create_contact",
   "update_contact",
   "create_invoice_draft",
@@ -36,38 +37,25 @@ const WRITE_TOOLS = [
   ...X_TOOLS,
 ];
 
-function fail(message, stderr = "") {
-  console.error(`smoke-bin: ${message}`);
+export function fail(message, stderr = "") {
+  console.error(`smoke: ${message}`);
   if (stderr) console.error(stderr.trimEnd());
   process.exit(1);
 }
 
-if (!existsSync(bin)) fail(`${bin} is missing; run "npm run build:bin" first`);
-
-// Only what the binary needs: a real token in the caller's environment must
-// not reach it, and the keychain is never asked because the variable is set.
-const arch = process.env.SMOKE_ARCH;
-if (arch !== undefined && !/^[a-z0-9_]+$/.test(arch)) fail(`invalid SMOKE_ARCH ${arch}`);
-const [command, args] = arch ? ["/usr/bin/arch", [`-${arch}`, bin]] : [bin, []];
-
-/** One run of the binary: initialize, tools/list, then stdin closes and it must exit 0. */
-async function smoke(label, extraEnv, expectedTools) {
-  const child = spawn(command, args, {
-    env: {
-      PATH: process.env.PATH ?? "",
-      SEVDESK_API_TOKEN: DUMMY_TOKEN,
-      SEVDESK_BASE_URL: "http://127.0.0.1:9/api/v1",
-      LOG_LEVEL: "warn",
-      ...extraEnv,
-    },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+/**
+ * One run of the server: initialize, tools/list, then stdin closes and it must
+ * exit 0. env is the server's whole environment, so a real token in the
+ * caller's environment cannot reach it. Returns the listed tool names.
+ */
+export async function smokeServer({ label, command, args, env, expectedTools, version }) {
+  const child = spawn(command, args, { env, stdio: ["pipe", "pipe", "pipe"] });
 
   let stderr = "";
   child.stderr.setEncoding("utf8").on("data", (chunk) => {
     stderr += chunk;
   });
-  child.on("error", (error) => fail(`${label}: cannot start ${bin}: ${error.message}`));
+  child.on("error", (error) => fail(`${label}: cannot start ${command}: ${error.message}`));
 
   const pending = new Map();
   createInterface({ input: child.stdout }).on("line", (line) => {
@@ -85,7 +73,7 @@ async function smoke(label, extraEnv, expectedTools) {
   );
   exited.then(({ code, signal }) => {
     if (pending.size > 0) {
-      fail(`${label}: binary exited early (code ${code}, signal ${signal})`, stderr);
+      fail(`${label}: server exited early (code ${code}, signal ${signal})`, stderr);
     }
   });
 
@@ -110,15 +98,13 @@ async function smoke(label, extraEnv, expectedTools) {
   const init = await request(1, "initialize", {
     protocolVersion: "2025-11-25",
     capabilities: {},
-    clientInfo: { name: "smoke-bin", version: "0.0.0" },
+    clientInfo: { name: "smoke", version: "0.0.0" },
   });
   if (init?.serverInfo?.name !== "sevdesk-mcp") {
     fail(`${label}: unexpected serverInfo ${JSON.stringify(init)}`);
   }
   if (init.serverInfo.version !== version) {
-    fail(
-      `${label}: binary reports version ${init.serverInfo.version}, package.json has ${version}`,
-    );
+    fail(`${label}: server reports version ${init.serverInfo.version}, expected ${version}`);
   }
   child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
 
@@ -136,21 +122,55 @@ async function smoke(label, extraEnv, expectedTools) {
   ]);
   if (code === "timeout") {
     child.kill("SIGKILL");
-    fail(`${label}: binary did not exit after stdin closed`, stderr);
+    fail(`${label}: server did not exit after stdin closed`, stderr);
   }
-  if (code !== 0) fail(`${label}: binary exited with code ${code} (signal ${signal})`, stderr);
+  if (code !== 0) fail(`${label}: server exited with code ${code} (signal ${signal})`, stderr);
   if (stderr.includes(DUMMY_TOKEN)) fail(`${label}: the token appeared on stderr`);
   return names;
 }
 
-const defaults = await smoke("default", {}, EXPECTED_TOOLS);
-const full = await smoke(
-  "full",
-  { SEVDESK_MODE: "full", SEVDESK_ENABLE_TOOLS: X_TOOLS.join(",") },
-  [...EXPECTED_TOOLS, ...WRITE_TOOLS],
-);
+async function main() {
+  const host = `${process.platform}-${process.arch}`;
+  const bin = process.argv[2] ?? fileURLToPath(new URL(`out/bin/sevdesk-mcp-${host}`, root));
+  const { version } = JSON.parse(readFileSync(new URL("package.json", root), "utf8"));
+  if (!existsSync(bin)) fail(`${bin} is missing; run "npm run build:bin" first`);
 
-console.error(
-  `smoke-bin: ${bin}${arch ? ` (${arch})` : ""} ${version} ok, ${defaults.length} tools by ` +
-    `default: ${defaults.join(", ")}; ${full.length} tools in full mode with ${X_TOOLS.join(", ")}`,
-);
+  const arch = process.env.SMOKE_ARCH;
+  if (arch !== undefined && !/^[a-z0-9_]+$/.test(arch)) fail(`invalid SMOKE_ARCH ${arch}`);
+  const [command, args] = arch ? ["/usr/bin/arch", [`-${arch}`, bin]] : [bin, []];
+  // Only what the binary needs; the keychain is never asked because the token is set.
+  const env = {
+    PATH: process.env.PATH ?? "",
+    SEVDESK_API_TOKEN: DUMMY_TOKEN,
+    SEVDESK_BASE_URL: OFFLINE_BASE_URL,
+    LOG_LEVEL: "warn",
+  };
+
+  const defaults = await smokeServer({
+    label: "default",
+    command,
+    args,
+    env,
+    expectedTools: EXPECTED_TOOLS,
+    version,
+  });
+  const full = await smokeServer({
+    label: "full",
+    command,
+    args,
+    env: { ...env, SEVDESK_MODE: "full", SEVDESK_ENABLE_TOOLS: X_TOOLS.join(",") },
+    expectedTools: [...EXPECTED_TOOLS, ...WRITE_TOOLS],
+    version,
+  });
+
+  console.error(
+    `smoke-bin: ${bin}${arch ? ` (${arch})` : ""} ${version} ok, ${defaults.length} tools by ` +
+      `default: ${defaults.join(", ")}; ${full.length} tools in full mode with ${X_TOOLS.join(", ")}`,
+  );
+}
+
+// Run directly, not imported. realpath: a symlinked path would otherwise not match and the
+// smoke test would pass without running.
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
+  await main();
+}

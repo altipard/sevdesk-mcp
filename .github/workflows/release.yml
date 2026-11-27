@@ -2,7 +2,7 @@
 # (fix -> patch, feat -> minor, breaking -> major; other types release nothing). Tags carry
 # the version without a "v" and are the only version source (.cz.toml: version_provider =
 # scm). Nothing is committed back to main: the version is stamped into package.json inside
-# the jobs that build the binaries and the npm tarball.
+# the jobs that build the binaries, the extension and the npm tarball.
 #
 # First release: without any tag commitizen starts from 0.0.0, so the first run with a feat
 # commit releases 0.1.0 (a fix alone: 0.0.1). The first real run shows the result; to start
@@ -14,9 +14,11 @@
 # have to be published by hand. Without it the npm job fails with a 403/404.
 #
 # Order and reruns: everything is built and attested before anything is published; then npm,
-# then the GitHub release, which also creates the tag. Every publish step checks what already
-# exists and never replaces it, so "Re-run all jobs" after a partial failure completes the
-# release: a commit that already carries its release tag is resumed instead of bumped again.
+# then the GitHub release, which also creates the tag. Release assets: the four binaries, the
+# Claude Desktop extension sevdesk-mcp.mcpb and SHA256SUMS over all of them. Every publish
+# step checks what already exists and never replaces it, so "Re-run all jobs" after a partial
+# failure completes the release: a commit that already carries its release tag is resumed
+# instead of bumped again.
 name: release
 
 on:
@@ -160,10 +162,45 @@ jobs:
           path: out/bin/sevdesk-mcp-${{ matrix.target }}
           if-no-files-found: error
 
-  # Signed build provenance for the binaries; verify a download with
-  #   gh attestation verify sevdesk-mcp-<os>-<arch> --repo altipard/sevdesk-mcp
+  # Claude Desktop extension: dist/ plus production dependencies, run by the client's built-in
+  # Node.js. Dependency install scripts are skipped; the smoke test starts the server from the
+  # unpacked bundle with the manifest's command and environment.
+  mcpb:
+    needs: [version, check]
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci --ignore-scripts
+
+      - run: npm version --no-git-tag-version --allow-same-version "$VERSION"
+
+      - run: npm run build:mcpb
+
+      # Also checks that the bundled server reports the release version.
+      - run: node scripts/smoke-mcpb.mjs out/mcpb/sevdesk-mcp.mcpb
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sevdesk-mcp-mcpb
+          path: out/mcpb/sevdesk-mcp.mcpb
+          if-no-files-found: error
+
+  # Signed build provenance for the binaries and the extension; verify a download with
+  #   gh attestation verify <file> --repo altipard/sevdesk-mcp
   attest:
-    needs: [version, binaries]
+    needs: [version, binaries, mcpb]
     if: needs.version.outputs.version != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -180,7 +217,9 @@ jobs:
 
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: assets/sevdesk-mcp-*
+          subject-path: |
+            assets/sevdesk-mcp-*
+            assets/sevdesk-mcp.mcpb
 
   # Builds the npm tarball without any publish rights. Dependency install scripts are skipped;
   # the package's own prepack (codegen and tsc) runs.
@@ -319,9 +358,9 @@ jobs:
       # A published asset is never replaced: a rerun only adds what a partial run left out.
       - name: tag and release
         run: |
-          binaries=(sevdesk-mcp-darwin-arm64 sevdesk-mcp-darwin-x64 sevdesk-mcp-linux-x64 sevdesk-mcp-linux-arm64)
+          files=(sevdesk-mcp-darwin-arm64 sevdesk-mcp-darwin-x64 sevdesk-mcp-linux-x64 sevdesk-mcp-linux-arm64 sevdesk-mcp.mcpb)
           if ! existing=$(gh release view "$VERSION" --json assets --jq '.assets[].name' 2>/dev/null); then
-            (cd assets && sha256sum "${binaries[@]}" > SHA256SUMS && cat SHA256SUMS)
+            (cd assets && sha256sum "${files[@]}" > SHA256SUMS && cat SHA256SUMS)
             gh release create "$VERSION" assets/* \
               --target "$GITHUB_SHA" \
               --title "$VERSION" \
@@ -331,7 +370,7 @@ jobs:
           fi
           has() { printf '%s\n' "$existing" | grep -qxF "$1"; }
           missing=()
-          for name in "${binaries[@]}" SHA256SUMS; do
+          for name in "${files[@]}" SHA256SUMS; do
             has "$name" || missing+=("$name")
           done
           if [ "${#missing[@]}" -eq 0 ]; then
@@ -339,18 +378,18 @@ jobs:
             exit 0
           fi
           if has SHA256SUMS; then
-            # The published sums describe binaries of the earlier run; a rebuilt one would not match.
+            # The published sums describe files of the earlier run; a rebuilt one would not match.
             echo "::error::release $VERSION has SHA256SUMS but lacks: ${missing[*]}. Delete the release and its tag, then re-run."
             exit 1
           fi
-          # Sums over exactly what the release will hold: published binaries as they are, rebuilt
+          # Sums over exactly what the release will hold: published files as they are, rebuilt
           # ones only where missing. --clobber replaces the local rebuilt copy, not the asset.
-          for name in "${binaries[@]}"; do
+          for name in "${files[@]}"; do
             if has "$name"; then
               gh release download "$VERSION" --pattern "$name" --dir assets --clobber
             fi
           done
-          (cd assets && sha256sum "${binaries[@]}" > SHA256SUMS && cat SHA256SUMS)
+          (cd assets && sha256sum "${files[@]}" > SHA256SUMS && cat SHA256SUMS)
           for name in "${missing[@]}"; do
             gh release upload "$VERSION" "assets/$name"
           done
