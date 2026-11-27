@@ -54,13 +54,14 @@ Pick your client; the first way listed is the simplest.
 | Client | Simplest way | Needs |
 | --- | --- | --- |
 | [Claude Code](#claude-code) | plugin, one command | Node.js 24+, token in the keychain |
-| [Claude Desktop](#claude-desktop) | `sevdesk-mcp.mcpb` extension, double-click | token typed into the extension |
+| [Claude Desktop](#claude-desktop) | `sevdesk-mcp.mcpb` extension, double-click | token typed into the extension; runs on Claude Desktop's built-in Node.js |
 | [Cursor, VS Code, others](#cursor-vs-code-and-others) | npx entry in the client config | Node.js 24+, token in the keychain |
 | any, without Node.js | [binary installer](#binary-installer) | macOS or Linux (glibc) |
 
 ### Claude Code
 
-In a Claude Code session (v2.1.275 or later):
+Store the [token](#token) in the keychain first, then, in a Claude Code session (v2.1.275
+or later):
 
 ```text
 /plugin install sevdesk --marketplace altipard/sevdesk-mcp
@@ -254,9 +255,10 @@ the client's `env` block. The Claude Desktop extension asks for the token itself
 ## Connect your MCP client
 
 All clients below start the server as a local process over stdio; to run it as a shared
-service instead, see [Remote (HTTP)](#remote-http). The plugin, the Desktop extension and
-the [binary installer](#binary-installer) write these entries for you; the snippets below
-are for doing it by hand, including `full` mode and other settings. Replace
+service instead, see [Remote (HTTP)](#remote-http). The
+[binary installer](#binary-installer) writes these entries for you, and the plugin and the
+Desktop extension need none; the snippets below are for doing it by hand, including `full`
+mode and other settings. Replace
 `/Users/you/.local/bin/sevdesk-mcp` with the absolute path of your binary (`echo
 ~/.local/bin/sevdesk-mcp`).
 
