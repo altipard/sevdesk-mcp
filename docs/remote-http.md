@@ -28,7 +28,11 @@ authorization server (identity provider).
   [Security](security.md) for modes and confirmations.
 - **sevdesk token.** The server uses one sevdesk API token for all callers, taken from
   `SEVDESK_API_TOKEN` only (no keychain lookup). Everyone with a valid access token acts as
-  that sevdesk user, within their scopes.
+  that sevdesk user, within their scopes. Since the pacing bucket belongs to the token, all
+  callers share one bucket and its pace (`SEVDESK_RATE_LIMIT`, see
+  [Configuration](configuration.md#pacing-and-retries)): a busy caller slows the others. The
+  pace holds per process: several replicas together send up to their number times
+  `SEVDESK_RATE_LIMIT`.
 - **Host and Origin.** `MCP_ALLOWED_HOSTS` is the allowlist for the `Host` header (DNS
   rebinding protection) and for the `Origin` header of the MCP endpoint; it defaults to the
   host of `MCP_RESOURCE_URL`. Requests without `Origin` (CLI and desktop clients,

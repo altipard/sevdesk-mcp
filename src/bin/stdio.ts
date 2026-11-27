@@ -172,6 +172,7 @@ const logger = createLogger({ level: config.logLevel, redact: secrets });
 const sevdesk = createSevdeskClient({
   baseUrl: config.baseUrl,
   token: config.sevdeskApiToken,
+  rateLimit: config.rateLimit,
   logger,
 });
 // Once per process: without SEVDESK_CONFIRM_SECRET the HMAC key is random
