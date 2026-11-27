@@ -41,22 +41,24 @@ They never change anything. Each call reads at most 2000 documents per list, sto
 45 seconds and sends at most 2 requests at a time; `audit_vat` also reads positions for at
 most 500 vouchers and looks up at most 200 suppliers. If a cap, the time limit or a failed
 request stopped a call early, the answer has `truncated: true` and a note naming the cause.
-Amounts are euro amounts as sevdesk reports them; documents in another currency carry their
-currency (and, for invoices and credit notes, the foreign amount) separately.
+Amounts are in euro: invoices and credit notes from their sums (the foreign amount is
+reported separately), vouchers from their accounting sums (`sumNetAccounting` etc.). A
+foreign-currency voucher without accounting sums falls back to `sumNet` etc., and the note
+says its euro amount is unconfirmed.
 
 Where the sevdesk API documentation leaves semantics open, the tools take the cautious side
 and say so in the answer: cancellation invoices (SR) and credit notes are subtracted whatever
 sign sevdesk stores; a final invoice (ER) next to advance or partial invoices gets a note that
 amounts may count twice; `audit_vat` skips tax amount checks for the self-assessed rules 8,
-12, 13 and 14; credit notes are read in one request because the API offers no paging for
-them, and a full answer is marked truncated.
+12, 13 and 14; credit notes are read in one request because the API declares no paging for
+them, a limit of 100 per answer is assumed, and a full answer is marked truncated.
 
 | Tool | What it does |
 | --- | --- |
 | `summarize_documents` | Count, net, tax and gross in euro of invoices (with credit notes, which are subtracted like cancellations) or vouchers (income and expenses always apart) in a period, per month, status or contact and in total. |
 | `audit_vat` | Checks the vouchers of a period for likely VAT booking mistakes: foreign supplier with a domestic expense rule and only 0 % positions (possible reverse charge, with the fitting rule suggested), tax rule from the wrong side, rule not allowed for the booking account, rate contradicting the rule, sums that do not add up, one supplier with different rules. Findings are hints, not tax advice. |
 | `reverse_charge_report` | The §13b tax base of a period from vouchers, invoices and credit notes: nets to zero (rules 12, 14), payable (rule 13) and own revenue (rule 5), with totals in euro and document counts. Documents count by their document date. |
-| `find_duplicate_vouchers` | Vouchers with the same number and amount per supplier (a description counts as number only with a digit), the same supplier and amount within a few days, and old drafts. |
+| `find_duplicate_vouchers` | Vouchers with the same number and amount per supplier within 90 days (a description counts as number only with a digit other than a year), the same supplier and amount within a few days, and old drafts. |
 | `find_subscription_gaps` | Detects suppliers billed monthly and lists the months of the period without a voucher. |
 | `reconcile_transactions` | Matches open bank transactions with open vouchers and invoices by amount and date, with a confidence, and lists payments without document and documents without payment. |
 
